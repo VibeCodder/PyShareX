@@ -19,9 +19,6 @@ Linux: sudo apt install ffmpeg <br>
 Windows: https://github.com/UB-Mannheim/tesseract/wiki <br>
 Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
 
-<img width="993" height="722" alt="image" src="https://github.com/user-attachments/assets/aac76ad5-abd3-42e1-919d-2bdd025478bf" />
-<br>
-
 ### PyShareX allows you for:
 - capture screen region
 - capture active monitor screenshot
@@ -32,6 +29,8 @@ Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
 - screen region GIF recording
 - OCR text recognision
 - OCR QR recognision
+
+<img width="993" height="722" alt="image" src="https://github.com/user-attachments/assets/aac76ad5-abd3-42e1-919d-2bdd025478bf" />
 
 
 <br>
