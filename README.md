@@ -1,7 +1,7 @@
 <img width="2878" height="738" alt="PyShareX#gh-dark-mode-only" src="https://github.com/user-attachments/assets/18a98e15-916a-4b39-a7d5-d4a5c8913176#gh-dark-mode-only"/>
 <img width="2878" height="738" alt="PyShareX#gh-light-mode-only" src="https://github.com/user-attachments/assets/df561e61-48b5-45d5-b9cd-c47e0bacbd2d#gh-light-mode-only"/>
 <br>
-A ShareX clone made in Python and created by Claude AI and Gemini.
+A multiplatform ShareX clone made in Python and created by Claude AI and Gemini to use on Linux and Windows.
 
 Before usage please install everything from `requirements.txt` using this cmd:
 ```
@@ -14,7 +14,6 @@ In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
 ffmpeg must be installed separately: <br>
 Windows: https://ffmpeg.org/download.html (or: winget install ffmpeg) <br>
 Linux: sudo apt install ffmpeg <br>
-macOS: brew install ffmpeg <br>
 
 ### Optional - OCR (requires tesseract in the system) <br>
 Windows: https://github.com/UB-Mannheim/tesseract/wiki <br>
