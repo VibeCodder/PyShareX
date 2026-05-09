@@ -2332,7 +2332,7 @@ class MainWindow(QMainWindow):
         if path:
             self.status_sig.emit(f"✅ {label}: {Path(path).name}")
             # Schedule on main thread (this may be called from background thread)
-            self._notify_sig.emit(path)
+            self._notify_sig.emit(path, None)
 
     def act_region(self):
         d = self.config.get("delay", 0)
