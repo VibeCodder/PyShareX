@@ -7,3 +7,5 @@ Before usage please install everything from `requirements.txt` using this cmd:
 ```
 pip install -r requirements.txt
 ```
+You should also run the app by pythonw.exe
+In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
