@@ -1,0 +1,22 @@
+# PyshareX - wymagane pakiety
+# Zainstaluj poleceniem: pip install -r requirements.txt
+
+PyQt6>=6.4.0
+Pillow>=9.0.0
+mss>=7.0.0
+pynput>=1.7.0
+pyautogui>=0.9.54
+opencv-python>=4.7.0
+numpy>=1.23.0
+screeninfo>=0.8.0
+easyocr
+
+# Opcjonalne - nagrywanie wideo (wymaga też zainstalowanego ffmpeg w systemie)
+# ffmpeg należy zainstalować osobno:
+# Windows: https://ffmpeg.org/download.html  (lub: winget install ffmpeg)
+# Linux:   sudo apt install ffmpeg
+# macOS:   brew install ffmpeg
+
+# Opcjonalne - OCR (wymaga tesseract w systemie)
+# Windows: https://github.com/UB-Mannheim/tesseract/wiki
+# Linux:   sudo apt install tesseract-ocr tesseract-ocr-pol
