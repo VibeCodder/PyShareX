@@ -11,11 +11,27 @@ You should also run the app by pythonw.exe <br>
 In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
 
 ### Optional - video recording (also requires ffmpeg installed on the system)
-ffmpeg must be installed separately:
-Windows: https://ffmpeg.org/download.html (or: winget install ffmpeg)
-Linux: sudo apt install ffmpeg
-macOS: brew install ffmpeg
+ffmpeg must be installed separately: <br>
+Windows: https://ffmpeg.org/download.html (or: winget install ffmpeg) <br>
+Linux: sudo apt install ffmpeg <br>
+macOS: brew install ffmpeg <br>
 
-### Optional - OCR (requires tesseract in the system)
-Windows: https://github.com/UB-Mannheim/tesseract/wiki
-Linux: sudo apt install tesseract-ocr tesseract-ocr-pol
+### Optional - OCR (requires tesseract in the system) <br>
+Windows: https://github.com/UB-Mannheim/tesseract/wiki <br>
+Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
+
+<img width="993" height="722" alt="image" src="https://github.com/user-attachments/assets/aac76ad5-abd3-42e1-919d-2bdd025478bf" />
+
+PyShareX allows you for:
+- capture screen region
+- capture active monitor screenshot
+- capture selected monitor screenshot
+- scrolling capture (still issues)
+- screen region video recording
+- screen region GIF recording
+- OCR text recognision
+- OCR QR recognision
+
+<img width="346" height="501" alt="Zrzut ekranu 2026-05-10 001729" src="https://github.com/user-attachments/assets/c846cabe-07df-4abe-8555-64d5fbdd47ec" />
+
+
