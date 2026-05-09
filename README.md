@@ -9,3 +9,13 @@ pip install -r requirements.txt
 ```
 You should also run the app by pythonw.exe <br>
 In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
+
+### Optional - video recording (also requires ffmpeg installed on the system)
+ffmpeg must be installed separately:
+Windows: https://ffmpeg.org/download.html (or: winget install ffmpeg)
+Linux: sudo apt install ffmpeg
+macOS: brew install ffmpeg
+
+### Optional - OCR (requires tesseract in the system)
+Windows: https://github.com/UB-Mannheim/tesseract/wiki
+Linux: sudo apt install tesseract-ocr tesseract-ocr-pol
