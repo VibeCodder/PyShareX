@@ -21,17 +21,21 @@ Windows: https://github.com/UB-Mannheim/tesseract/wiki <br>
 Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
 
 <img width="993" height="722" alt="image" src="https://github.com/user-attachments/assets/aac76ad5-abd3-42e1-919d-2bdd025478bf" />
+<br>
 
-PyShareX allows you for:
+### PyShareX allows you for:
 - capture screen region
 - capture active monitor screenshot
 - capture selected monitor screenshot
+- caputure full screen (from all monitors)
 - scrolling capture (still issues)
 - screen region video recording
 - screen region GIF recording
 - OCR text recognision
 - OCR QR recognision
 
+
+<br>
 <img width="346" height="501" alt="Zrzut ekranu 2026-05-10 001729" src="https://github.com/user-attachments/assets/c846cabe-07df-4abe-8555-64d5fbdd47ec" />
 
 
