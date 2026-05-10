@@ -10,7 +10,7 @@ pip install -r requirements.txt
 You should also run the app by pythonw.exe <br>
 In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
 
-### Optional - video recording (also requires ffmpeg installed on the system)
+### Optional - video recording (requires ffmpeg installed on the system)
 ffmpeg must be installed separately: <br>
 Windows: https://ffmpeg.org/download.html (or: winget install ffmpeg) <br>
 Linux: sudo apt install ffmpeg <br>
