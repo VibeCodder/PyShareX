@@ -1814,7 +1814,7 @@ class MainWindow(QMainWindow):
                   "QPushButton:hover{background:#252535;color:#cdd6f4;}"
                   "QPushButton:checked{background:#313244;color:#89b4fa;font-weight:bold;}")
         self._sb_btns = []
-        for lbl, fn in [("🖼  Capture",  self._show_capture),
+        for lbl, fn in [("⌨️  Shortcuts",  self._show_capture),
                          ("🔧  Tools",    self._show_tools),
                          ("⚙️  Settings", self._show_settings),
                          ("📋  History",  self._show_history)]:
