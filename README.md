@@ -9,6 +9,8 @@ pip install -r requirements.txt
 ```
 You should also run the app by pythonw.exe <br>
 In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
+<br><br>
+For the icon to be visible in the app, the .ico file must be inside "icons" folder and the "icons" folder must be in the same folder with .pyw script.
 
 ### Optional - video recording (requires ffmpeg installed on the system)
 ffmpeg must be installed separately: <br>
