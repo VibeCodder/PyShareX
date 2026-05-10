@@ -15,7 +15,7 @@ ffmpeg must be installed separately: <br>
 Windows: https://ffmpeg.org/download.html (or: winget install ffmpeg) <br>
 Linux: sudo apt install ffmpeg <br>
 
-### Optional - OCR (requires tesseract [or easyocr] in the system) <br>
+### Optional - OCR (requires tesseract in the system [or easyocr in pip]) <br>
 Windows: https://github.com/UB-Mannheim/tesseract/wiki <br>
 Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
 
@@ -24,7 +24,7 @@ Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
 - capture active monitor screenshot
 - capture selected monitor screenshot
 - caputure full screen (from all monitors)
-- scrolling capture (still issues)
+- scrolling capture
 - screen region video recording
 - screen region GIF recording
 - OCR text recognision
