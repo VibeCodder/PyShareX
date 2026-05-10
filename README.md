@@ -12,7 +12,7 @@ In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
 <br><br>
 For the icon to be visible in the app, the .ico file must be inside "icons" folder and the "icons" folder must be in the same folder with .pyw script.
 
-### Optional - video recording (requires ffmpeg installed on the system)
+### Optional - video recording/converter (requires ffmpeg installed on the system)
 ffmpeg must be installed separately: <br>
 Windows: https://ffmpeg.org/download.html (or: winget install ffmpeg) <br>
 Linux: sudo apt install ffmpeg <br>
@@ -31,6 +31,7 @@ Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
 - screen region GIF recording
 - OCR text recognision
 - OCR QR recognision
+- video converter
 
 <img width="993" height="722" alt="region_2026-05-10_15-39-15" src="https://github.com/user-attachments/assets/fb465778-9e0c-4634-907f-9245862d68b4" />
 
