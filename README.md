@@ -30,7 +30,8 @@ Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
 - OCR text recognision
 - OCR QR recognision
 
-<img width="993" height="722" alt="image" src="https://github.com/user-attachments/assets/aac76ad5-abd3-42e1-919d-2bdd025478bf" />
+<img width="993" height="722" alt="region_2026-05-10_15-39-15" src="https://github.com/user-attachments/assets/fb465778-9e0c-4634-907f-9245862d68b4" />
+
 
 
 <br>
