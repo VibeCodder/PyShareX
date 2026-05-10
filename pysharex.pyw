@@ -371,6 +371,289 @@ def get_monitors():
                      "width": 1920, "height": 1080, "x": 0, "y": 0}]
     return monitors
 
+class FFmpegConverterThread(QThread):
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(int)
+
+    def __init__(self, cmd):
+        super().__init__()
+        self.cmd = cmd
+        self._is_cancelled = False
+        self.process = None
+
+    def run(self):
+        try:
+            # Flaga CREATE_NO_WINDOW ukrywa konsolę CMD na Windowsie
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            self.process = subprocess.Popen(
+                self.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=creationflags
+            )
+            
+            for line in self.process.stdout:
+                if self._is_cancelled:
+                    break
+                self.log_signal.emit(line.strip())
+                
+            self.process.wait()
+            
+            if self._is_cancelled:
+                self.finished_signal.emit(-99) # Znak, że anulowano
+            else:
+                self.finished_signal.emit(self.process.returncode)
+                
+        except FileNotFoundError:
+            self.log_signal.emit("ERROR: ffmpeg not found. Make sure ffmpeg is installed and added to your PATH environment variables.")
+            self.finished_signal.emit(-1)
+        except Exception as e:
+            self.log_signal.emit(f"ERROR: {str(e)}")
+            self.finished_signal.emit(-1)
+
+    def cancel(self):
+        self._is_cancelled = True
+        if self.process:
+            self.process.terminate()
+
+from PyQt6.QtWidgets import (QGridLayout, QFormLayout, QProgressBar)
+
+class VideoConverterDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Video Converter")
+        self.resize(700, 550)
+        self.thread = None
+
+        layout = QVBoxLayout(self)
+
+        # --- FILE SECTION ---
+        file_group = QGroupBox("File paths")
+        file_layout = QGridLayout()
+
+        self.input_edit = QLineEdit()
+        self.btn_browse_input = QPushButton("Browse...")
+        self.btn_browse_input.clicked.connect(self.browse_input)
+        
+        self.output_dir_edit = QLineEdit()
+        self.btn_browse_output = QPushButton("Browse...")
+        self.btn_browse_output.clicked.connect(self.browse_output)
+        
+        self.output_name_edit = QLineEdit()
+
+        file_layout.addWidget(QLabel("Input file:"), 0, 0)
+        file_layout.addWidget(self.input_edit, 0, 1)
+        file_layout.addWidget(self.btn_browse_input, 0, 2)
+
+        file_layout.addWidget(QLabel("Output folder:"), 1, 0)
+        file_layout.addWidget(self.output_dir_edit, 1, 1)
+        file_layout.addWidget(self.btn_browse_output, 1, 2)
+
+        file_layout.addWidget(QLabel("Output file name:"), 2, 0)
+        file_layout.addWidget(self.output_name_edit, 2, 1)
+        
+        file_group.setLayout(file_layout)
+        layout.addWidget(file_group)
+
+        # --- ENCODING SETTINGS ---
+        settings_layout = QHBoxLayout()
+        
+        # Video Options
+        video_group = QGroupBox("Video options")
+        video_form = QFormLayout()
+        
+        self.video_codec_combo = QComboBox()
+        self.video_codec_combo.addItems([
+            "H.264/AVC (libx264)", "H.265/HEVC (libx265)", 
+            "VP8 (libvpx)", "VP9 (libvpx-vp9)", 
+            "AV1 (libaom-av1)", "Copy (no re-compression)", "None"
+        ])
+        
+        self.video_bitrate_spin = QSpinBox()
+        self.video_bitrate_spin.setRange(0, 50000)
+        self.video_bitrate_spin.setSuffix(" kbps")
+        self.video_bitrate_spin.setSpecialValueText("0 (Auto / CRF)")
+        self.video_bitrate_spin.setValue(0)
+        
+        video_form.addRow("Video codec:", self.video_codec_combo)
+        video_form.addRow("Video bitrate:", self.video_bitrate_spin)
+        video_group.setLayout(video_form)
+        settings_layout.addWidget(video_group)
+
+        # Audio & Format Options
+        audio_group = QGroupBox("Audio & Output options")
+        audio_form = QFormLayout()
+        
+        self.audio_codec_combo = QComboBox()
+        self.audio_codec_combo.addItems([
+            "AAC (aac)", "MP3 (libmp3lame)", "Opus (libopus)", 
+            "Vorbis (libvorbis)", "Copy (no re-compression)", "None"
+        ])
+        
+        self.audio_bitrate_spin = QSpinBox()
+        self.audio_bitrate_spin.setRange(0, 1000)
+        self.audio_bitrate_spin.setSuffix(" kbps")
+        self.audio_bitrate_spin.setSpecialValueText("0 (Auto)")
+        self.audio_bitrate_spin.setValue(128)
+        
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["MP4", "WebM", "MKV", "AVI", "GIF"])
+        
+        audio_form.addRow("Audio codec:", self.audio_codec_combo)
+        audio_form.addRow("Audio bitrate:", self.audio_bitrate_spin)
+        audio_form.addRow("Output format:", self.format_combo)
+        audio_group.setLayout(audio_form)
+        settings_layout.addWidget(audio_group)
+
+        layout.addLayout(settings_layout)
+
+        # --- LOGS AND CONTROL ---
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        layout.addWidget(self.log_text)
+
+        button_layout = QHBoxLayout()
+        self.btn_start = QPushButton("Start encode")
+        self.btn_start.clicked.connect(self.start_conversion)
+        
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self.cancel_conversion)
+        
+        button_layout.addStretch()
+        button_layout.addWidget(self.btn_start)
+        button_layout.addWidget(self.btn_cancel)
+        layout.addLayout(button_layout)
+
+    def browse_input(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select video file", "", "Video Files (*.mp4 *.mkv *.avi *.webm *.mov);;All Files (*)")
+        if file_path:
+            self.input_edit.setText(file_path)
+            p = Path(file_path)
+            self.output_dir_edit.setText(str(p.parent))
+            self.output_name_edit.setText(f"{p.stem}_converted")
+
+    def browse_output(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select output folder")
+        if dir_path:
+            self.output_dir_edit.setText(dir_path)
+
+    def get_ffmpeg_args(self):
+        v_codecs = {
+            "H.264/AVC (libx264)": "libx264", 
+            "H.265/HEVC (libx265)": "libx265", 
+            "VP8 (libvpx)": "libvpx", 
+            "VP9 (libvpx-vp9)": "libvpx-vp9", 
+            "AV1 (libaom-av1)": "libaom-av1", 
+            "Copy (no re-compression)": "copy"
+        }
+        
+        a_codecs = {
+            "AAC (aac)": "aac", 
+            "MP3 (libmp3lame)": "libmp3lame", 
+            "Opus (libopus)": "libopus", 
+            "Vorbis (libvorbis)": "libvorbis", 
+            "Copy (no re-compression)": "copy"
+        }
+
+        v_val = self.video_codec_combo.currentText()
+        a_val = self.audio_codec_combo.currentText()
+
+        # -map 0:v:0 -map 0:a? zapewnia, że audio zostanie dołączone jeśli istnieje
+        args = ["-map", "0:v:0", "-map", "0:a?"]
+        
+        # --- VIDEO ---
+        if v_val == "None":
+            args.append("-vn")
+        else:
+            codec = v_codecs.get(v_val, "libx264")
+            args.extend(["-c:v", codec])
+            
+            if codec != "copy":
+                # Zapewnienie kompatybilności kolorów dla większości odtwarzaczy
+                args.extend(["-pix_fmt", "yuv420p"])
+                
+                v_bitrate = self.video_bitrate_spin.value()
+                if v_bitrate > 0:
+                    args.extend(["-b:v", f"{v_bitrate}k"])
+                else:
+                    # Jeśli bitrate to 0, używamy CRF (Constant Rate Factor)
+                    # Zakładamy domyślnie 23, jeśli nie masz suwaka, lub dodaj self.quality_slider
+                    args.extend(["-crf", "23"])
+
+        # --- AUDIO ---
+        if a_val == "None":
+            args.append("-an")
+        else:
+            codec = a_codecs.get(a_val, "aac")
+            args.extend(["-c:a", codec])
+            
+            if codec != "copy":
+                a_bitrate = self.audio_bitrate_spin.value()
+                if a_bitrate > 0:
+                    args.extend(["-b:a", f"{a_bitrate}k"])
+                else:
+                    args.extend(["-b:a", "128k"]) # Rozsądny domyślny bitrate
+
+        # Flagi dla plików MP4, aby można było je odtwarzać zanim się całkiem pobiorą/skonwertują
+        if self.format_combo.currentText().lower() == "mp4":
+            args.extend(["-movflags", "+faststart"])
+
+        return args
+
+    def start_conversion(self):
+        input_file = self.input_edit.text().strip()
+        output_dir = self.output_dir_edit.text().strip()
+        output_name = self.output_name_edit.text().strip()
+        ext = self.format_combo.currentText().lower()
+
+        if not input_file or not os.path.exists(input_file):
+            QMessageBox.warning(self, "Error", "Please select a valid input file!")
+            return
+
+        # Sprawdzenie czy to GIF (GIF-y nie obsługują dźwięku)
+        if ext == "gif":
+            QMessageBox.information(self, "Note", "Converting to GIF will strip the audio as the format doesn't support it.")
+
+        output_path = os.path.join(output_dir, f"{output_name}.{ext}")
+        
+        # Budowanie komendy z poprawionymi argumentami
+        cmd = ["ffmpeg", "-y", "-i", input_file] + self.get_ffmpeg_args() + [output_path]
+
+        self.log_text.clear()
+        self.log_text.append(f"Running command:\n{' '.join(cmd)}\n")
+        
+        self.btn_start.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+
+        self.thread = FFmpegConverterThread(cmd)
+        self.thread.log_signal.connect(self.append_log)
+        self.thread.finished_signal.connect(self.conversion_finished)
+        self.thread.start()
+
+    def append_log(self, text):
+        self.log_text.append(text)
+        # Auto-scroll do dołu
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def cancel_conversion(self):
+        if self.thread and self.thread.isRunning():
+            self.thread.cancel()
+            self.log_text.append("\n[!] Cancelled by user.")
+
+    def conversion_finished(self, returncode):
+        self.btn_start.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        
+        if returncode == 0:
+            self.log_text.append("\n[✓] Conversion completed successfully!")
+        elif returncode == -99:
+            pass 
+        else:
+            self.log_text.append(f"\n[✗] Conversion error (Exit code: {returncode})")
+
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -1505,6 +1788,7 @@ AVAILABLE_ACTIONS = [
     ("record_gif",               "Record GIF"),
     ("ocr_text",                 "OCR – Recognize text"),
     ("ocr_code",                 "OCR – Recognize code"),
+    ("video_converter",          "Video Converter")
 ]
 _ACTION_TO_NAME = {a: n for a, n in AVAILABLE_ACTIONS}
 _NAME_TO_ACTION = {n: a for a, n in AVAILABLE_ACTIONS}
@@ -1887,7 +2171,8 @@ class MainWindow(QMainWindow):
                  ("🖥  Full screen",     self.act_fullscreen),
                  ("🪟  Active window",   self.act_window),
                  ("🖥  Active monitor",  self.act_monitor),
-                 ("🎞  Record GIF",      self.act_gif)]
+                 ("🎞  Record GIF",      self.act_gif),
+                 ("🎬  Video Converter", self.act_video_converter)]
         row = QHBoxLayout()
         for i, (lbl2, fn) in enumerate(items):
             b = QPushButton(lbl2); b.setMinimumHeight(60); b.clicked.connect(fn)
@@ -2090,6 +2375,7 @@ class MainWindow(QMainWindow):
         tm = mb.addMenu("Tools")
         tm.addAction("OCR – Recognize text").triggered.connect(self.act_ocr_text)
         tm.addAction("OCR – Recognize code").triggered.connect(self.act_ocr_code)
+        tm.addAction("Video Converter").triggered.connect(self.act_video_converter)
 
         am = mb.addMenu("Application")
         am.addAction("Screenshots folder").triggered.connect(self._open_folder)
@@ -2122,6 +2408,7 @@ class MainWindow(QMainWindow):
         tsub = menu.addMenu("Tools")
         tsub.addAction("OCR – text").triggered.connect(self.act_ocr_text)
         tsub.addAction("OCR – code").triggered.connect(self.act_ocr_code)
+        tsub.addAction("Video Converter").triggered.connect(self.act_video_converter)
 
         menu.addSeparator()
         menu.addAction("Screenshots folder").triggered.connect(self._open_folder)
@@ -2323,6 +2610,7 @@ class MainWindow(QMainWindow):
         "ocr_text":                 "act_ocr_text",
         "ocr_code":                 "act_ocr_code",
         "capture_fullscreen":       "act_fullscreen",
+        "video_converter":          "act_video_converter",
     }
 
     def _hotkeys_start(self):
@@ -2764,6 +3052,12 @@ class MainWindow(QMainWindow):
                 self._ocr_done_sig.emit(f"Wystąpił błąd podczas dekodowania: {e}", "QR Code Result")
 
         threading.Thread(target=go, daemon=True).start()
+    
+    def act_video_converter(self):
+        # Otwieramy okno konwertera
+        dlg = VideoConverterDialog(self)
+        dlg.setStyleSheet(self.styleSheet()) # Opcjonalne: dopasowanie stylu do ciemnego motywu apki
+        dlg.exec()
 
     def _show_ocr(self, txt, title="Result"):
         dlg = OcrResultDialog(txt, parent=None)
