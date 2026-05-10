@@ -70,6 +70,10 @@ except ImportError:
 
 _easyocr_reader = None   # lazy singleton — first use initialises it
 
+
+
+
+
 def _get_easyocr_reader():
     global _easyocr_reader
     if _easyocr_reader is None and EASYOCR_AVAILABLE:
@@ -1037,11 +1041,10 @@ class CaptureEngine:
             shot = sct.grab(sct.monitors[0])
             return self._save(Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX"), "fullscreen")
 
-    def capture_scrolling(self) -> str:
+    # Dodajemy opcjonalny parametr region=None
+    def capture_scrolling(self, region=None) -> str:
         """
-        Scrolling capture: takes multiple screenshots while auto-scrolling,
-        then detects the scroll offset between frames using pixel matching
-        and stitches only the NEW content each time.
+        Scrolling capture: robi zrzuty ekranu podczas przewijania.
         """
         if not (MSS_AVAILABLE and PIL_AVAILABLE): return None
         try:
@@ -1050,76 +1053,125 @@ class CaptureEngine:
         except ImportError:
             return self.capture_active_monitor()
 
-        FRAMES    = 10
-        SCROLL_PX = 500      # pixels to scroll per step
-        DELAY     = 0.4      # seconds between frames
+        FRAMES    = 15       
+        SCROLL_PX = 500      
+        DELAY     = 0.4      
 
-        # Use monitor under cursor
-        cx, cy = QCursor.pos().x(), QCursor.pos().y()
-        with mss.MSS() as sct:
-            mon = sct.monitors[1]
-            for m in sct.monitors[1:]:
-                if (m["left"] <= cx < m["left"] + m["width"] and
-                        m["top"] <= cy < m["top"] + m["height"]):
-                    mon = m; break
+        # ZMIANA: Jeśli przekazano region, używamy dokładnie tego wycinka
+        if region:
+            rx, ry, rw, rh = region
+            mon = {"left": rx, "top": ry, "width": rw, "height": rh}
+            
+            # Przesuwamy kursor myszy na środek zaznaczonego obszaru.
+            # To kluczowe, żeby symulowany scroll przewijał właściwy element!
+            try:
+                pyautogui.moveTo(rx + rw // 2, ry + rh // 2)
+            except: pass
+        else:
+            # Fallback (stare zachowanie): cały monitor pod kursorem
+            cx, cy = QCursor.pos().x(), QCursor.pos().y()
+            with mss.MSS() as sct:
+                mon = sct.monitors[1]
+                for m in sct.monitors[1:]:
+                    if (m["left"] <= cx < m["left"] + m["width"] and
+                            m["top"] <= cy < m["top"] + m["height"]):
+                        mon = m; break
+
+        # ... CAŁA RESZTA KODU (pętla, mss.grab(mon) i sklejanie) POZOSTAJE BEZ ZMIAN! ...
 
         frames = []
         with mss.MSS() as sct:
             for i in range(FRAMES):
                 shot = sct.grab(mon)
-                frames.append(Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX"))
+                img1 = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                frames.append(img1)
+                
                 if i < FRAMES - 1:
                     pyautogui.scroll(-SCROLL_PX)
                     time.sleep(DELAY)
-                    # Check if page moved at all (reached bottom)
+                    
+                    # Sprawdzamy czy strona w ogóle się przewinęła
                     shot2 = sct.grab(mon)
-                    f2 = Image.frombytes("RGB", shot2.size, shot2.bgra, "raw", "BGRX")
-                    a1 = _np.array(frames[-1])
-                    a2 = _np.array(f2)
-                    if _np.array_equal(a1, a2):
-                        break   # reached end of page
+                    img2 = Image.frombytes("RGB", shot2.size, shot2.bgra, "raw", "BGRX")
+                    
+                    a1 = _np.array(img1.convert("L"))
+                    a2 = _np.array(img2.convert("L"))
+                    
+                    # Ucinamy prawy margines z suwakiem systemowym (ok. 60px)
+                    w = a1.shape[1]
+                    crop_w = w - 60 if w > 100 else w
+                    
+                    # Fuzzy match: mierzymy średnią różnicę pikseli
+                    # (Toleruje migające kursory i cienie)
+                    diff = _np.mean(_np.abs(a1[:, :crop_w].astype(int) - a2[:, :crop_w].astype(int)))
+                    if diff < 2.0:  # Różnica jest mikroskopijna = dotarliśmy do końca strony
+                        print(f"Osiągnięto koniec strony na klatce {i+1}")
+                        break
 
         if not frames: return None
         if len(frames) == 1:
             return self._save(frames[0], "scroll")
 
-        def detect_scroll_offset(img_a, img_b, max_search=None):
-            """Find vertical offset between img_b relative to img_a using strip matching."""
+        def detect_scroll_offset(img_a, img_b):
+            """Wylicza przesunięcie przy użyciu dopasowania bloku z górnej części ekranu."""
             arr_a = _np.array(img_a.convert("L"))
             arr_b = _np.array(img_b.convert("L"))
-            h = arr_a.shape[0]
-            if max_search is None:
-                max_search = h
-            strip_h = min(60, h // 8)
-            # Use a strip from the BOTTOM of img_a to search in img_b
-            ref = arr_a[h - strip_h: h, :]
+            h, w = arr_a.shape
+            
+            crop_w = w - 60 if w > 100 else w
+            arr_a = arr_a[:, :crop_w]
+            arr_b = arr_b[:, :crop_w]
+
+            # 1. Wysokość górnego, przyklejonego menu (z tolerancją różnic)
+            sticky_h = 0
+            for y in range(h):
+                if _np.mean(_np.abs(arr_a[y].astype(int) - arr_b[y].astype(int))) > 5:
+                    break
+                sticky_h += 1
+            
+            if sticky_h > h * 0.5:
+                sticky_h = 0
+
+            # 2. Template Matching: bierzemy wycinek świeżego tekstu z nowej klatki
+            # Tuż spod przyklejonego menu.
+            block_h = min(150, h // 4)
+            if sticky_h + block_h >= h:
+                return h // 2
+                
+            block = arr_b[sticky_h : sticky_h + block_h]
+            
             best_score = float("inf")
-            best_off = h // 2
-            for off in range(strip_h, min(max_search, h - strip_h)):
-                candidate = arr_b[off - strip_h: off, :]
-                if candidate.shape != ref.shape:
-                    continue
-                score = float(_np.mean(_np.abs(ref.astype(int) - candidate.astype(int))))
+            best_shift = 0
+            
+            # Przesuwamy ten wycinek po starej klatce, by sprawdzić gdzie był przed chwilą
+            for shift in range(10, h - sticky_h - block_h):
+                y_in_a = sticky_h + shift
+                strip_a = arr_a[y_in_a : y_in_a + block_h]
+                score = _np.mean(_np.abs(strip_a.astype(int) - block.astype(int)))
+                
                 if score < best_score:
                     best_score = score
-                    best_off = off
-            # best_off = where the bottom strip of img_a appears in img_b
-            # → new content starts at (h - best_off) from bottom of img_a
-            scroll_amount = h - best_off
-            return max(1, scroll_amount)
+                    best_shift = shift
+                    
+            if best_score > 35: # Jeśli nic nie pasuje wcale (wideo full-screen itp.)
+                return 50
+                
+            return best_shift
 
-        # Stitch: first frame in full, then only the NEW rows from each subsequent frame
+        # Pierwsza klatka to podstawa
         strips = [frames[0]]
-        offsets = []
         for i in range(1, len(frames)):
-            off = detect_scroll_offset(frames[i-1], frames[i])
-            offsets.append(off)
-            # New content = bottom `off` rows of frames[i]
-            new_h = frames[i].height - off
-            if new_h < 2:
-                new_h = off
-            strips.append(frames[i].crop((0, frames[i].height - new_h, frames[i].width, frames[i].height)))
+            # Wyliczamy o ile ekran zjechał w dół
+            shift = detect_scroll_offset(frames[i-1], frames[i])
+            
+            if shift < 2:
+                shift = 50
+                
+            # Wycinamy tylko `shift` NOWYCH pikseli z samego dołu klatki
+            crop_box = (0, frames[i].height - shift, frames[i].width, frames[i].height)
+            strips.append(frames[i].crop(crop_box))
 
+        # Sklejanie wszystkich pasków w jeden wielki obraz
         total_h = sum(s.size[1] for s in strips)
         canvas = Image.new("RGB", (frames[0].width, total_h))
         yo = 0
@@ -2377,14 +2429,30 @@ class MainWindow(QMainWindow):
             self.engine.capture_fullscreen(), "Full screen"), daemon=True).start()
 
     def act_scrolling(self):
-        self._status("Scrolling capture — scroll now…")
-        self.hide(); QTimer.singleShot(500, self._do_scroll)
+        self._status("Zaznacz obszar do przewijania (Scrolling capture)…")
+        self.hide()
+        QTimer.singleShot(160, self._do_scroll_region)
 
-    def _do_scroll(self):
+    def _do_scroll_region(self):
+        # Uruchamiamy sprawdzony selektor obszaru
+        self._sel = RegionSelector()
+        self._sel.region_selected.connect(self._on_scroll_region)
+        self._sel.cancelled.connect(self.show_win)
+
+    def _on_scroll_region(self, x, y, w, h):
+        if w < 5 or h < 5: 
+            self.show_win()
+            return
+
+        self._status("Scrolling capture — przewijanie…")
+
         def do():
-            p = self.engine.capture_scrolling()
+            time.sleep(0.05)
+            # Przekazujemy wycięty obszar do silnika
+            p = self.engine.capture_scrolling(region=(x, y, w, h))
             self._done(p, "Scroll")
             QTimer.singleShot(0, self.show_win)
+
         threading.Thread(target=do, daemon=True).start()
 
     # ════════════════════════════════════════
