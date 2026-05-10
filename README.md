@@ -15,7 +15,7 @@ ffmpeg must be installed separately: <br>
 Windows: https://ffmpeg.org/download.html (or: winget install ffmpeg) <br>
 Linux: sudo apt install ffmpeg <br>
 
-### Optional - OCR (requires tesseract in the system) <br>
+### Optional - OCR (requires tesseract [or easyocr] in the system) <br>
 Windows: https://github.com/UB-Mannheim/tesseract/wiki <br>
 Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
 
