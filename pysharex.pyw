@@ -20,7 +20,7 @@ from pathlib import Path
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QAbstractSpinBox, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
     QSystemTrayIcon, QMenu, QFileDialog, QDialog, QLineEdit,
     QComboBox, QCheckBox, QGroupBox, QScrollArea, QFrame,
@@ -418,17 +418,18 @@ class FFmpegConverterThread(QThread):
             self.process.terminate()
 
 from PyQt6.QtWidgets import (QGridLayout, QFormLayout, QProgressBar)
+from PyQt6.QtWidgets import QSlider
 
 class VideoConverterDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Video Converter")
-        self.resize(700, 550)
+        self.resize(750, 650)
         self.thread = None
 
         layout = QVBoxLayout(self)
 
-        # --- FILE SECTION ---
+        # --- FILE PATHS ---
         file_group = QGroupBox("File paths")
         file_layout = QGridLayout()
 
@@ -445,22 +446,18 @@ class VideoConverterDialog(QDialog):
         file_layout.addWidget(QLabel("Input file:"), 0, 0)
         file_layout.addWidget(self.input_edit, 0, 1)
         file_layout.addWidget(self.btn_browse_input, 0, 2)
-
         file_layout.addWidget(QLabel("Output folder:"), 1, 0)
         file_layout.addWidget(self.output_dir_edit, 1, 1)
         file_layout.addWidget(self.btn_browse_output, 1, 2)
-
-        file_layout.addWidget(QLabel("Output file name:"), 2, 0)
+        file_layout.addWidget(QLabel("Output name:"), 2, 0)
         file_layout.addWidget(self.output_name_edit, 2, 1)
-        
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
 
-        # --- ENCODING SETTINGS ---
-        settings_layout = QHBoxLayout()
         
-        # Video Options
+        # --- VIDEO OPTIONS ---
         video_group = QGroupBox("Video options")
+        v_main_layout = QVBoxLayout()
         video_form = QFormLayout()
         
         self.video_codec_combo = QComboBox()
@@ -470,19 +467,70 @@ class VideoConverterDialog(QDialog):
             "AV1 (libaom-av1)", "Copy (no re-compression)", "None"
         ])
         
-        self.video_bitrate_spin = QSpinBox()
-        self.video_bitrate_spin.setRange(0, 50000)
-        self.video_bitrate_spin.setSuffix(" kbps")
-        self.video_bitrate_spin.setSpecialValueText("0 (Auto / CRF)")
-        self.video_bitrate_spin.setValue(0)
+        # 1. Quality Controls
+        self.quality_check = QCheckBox("Set custom video quality (CRF)")
         
-        video_form.addRow("Video codec:", self.video_codec_combo)
-        video_form.addRow("Video bitrate:", self.video_bitrate_spin)
-        video_group.setLayout(video_form)
-        settings_layout.addWidget(video_group)
+        quality_widget = QWidget()
+        quality_vbox = QVBoxLayout(quality_widget)
+        quality_vbox.setContentsMargins(0, 5, 0, 5)
 
-        # Audio & Format Options
-        audio_group = QGroupBox("Audio & Output options")
+        self.quality_label = QLabel("Quality: Standard (CRF 23)")
+        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.quality_slider.setRange(0, 51)
+        self.quality_slider.setValue(28) # Value 28 corresponds to CRF 23
+        
+        quality_hint_layout = QHBoxLayout()
+        low_lbl = QLabel("Smaller file / Lower quality"); low_lbl.setStyleSheet("font-size: 10px; color: #888;")
+        high_lbl = QLabel("Higher quality / Bigger file"); high_lbl.setStyleSheet("font-size: 10px; color: #888;")
+        quality_hint_layout.addWidget(low_lbl)
+        quality_hint_layout.addStretch()
+        quality_hint_layout.addWidget(high_lbl)
+
+        quality_vbox.addWidget(self.quality_label)
+        quality_vbox.addWidget(self.quality_slider)
+        quality_vbox.addLayout(quality_hint_layout)
+
+        # Quality logic
+        def update_quality_ui(val):
+            crf = 51 - val
+            desc = "Standard"
+            if crf <= 17: desc = "Excellent"
+            elif crf <= 23: desc = "Standard"
+            elif crf <= 28: desc = "Medium"
+            else: desc = "Low"
+            self.quality_label.setText(f"Quality: {desc} (CRF {crf})")
+
+        self.quality_slider.valueChanged.connect(update_quality_ui)
+        self.quality_slider.setEnabled(False)
+        self.quality_label.setEnabled(False)
+        self.quality_check.toggled.connect(self.quality_slider.setEnabled)
+        self.quality_check.toggled.connect(self.quality_label.setEnabled)
+
+        # 2. Scale (Resize)
+        self.scale_combo = QComboBox()
+        self.scale_combo.addItems(["Original", "1920x1080", "1280x720", "854x480", "640x360"])
+
+        # 3. FPS Controls
+        self.fps_orig_check = QCheckBox("Use video’s original framerate")
+        self.fps_orig_check.setChecked(True)
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(1, 240)
+        self.fps_spin.setValue(60)
+        self.fps_spin.setEnabled(False)
+        self.fps_orig_check.toggled.connect(lambda checked: self.fps_spin.setEnabled(not checked))
+        # 4. Assemble the Form (NO DUPLICATES)
+        video_form.addRow("Video codec:", self.video_codec_combo)
+        video_form.addRow(self.quality_check)
+        video_form.addRow(quality_widget)
+        video_form.addRow("Scale (Resize):", self.scale_combo)
+        video_form.addRow(self.fps_orig_check)
+        video_form.addRow("Custom FPS:", self.fps_spin)
+        
+        v_main_layout.addLayout(video_form)
+        video_group.setLayout(v_main_layout)
+
+        # --- AUDIO & FORMAT ---
+        audio_group = QGroupBox("Audio & Format")
         audio_form = QFormLayout()
         
         self.audio_codec_combo = QComboBox()
@@ -491,32 +539,27 @@ class VideoConverterDialog(QDialog):
             "Vorbis (libvorbis)", "Copy (no re-compression)", "None"
         ])
         
-        self.audio_bitrate_spin = QSpinBox()
-        self.audio_bitrate_spin.setRange(0, 1000)
-        self.audio_bitrate_spin.setSuffix(" kbps")
-        self.audio_bitrate_spin.setSpecialValueText("0 (Auto)")
-        self.audio_bitrate_spin.setValue(128)
-        
         self.format_combo = QComboBox()
         self.format_combo.addItems(["MP4", "WebM", "MKV", "AVI", "GIF"])
         
         audio_form.addRow("Audio codec:", self.audio_codec_combo)
-        audio_form.addRow("Audio bitrate:", self.audio_bitrate_spin)
         audio_form.addRow("Output format:", self.format_combo)
         audio_group.setLayout(audio_form)
-        settings_layout.addWidget(audio_group)
 
+        settings_layout = QHBoxLayout()
+        settings_layout.addWidget(video_group)
+        settings_layout.addWidget(audio_group)
         layout.addLayout(settings_layout)
 
-        # --- LOGS AND CONTROL ---
+        # --- LOGS & BUTTONS ---
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 9) if sys.platform=="win32" else QFont("Monospace", 9))
         layout.addWidget(self.log_text)
 
         button_layout = QHBoxLayout()
-        self.btn_start = QPushButton("Start encode")
+        self.btn_start = QPushButton("Start encoding")
         self.btn_start.clicked.connect(self.start_conversion)
-        
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self.cancel_conversion)
@@ -525,6 +568,7 @@ class VideoConverterDialog(QDialog):
         button_layout.addWidget(self.btn_start)
         button_layout.addWidget(self.btn_cancel)
         layout.addLayout(button_layout)
+        
 
     def browse_input(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select video file", "", "Video Files (*.mp4 *.mkv *.avi *.webm *.mov);;All Files (*)")
@@ -540,47 +584,43 @@ class VideoConverterDialog(QDialog):
             self.output_dir_edit.setText(dir_path)
 
     def get_ffmpeg_args(self):
-        v_codecs = {
-            "H.264/AVC (libx264)": "libx264", 
-            "H.265/HEVC (libx265)": "libx265", 
-            "VP8 (libvpx)": "libvpx", 
-            "VP9 (libvpx-vp9)": "libvpx-vp9", 
-            "AV1 (libaom-av1)": "libaom-av1", 
-            "Copy (no re-compression)": "copy"
-        }
+        v_codecs = {"H.264/AVC (libx264)": "libx264", "H.265/HEVC (libx265)": "libx265", 
+                    "VP8 (libvpx)": "libvpx", "VP9 (libvpx-vp9)": "libvpx-vp9", 
+                    "AV1 (libaom-av1)": "libaom-av1", "Copy (no re-compression)": "copy"}
         
-        a_codecs = {
-            "AAC (aac)": "aac", 
-            "MP3 (libmp3lame)": "libmp3lame", 
-            "Opus (libopus)": "libopus", 
-            "Vorbis (libvorbis)": "libvorbis", 
-            "Copy (no re-compression)": "copy"
-        }
+        a_codecs = {"AAC (aac)": "aac", "MP3 (libmp3lame)": "libmp3lame", 
+                    "Opus (libopus)": "libopus", "Vorbis (libvorbis)": "libvorbis", 
+                    "Copy (no re-compression)": "copy"}
 
         v_val = self.video_codec_combo.currentText()
         a_val = self.audio_codec_combo.currentText()
-
-        # -map 0:v:0 -map 0:a? zapewnia, że audio zostanie dołączone jeśli istnieje
         args = ["-map", "0:v:0", "-map", "0:a?"]
         
+        # --- VIDEO ---
         # --- VIDEO ---
         if v_val == "None":
             args.append("-vn")
         else:
             codec = v_codecs.get(v_val, "libx264")
             args.extend(["-c:v", codec])
-            
             if codec != "copy":
-                # Zapewnienie kompatybilności kolorów dla większości odtwarzaczy
                 args.extend(["-pix_fmt", "yuv420p"])
                 
-                v_bitrate = self.video_bitrate_spin.value()
-                if v_bitrate > 0:
-                    args.extend(["-b:v", f"{v_bitrate}k"])
-                else:
-                    # Jeśli bitrate to 0, używamy CRF (Constant Rate Factor)
-                    # Zakładamy domyślnie 23, jeśli nie masz suwaka, lub dodaj self.quality_slider
-                    args.extend(["-crf", "23"])
+                # --- Quality Logic ---
+                if self.quality_check.isChecked():
+                    # Invert the slider value back to FFmpeg CRF
+                    real_crf = 51 - self.quality_slider.value()
+                    args.extend(["-crf", str(real_crf)])
+                
+                # Resizing
+                scale = self.scale_combo.currentText()
+                if scale != "Original":
+                    w, h = scale.split('x')
+                    args.extend(["-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"])
+
+                # --- Update FPS Logic ---
+                if not self.fps_orig_check.isChecked():
+                    args.extend(["-r", str(self.fps_spin.value())])
 
         # --- AUDIO ---
         if a_val == "None":
@@ -588,15 +628,9 @@ class VideoConverterDialog(QDialog):
         else:
             codec = a_codecs.get(a_val, "aac")
             args.extend(["-c:a", codec])
-            
             if codec != "copy":
-                a_bitrate = self.audio_bitrate_spin.value()
-                if a_bitrate > 0:
-                    args.extend(["-b:a", f"{a_bitrate}k"])
-                else:
-                    args.extend(["-b:a", "128k"]) # Rozsądny domyślny bitrate
+                args.extend(["-b:a", "128k"])
 
-        # Flagi dla plików MP4, aby można było je odtwarzać zanim się całkiem pobiorą/skonwertują
         if self.format_combo.currentText().lower() == "mp4":
             args.extend(["-movflags", "+faststart"])
 
@@ -609,24 +643,17 @@ class VideoConverterDialog(QDialog):
         ext = self.format_combo.currentText().lower()
 
         if not input_file or not os.path.exists(input_file):
-            QMessageBox.warning(self, "Error", "Please select a valid input file!")
+            QMessageBox.warning(self, "Error", "Invalid input file!")
             return
 
-        # Sprawdzenie czy to GIF (GIF-y nie obsługują dźwięku)
-        if ext == "gif":
-            QMessageBox.information(self, "Note", "Converting to GIF will strip the audio as the format doesn't support it.")
-
         output_path = os.path.join(output_dir, f"{output_name}.{ext}")
-        
-        # Budowanie komendy z poprawionymi argumentami
         cmd = ["ffmpeg", "-y", "-i", input_file] + self.get_ffmpeg_args() + [output_path]
 
         self.log_text.clear()
-        self.log_text.append(f"Running command:\n{' '.join(cmd)}\n")
+        self.log_text.append(f"Command: {' '.join(cmd)}\n")
         
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-
         self.thread = FFmpegConverterThread(cmd)
         self.thread.log_signal.connect(self.append_log)
         self.thread.finished_signal.connect(self.conversion_finished)
@@ -634,25 +661,17 @@ class VideoConverterDialog(QDialog):
 
     def append_log(self, text):
         self.log_text.append(text)
-        # Auto-scroll do dołu
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
 
     def cancel_conversion(self):
         if self.thread and self.thread.isRunning():
             self.thread.cancel()
-            self.log_text.append("\n[!] Cancelled by user.")
 
-    def conversion_finished(self, returncode):
+    def conversion_finished(self, code):
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
-        
-        if returncode == 0:
-            self.log_text.append("\n[✓] Conversion completed successfully!")
-        elif returncode == -99:
-            pass 
-        else:
-            self.log_text.append(f"\n[✗] Conversion error (Exit code: {returncode})")
+        msg = "[✓] Done!" if code == 0 else "[✗] Failed or Cancelled."
+        self.log_text.append(f"\n{msg}")
 
 
 # ─────────────────────────────────────────────
@@ -1917,8 +1936,7 @@ QComboBox { background:#181825; border:1px solid #45475a; border-radius:6px;
 QComboBox::drop-down { border:none; }
 QComboBox QAbstractItemView { background:#181825; border:1px solid #45475a;
     selection-background-color:#313244; }
-QSpinBox { background:#181825; border:1px solid #45475a; border-radius:6px;
-    padding:5px 8px; color:#cdd6f4; }
+
 QCheckBox::indicator { width:16px; height:16px; border-radius:4px;
     border:1px solid #45475a; background:#181825; }
 QCheckBox::indicator:checked { background:#89b4fa; border-color:#89b4fa; }
@@ -1984,6 +2002,47 @@ QRadioButton::indicator:checked:hover {
     background-color: #33bfff;
   width: 18px;
     height: 18px;
+}
+
+
+
+/* Gray out disabled SpinBoxes */
+QSpinBox:disabled {
+    background-color: #2b2b2b;
+    color: #555555;
+    border: 1px solid #444444;
+}
+
+QSpinBox::up-button {
+    width: 0px;
+} 
+
+QSpinBox::down-button 
+{
+    width: 0px;
+}
+
+QSpinBox { background:#181825; border:1px solid #45475a; border-radius:6px;
+    padding:5px 8px; color:#cdd6f4; }
+
+/* Gray out disabled Checkboxes and Labels */
+QCheckBox:disabled, QLabel:disabled {
+    color: #555555;
+}
+
+/* Gray out disabled Sliders */
+QSlider::handle:horizontal:disabled {
+    background: #444444;
+}
+
+/* Gray out disabled Checkboxes and Labels */
+QCheckBox:disabled, QLabel:disabled {
+    color: #555555;
+}
+
+/* Gray out disabled Sliders */
+QSlider::handle:horizontal:disabled {
+    background: #444444;
 }
 """
 
