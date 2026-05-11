@@ -19,6 +19,7 @@ import io
 from pathlib import Path
 from datetime import datetime
 
+import urllib.request # Potrzebne do otwierania z sieci
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -26,14 +27,16 @@ from PyQt6.QtWidgets import (
     QComboBox, QCheckBox, QGroupBox, QScrollArea, QFrame,
     QMessageBox, QListWidget, QListWidgetItem,
     QKeySequenceEdit, QDialogButtonBox, QSpinBox, QTabWidget,
-    QTextEdit, QSizePolicy, QStackedWidget
+    QTextEdit, QSizePolicy, QStackedWidget, QColorDialog, QInputDialog,
+    QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsRectItem, 
+    QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem
 )
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QSize, QRect, QPoint,
-    QStandardPaths, QElapsedTimer
+    QPointF, Qt, QThread, pyqtSignal, QTimer, QSize, QRect, QPoint,
+    QStandardPaths, QElapsedTimer, QLineF, QRectF
 )
 from PyQt6.QtGui import (
-    QIcon, QKeySequence, QAction, QPixmap, QPainter, QColor,
+    QIcon, QKeySequence, QAction, QMouseEvent, QPixmap, QPainter, QColor,
     QFont, QPen, QBrush, QCursor, QPainterPath, QImage
 )
 
@@ -691,7 +694,8 @@ class Config:
         {"name": "OCR – Recognize code",     "action": "ocr_code",                "shortcut": "Ctrl+Alt+K",             "enabled": True},
     ]
     DEFAULT_AFTER = {"copy_to_clipboard": True,  "save_to_file": True,
-                     "show_in_explorer": False, "scan_qr": False, "ocr_recognize": False}
+                     "show_in_explorer": False, "scan_qr": False, "ocr_recognize": False,
+                     "open_in_editor": False}
     DEFAULT_NOTIF = {"enabled": True, "sound": True, "thumbnail": True,
                       "show_path": True, "click_open_file": True, "click_open_folder": False}
 
@@ -2059,6 +2063,464 @@ def _tray_icon():
     p.drawRect(22, 7, 5, 4); p.end()
     return QIcon(pm)
 
+import urllib.request
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IMAGE EDITOR COMPONENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+from PyQt6.QtWidgets import QInputDialog, QGraphicsScene, QGraphicsView, QGraphicsItem, \
+    QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem
+
+from PyQt6.QtWidgets import QColorDialog, QSpinBox, QCheckBox
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IMPROVED IMAGE EDITOR COMPONENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IMAGE EDITOR COMPONENTS (FIXED)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ImageEditorStartDialog(QDialog):
+    def __init__(self, parent=None, default_dir=""):
+        super().__init__(parent)
+        self.setWindowTitle("Image Editor - Select Source")
+        self.setFixedSize(320, 180)
+        self.result_image = None
+        self.default_dir = default_dir
+        
+        layout = QVBoxLayout(self)
+        btn_file = QPushButton("📂 Open screenshot file")
+        btn_clipboard = QPushButton("📋 Open screenshot from clipboard")
+        btn_web = QPushButton("🌐 Open image from web")
+        
+        btn_file.clicked.connect(self.open_file)
+        btn_clipboard.clicked.connect(self.open_clipboard)
+        btn_web.clicked.connect(self.open_web)
+        
+        layout.addWidget(btn_file)
+        layout.addWidget(btn_clipboard)
+        layout.addWidget(btn_web)
+
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Image", self.default_dir, "Images (*.png *.jpg *.jpeg *.bmp)")
+        if path:
+            self.result_image = QPixmap(path)
+            self.accept()
+
+    def open_clipboard(self):
+        pixmap = QApplication.clipboard().pixmap()
+        if not pixmap.isNull():
+            self.result_image = pixmap
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Error", "No image in clipboard!")
+
+    def open_web(self):
+        url, ok = QInputDialog.getText(self, "Web Image", "Enter Image URL:")
+        if ok and url:
+            try:
+                data = urllib.request.urlopen(url).read()
+                pixmap = QPixmap()
+                pixmap.loadFromData(data)
+                if not pixmap.isNull():
+                    self.result_image = pixmap
+                    self.accept()
+                else: raise Exception("Invalid image")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ADVANCED IMAGE EDITOR COMPONENTS (WITH ZOOM, PAN, RESIZE & LIVE UPDATES)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ADVANCED IMAGE EDITOR (FIXED POSITIONING, SCALING & ALPHA CHANNEL)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FINAL IMAGE EDITOR (FIXED SCALING, DELETE, SAVE AS & CTRL PROPORTIONS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EditorCanvas(QGraphicsView):
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+        
+        # Enable keyboard focus for Delete key
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        
+        self.bg_item = self.scene.addPixmap(pixmap)
+        self.bg_item.setZValue(-100)
+        self.bg_pixmap = pixmap
+        
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        
+        # State
+        self.current_tool = "Select"
+        self.start_point = None
+        self.current_item = None
+        self.is_dirty = False
+        self.resizing_item = None
+        self.resize_handle = None # 'T', 'B', 'L', 'R', 'TL', 'TR', 'BL', 'BR'
+        
+        # Drawing Props
+        self.stroke_color = QColor(255, 0, 0, 255)
+        self.fill_color = QColor(255, 0, 0, 0)
+        self.stroke_width = 3
+        self.font_size = 14
+        self.is_filled = False
+
+    def keyPressEvent(self, event):
+        """Handle Delete key to remove selected items."""
+        if event.key() == Qt.Key.Key_Delete:
+            for item in self.scene.selectedItems():
+                if item != self.bg_item:
+                    self.scene.removeItem(item)
+                    self.is_dirty = True
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event):
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+            self.scale(factor, factor)
+        else:
+            super().wheelEvent(event)
+
+    def mousePressEvent(self, event):
+        self.setFocus() # Ensure canvas has focus for keyboard events
+        scene_pos = self.mapToScene(event.pos())
+        
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            fake = QMouseEvent(event.type(), event.position(), Qt.MouseButton.LeftButton, 
+                               Qt.MouseButton.LeftButton, event.modifiers())
+            super().mousePressEvent(fake)
+            return
+
+        if self.current_tool == "Eraser":
+            self.erase_at(scene_pos)
+            return
+
+        if self.current_tool == "Select":
+            # Detect which handle was clicked
+            self.resizing_item, self.resize_handle = self.get_handle_at(scene_pos)
+            if self.resizing_item:
+                self.start_point = scene_pos
+                return # Block regular selection/drawing
+            super().mousePressEvent(event)
+            return
+
+        # Drawing Mode
+        self.is_dirty = True
+        self.start_point = scene_pos
+        if self.current_tool == "Rectangle": self.current_item = QGraphicsRectItem()
+        elif self.current_tool == "Circle": self.current_item = QGraphicsEllipseItem()
+        elif self.current_tool == "Line": self.current_item = QGraphicsLineItem()
+        elif self.current_tool == "Freehand":
+            self.current_item = QGraphicsPathItem()
+            self.current_item.setPath(QPainterPath(self.start_point))
+        
+        if self.current_item:
+            self.apply_props(self.current_item)
+            self.scene.addItem(self.current_item)
+
+    def mouseMoveEvent(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        
+        if self.current_tool == "Select" and not self.resizing_item:
+            _, handle = self.get_handle_at(scene_pos)
+            self.update_cursor_by_handle(handle)
+
+        if self.resizing_item and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.handle_resize_logic(scene_pos, event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            self.is_dirty = True
+            return
+
+        if self.current_tool == "Eraser" and event.buttons() & Qt.MouseButton.LeftButton:
+            self.erase_at(scene_pos)
+            return
+
+        if not self.current_item:
+            super().mouseMoveEvent(event)
+            return
+
+        # Regular Drawing
+        rect = QRectF(self.start_point, scene_pos).normalized()
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Proportional drawing (Square/Circle)
+            side = max(rect.width(), rect.height())
+            rect = QRectF(self.start_point.x(), self.start_point.y(), 
+                          side if scene_pos.x() > self.start_point.x() else -side,
+                          side if scene_pos.y() > self.start_point.y() else -side).normalized()
+
+        if self.current_tool in ["Rectangle", "Circle"]: self.current_item.setRect(rect)
+        elif self.current_tool == "Line": self.current_item.setLine(QLineF(self.start_point, scene_pos))
+        elif self.current_tool == "Freehand":
+            path = self.current_item.path(); path.lineTo(scene_pos); self.current_item.setPath(path)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        
+        if self.current_tool == "Text" and self.start_point:
+            txt, ok = QInputDialog.getMultiLineText(self, "Text", "Enter text:", "")
+            if ok and txt:
+                item = QGraphicsTextItem(txt)
+                item.setPos(self.start_point); self.apply_props(item)
+                self.scene.addItem(item); self.is_dirty = True
+
+        self.current_item = None
+        self.resizing_item = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        item = self.scene.itemAt(scene_pos, self.transform())
+        if isinstance(item, QGraphicsTextItem):
+            txt, ok = QInputDialog.getMultiLineText(self, "Edit Text", "Update text:", item.toPlainText())
+            if ok and txt:
+                item.setPlainText(txt)
+                self.is_dirty = True
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        item = self.scene.itemAt(scene_pos, self.transform())
+        if isinstance(item, QGraphicsTextItem):
+            menu = QMenu(self)
+            edit_action = menu.addAction("✏️ Edit Text")
+            action = menu.exec(event.globalPos())
+            if action == edit_action:
+                txt, ok = QInputDialog.getMultiLineText(self, "Edit Text", "Update text:", item.toPlainText())
+                if ok and txt:
+                    item.setPlainText(txt)
+                    self.is_dirty = True
+        else:
+            super().contextMenuEvent(event)
+
+    def get_handle_at(self, pos):
+        """Returns (item, handle_name) if mouse is over a resize handle of a selected item."""
+        for item in self.scene.selectedItems():
+            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem)):
+                rect = item.sceneBoundingRect()
+                m = 10 / self.transform().m11() # Scale-aware margin
+                
+                L, R = abs(pos.x() - rect.left()) < m, abs(pos.x() - rect.right()) < m
+                T, B = abs(pos.y() - rect.top()) < m, abs(pos.y() - rect.bottom()) < m
+                
+                if L and T: return item, 'TL'
+                if R and T: return item, 'TR'
+                if L and B: return item, 'BL'
+                if R and B: return item, 'BR'
+                if L: return item, 'L'
+                if R: return item, 'R'
+                if T: return item, 'T'
+                if B: return item, 'B'
+        return None, None
+
+    def update_cursor_by_handle(self, handle):
+        if not handle: self.setCursor(Qt.CursorShape.ArrowCursor)
+        elif handle in ['TL', 'BR']: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif handle in ['TR', 'BL']: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif handle in ['L', 'R']: self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif handle in ['T', 'B']: self.setCursor(Qt.CursorShape.SizeVerCursor)
+
+    def handle_resize_logic(self, pos, proportional):
+        item = self.resizing_item
+        # Pobieramy lokalne kordynaty obiektu (a nie z całej sceny)
+        rect = item.rect()
+        
+        # Konwertujemy pozycję myszy ze sceny na lokalną dla danego obiektu
+        local_pos = item.mapFromScene(pos)
+        
+        left, top, right, bottom = rect.left(), rect.top(), rect.right(), rect.bottom()
+        
+        if 'L' in self.resize_handle: left = local_pos.x()
+        if 'R' in self.resize_handle: right = local_pos.x()
+        if 'T' in self.resize_handle: top = local_pos.y()
+        if 'B' in self.resize_handle: bottom = local_pos.y()
+        
+        new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+        
+        if proportional:
+            side = max(new_rect.width(), new_rect.height())
+            # Zachowaj punkt zaczepienia w zależności od chwyconego uchwytu
+            if 'L' in self.resize_handle: left = right - side
+            else: right = left + side
+            
+            if 'T' in self.resize_handle: top = bottom - side
+            else: bottom = top + side
+            
+            new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+            
+        item.setRect(new_rect)
+
+    def erase_at(self, pos):
+        for item in self.scene.items(pos):
+            if item != self.bg_item:
+                self.scene.removeItem(item)
+                self.is_dirty = True
+
+    def apply_props(self, item):
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | 
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+        pen = QPen(self.stroke_color, self.stroke_width)
+        brush = QBrush(self.fill_color if self.is_filled else Qt.GlobalColor.transparent)
+        if isinstance(item, QGraphicsTextItem):
+            item.setDefaultTextColor(self.stroke_color)
+            item.setFont(QFont("Arial", int(self.font_size)))
+        else:
+            if hasattr(item, "setPen"): item.setPen(pen)
+            if hasattr(item, "setBrush"): item.setBrush(brush)
+
+class ImageEditorWindow(QMainWindow):
+    def __init__(self, pixmap, save_callback, default_dir="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("PyshareX Image Editor")
+        self.setWindowIcon(load_app_icon())  # Naprawa ikonki okna
+        self.save_callback = save_callback
+        self.default_dir = default_dir
+        self.saved = False
+        
+        central = QWidget(); self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        
+        # Row 1: Tools
+        tbar = QHBoxLayout()
+        self.btns = {}
+        for n, i in [("Select", "🖱️"), ("Rectangle", "⬜"), ("Circle", "⭕"), 
+                     ("Line", "📏"), ("Freehand", "✏️"), ("Text", "T"), ("Eraser", "🧹")]:
+            b = QPushButton(i); b.setCheckable(True)
+            b.setFixedSize(40, 40)  # Większy stały rozmiar
+            # Styl: usunięcie marginesów i wyśrodkowanie tekstu/emoji
+            b.setStyleSheet("""
+                QPushButton { 
+                    font-size: 20px; 
+                    padding: 0px; 
+                    margin: 0px; 
+                    border: 1px solid #ccc; 
+                    border-radius: 4px; 
+                }
+                QPushButton:checked { 
+                    background-color: #3498db; 
+                    color: white; 
+                }
+            """)
+            b.clicked.connect(lambda ch, name=n: self.select_tool(name))
+            tbar.addWidget(b); self.btns[n] = b
+            
+        tbar.addStretch()
+        
+        # Save Buttons
+        btn_save = QPushButton("💾 Save"); btn_save.clicked.connect(self.save_default)
+        btn_save_as = QPushButton("💾 Save As..."); btn_save_as.clicked.connect(self.save_as)
+        btn_save.setStyleSheet("background: #27ae60; color: white; font-weight: bold; padding: 5px 10px;")
+        btn_save_as.setStyleSheet("background: #2980b9; color: white; font-weight: bold; padding: 5px 10px;")
+        tbar.addWidget(btn_save)
+        tbar.addWidget(btn_save_as)
+        layout.addLayout(tbar)
+        
+        # Row 2: Props
+        pbar = QHBoxLayout()
+        self.btn_c = QPushButton("Color / Alpha"); self.btn_c.clicked.connect(self.pick_color)
+        pbar.addWidget(self.btn_c)
+        pbar.addWidget(QLabel("Size:"))
+        self.spin = QSpinBox(); self.spin.setRange(1,100); self.spin.setValue(3)
+        self.spin.valueChanged.connect(self.update_live_props)
+        pbar.addWidget(self.spin)
+        self.fill = QCheckBox("Fill Shape"); self.fill.stateChanged.connect(self.update_live_props)
+        pbar.addWidget(self.fill)
+        pbar.addStretch()
+        layout.addLayout(pbar)
+
+        self.canvas = EditorCanvas(pixmap)
+        layout.addWidget(self.canvas)
+        self.showMaximized()
+        self.select_tool("Select")
+
+    def select_tool(self, name):
+        self.canvas.current_tool = name
+        for n, b in self.btns.items(): b.setChecked(n == name)
+
+    def pick_color(self):
+        # Tworzymy instancję okna zamiast metody statycznej
+        dialog = QColorDialog(self.canvas.stroke_color, self)
+        dialog.setWindowTitle("Pick Color & Alpha")
+        
+        # Kluczowa linia: ShowAlphaChannel dodaje suwak, DontUseNativeDialog wyłącza stare okno Windowsa
+        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        
+        if dialog.exec():
+            c = dialog.selectedColor()
+            if c.isValid():
+                self.canvas.stroke_color = c
+                self.canvas.fill_color = c
+                
+                # Odświeżamy podgląd na przycisku (obsługa przezroczystości w podglądzie)
+                rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
+                self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
+                self.update_live_props()
+
+    def update_live_props(self):
+        self.canvas.stroke_width = self.spin.value()
+        self.canvas.font_size = self.spin.value()
+        self.canvas.is_filled = self.fill.isChecked()
+        
+        # Jeśli użytkownik nie chce wypełnienia, ustawiamy kolor wypełnienia na przezroczysty
+        # ale jeśli CHCE, to bierzemy kolor wybrany w pick_color (który ma już w sobie Alpha)
+        if not self.canvas.is_filled:
+            self.canvas.fill_color = QColor(0, 0, 0, 0)
+        else:
+            self.canvas.fill_color = self.canvas.stroke_color
+
+        for item in self.canvas.scene.selectedItems():
+            self.canvas.apply_props(item)
+        self.canvas.is_dirty = True
+        for item in self.canvas.scene.selectedItems():
+            self.canvas.apply_props(item)
+            self.canvas.is_dirty = True
+
+    def save_default(self):
+        img = self.render_scene()
+        self.save_callback(img)
+        self.saved = True
+        self.close()
+
+    def save_as(self):
+        import os
+        from datetime import datetime
+        default_path = os.path.join(self.default_dir, f"edited_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Image As", default_path, "PNG (*.png);;JPG (*.jpg)")
+        if path:
+            img = self.render_scene()
+            img.save(path)
+            self.saved = True
+            self.close()
+
+    def render_scene(self):
+        self.canvas.scene.clearSelection()
+        rect = self.canvas.scene.itemsBoundingRect()
+        img = QImage(rect.size().toSize(), QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img); self.canvas.scene.render(p); p.end()
+        return img
+
+    def closeEvent(self, event):
+        if self.canvas.is_dirty and not self.saved:
+            res = QMessageBox.warning(self, "Unsaved Changes", "Quit without saving?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if res == QMessageBox.StandardButton.Yes: event.accept()
+            else: event.ignore()
+        else: event.accept()
+
+
 
 # ─────────────────────────────────────────────
 #  MAIN WINDOW  (settings embedded)
@@ -2327,7 +2789,8 @@ class MainWindow(QMainWindow):
                          ("save_to_file",     "💾 Save to file"),
                          ("show_in_explorer", "📁 Show in explorer"),
                          ("scan_qr",          "🔳 Scan QR code"),
-                         ("ocr_recognize",    "🔤 Recognize text (OCR)")]:
+                         ("ocr_recognize",    "🔤 Recognize text (OCR)"),
+                         ("open_in_editor",   "🎨 Open in Image Editor")]:
             cb = QCheckBox(lbl2); cb.setChecked(ac.get(k, False))
             self._ac[k] = cb; acl.addWidget(cb)
         lay.addWidget(acg)
@@ -2435,6 +2898,7 @@ class MainWindow(QMainWindow):
         tm.addAction("OCR – Recognize text").triggered.connect(self.act_ocr_text)
         tm.addAction("OCR – Recognize code").triggered.connect(self.act_ocr_code)
         tm.addAction("Video Converter").triggered.connect(self.act_video_converter)
+        tm.addAction("Image Editor").triggered.connect(self.open_image_editor)
 
         am = mb.addMenu("Application")
         am.addAction("Screenshots folder").triggered.connect(self._open_folder)
@@ -2468,7 +2932,8 @@ class MainWindow(QMainWindow):
         tsub.addAction("OCR – text").triggered.connect(self.act_ocr_text)
         tsub.addAction("OCR – code").triggered.connect(self.act_ocr_code)
         tsub.addAction("Video Converter").triggered.connect(self.act_video_converter)
-
+        tsub.addAction("Image Editor").triggered.connect(self.open_image_editor)
+        
         menu.addSeparator()
         menu.addAction("Screenshots folder").triggered.connect(self._open_folder)
         menu.addSeparator()
@@ -2717,15 +3182,29 @@ class MainWindow(QMainWindow):
             elif p.startswith("F") and p[1:].isdigit(): res.append(f"<f{p[1:]}>")
             elif p: res.append(p.lower())
         return "+".join(res)
-
+    
+    
+    
     # ════════════════════════════════════════
     #  CAPTURE ACTIONS
     # ════════════════════════════════════════
 
     def _on_notify(self, path, pixmap=None):
-        """Called on main thread — safe to create QWidgets."""
         self._add_hist(path)
         notify(self.config, path, pixmap=pixmap)
+        
+        
+        # Sprawdzenie czy użytkownik chce otworzyć edytor
+        after = self.config.get("after_capture", {})
+        if after.get("open_in_editor"):
+            # Jeśli nie mamy pixmapy w pamięci, ładujemy z pliku
+            if not pixmap and os.path.exists(path):
+                pixmap = QPixmap(path)
+            
+            if pixmap:
+                # Otwieramy okno edytora
+                self.editor = ImageEditorWindow(pixmap, self.save_edited_image, self.config.get("save_folder", ""), self)
+                self.editor.show()
 
     def _done(self, path, label="Screenshot"):
         if path:
@@ -3117,7 +3596,32 @@ class MainWindow(QMainWindow):
         dlg = VideoConverterDialog(self)
         dlg.setStyleSheet(self.styleSheet()) # Opcjonalne: dopasowanie stylu do ciemnego motywu apki
         dlg.exec()
+    
+    def open_image_editor(self):
+        """Launches the Image Editor workflow."""
+        # Pobranie folderu zapisu z konfiguracji
+        screenshot_dir = self.config.get("save_folder", str(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)))
+        
+        start_dlg = ImageEditorStartDialog(self, default_dir=screenshot_dir)
+        if start_dlg.exec() == QDialog.DialogCode.Accepted:
+            pixmap = start_dlg.result_image
+            if pixmap:
+                # Otwarcie właściwego okna edytora (z przekazaniem screenshot_dir)
+                self.editor_win = ImageEditorWindow(pixmap, self.save_edited_image, screenshot_dir, self)
+                self.editor_win.show()
 
+    def save_edited_image(self, qimage):
+        """Saves the output from the editor to the screenshots folder."""
+        save_dir = Path(self.config.get("save_folder", "screenshots"))
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        filename = f"edited_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+        path = save_dir / filename
+        qimage.save(str(path), "PNG")
+        
+        # Powiadomienie (używa Twojej istniejącej metody powiadomień)
+        self._on_notify(str(path), None)
+    
     def _show_ocr(self, txt, title="Result"):
         dlg = OcrResultDialog(txt, parent=None)
         dlg.setWindowTitle(title)
