@@ -16,8 +16,8 @@ For the icon to be visible in the app, the .ico file must be inside "icons" fold
 ffmpeg must be installed separately: 
 <br>
 
-- Windows: https://ffmpeg.org/download.html
-or
+- Windows: https://ffmpeg.org/download.html  
+or  
 ```
 winget install ffmpeg
 ```
