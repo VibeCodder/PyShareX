@@ -2070,10 +2070,47 @@ import urllib.request
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  IMAGE EDITOR COMPONENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 from PyQt6.QtWidgets import QInputDialog, QGraphicsScene, QGraphicsView, QGraphicsItem, \
-    QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem
+    QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, \
+    QGraphicsTextItem
 
 from PyQt6.QtWidgets import QColorDialog, QSpinBox, QCheckBox
+
+
+class CropOverlayItem(QGraphicsRectItem):
+    """
+    Specjalny element reprezentujący obszar kadrowania.
+    Rysuje przyciemnienie poza obszarem cięcia oraz białą ramkę.
+    """
+    def __init__(self, full_rect):
+        super().__init__(full_rect)
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+        self.setZValue(1000)  # Zawsze na samej górze
+        self.setPen(QPen(Qt.GlobalColor.transparent))
+        self.setBrush(Qt.GlobalColor.transparent)
+
+    def paint(self, painter, option, widget=None):
+        scene_rect = self.scene().sceneRect() if self.scene() else self.rect()
+        crop_rect = self.rect()
+
+        # 1. Rysowanie przyciemnionego tła poza wyciętym obszarem (maska)
+        path = QPainterPath()
+        path.addRect(scene_rect)
+        path.addRect(crop_rect)
+        painter.setBrush(QColor(0, 0, 0, 140))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawPath(path)  # Metoda nieparzysto-parzysta domyślnie zostawi środek pusty
+
+        # 2. Rysowanie wyraźnej białej ramki kadrowania
+        painter.setBrush(Qt.GlobalColor.transparent)
+        pen = QPen(Qt.GlobalColor.white, 2, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.drawRect(crop_rect)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  IMPROVED IMAGE EDITOR COMPONENTS
@@ -2145,6 +2182,44 @@ class ImageEditorStartDialog(QDialog):
 #  FINAL IMAGE EDITOR (FIXED SCALING, DELETE, SAVE AS & CTRL PROPORTIONS)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class HighlightTextItem(QGraphicsTextItem):
+    def __init__(self, text, highlight_color=None):
+        super().__init__(text)
+        self.highlight_color = highlight_color
+
+    def paint(self, painter, option, widget=None):
+        # Rysowanie tła (podświetlenia) przed narysowaniem liter
+        if hasattr(self, 'highlight_color') and self.highlight_color and self.highlight_color.alpha() > 0:
+            painter.save()
+            painter.setBrush(QBrush(self.highlight_color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRect(self.boundingRect())
+            painter.restore()
+        super().paint(painter, option, widget)
+
+class ResizablePixmapItem(QGraphicsRectItem):
+    """
+    Niestandardowy element obrazka oparty na Rectangle, by zapewnić
+    kompatybilność z istniejącą mechaniką skalowania obiektów (uchwyty, setRect).
+    """
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self.pixmap = pixmap
+        # Ustaw początkowy rozmiar prostokąta taki jak rozmiar obrazka
+        self.setRect(QRectF(pixmap.rect()))
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+
+    def paint(self, painter, option, widget=None):
+        # Rysowanie obrazka przeskalowanego dynamicznie do wymiarów rect()
+        painter.drawPixmap(self.rect().toRect(), self.pixmap)
+        
+        # Jeśli obrazek jest zaznaczony, możemy narysować przerywaną ramkę
+        if self.isSelected():
+            pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.drawRect(self.rect())
+
 class EditorCanvas(QGraphicsView):
     def __init__(self, pixmap, parent=None):
         super().__init__(parent)
@@ -2168,6 +2243,7 @@ class EditorCanvas(QGraphicsView):
         self.is_dirty = False
         self.resizing_item = None
         self.resize_handle = None # 'T', 'B', 'L', 'R', 'TL', 'TR', 'BL', 'BR'
+        self.crop_item = None     # Referencja do aktywnej ramki kadrowania
         
         # Drawing Props
         self.stroke_color = QColor(255, 0, 0, 255)
@@ -2175,12 +2251,13 @@ class EditorCanvas(QGraphicsView):
         self.stroke_width = 3
         self.font_size = 14
         self.is_filled = False
+        self.text_highlight_color = QColor(255, 255, 0, 0) # Domyślnie przeźroczysty
 
     def keyPressEvent(self, event):
         """Handle Delete key to remove selected items."""
         if event.key() == Qt.Key.Key_Delete:
             for item in self.scene.selectedItems():
-                if item != self.bg_item:
+                if item != self.bg_item and item != self.crop_item:
                     self.scene.removeItem(item)
                     self.is_dirty = True
         super().keyPressEvent(event)
@@ -2206,6 +2283,14 @@ class EditorCanvas(QGraphicsView):
         if self.current_tool == "Eraser":
             self.erase_at(scene_pos)
             return
+
+        if self.current_tool == "Crop":
+            # W trybie Crop pozwalamy TYLKO na zmianę rozmiaru ramki kadrującej
+            self.resizing_item, self.resize_handle = self.get_handle_at(scene_pos)
+            if self.resizing_item and self.resizing_item == self.crop_item:
+                self.start_point = scene_pos
+                return
+            return # Całkowicie blokujemy przesuwanie i rysowanie w trybie Crop
 
         if self.current_tool == "Select":
             # Detect which handle was clicked
@@ -2233,7 +2318,7 @@ class EditorCanvas(QGraphicsView):
     def mouseMoveEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         
-        if self.current_tool == "Select" and not self.resizing_item:
+        if self.current_tool in ["Select", "Crop"] and not self.resizing_item:
             _, handle = self.get_handle_at(scene_pos)
             self.update_cursor_by_handle(handle)
 
@@ -2271,7 +2356,7 @@ class EditorCanvas(QGraphicsView):
         if self.current_tool == "Text" and self.start_point:
             txt, ok = QInputDialog.getMultiLineText(self, "Text", "Enter text:", "")
             if ok and txt:
-                item = QGraphicsTextItem(txt)
+                item = HighlightTextItem(txt, self.text_highlight_color)
                 item.setPos(self.start_point); self.apply_props(item)
                 self.scene.addItem(item); self.is_dirty = True
 
@@ -2282,7 +2367,7 @@ class EditorCanvas(QGraphicsView):
     def mouseDoubleClickEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         item = self.scene.itemAt(scene_pos, self.transform())
-        if isinstance(item, QGraphicsTextItem):
+        if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
             txt, ok = QInputDialog.getMultiLineText(self, "Edit Text", "Update text:", item.toPlainText())
             if ok and txt:
                 item.setPlainText(txt)
@@ -2293,7 +2378,7 @@ class EditorCanvas(QGraphicsView):
     def contextMenuEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         item = self.scene.itemAt(scene_pos, self.transform())
-        if isinstance(item, QGraphicsTextItem):
+        if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
             menu = QMenu(self)
             edit_action = menu.addAction("✏️ Edit Text")
             action = menu.exec(event.globalPos())
@@ -2308,7 +2393,7 @@ class EditorCanvas(QGraphicsView):
     def get_handle_at(self, pos):
         """Returns (item, handle_name) if mouse is over a resize handle of a selected item."""
         for item in self.scene.selectedItems():
-            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem)):
+            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, CropOverlayItem)):
                 rect = item.sceneBoundingRect()
                 m = 10 / self.transform().m11() # Scale-aware margin
                 
@@ -2360,6 +2445,11 @@ class EditorCanvas(QGraphicsView):
             
             new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
             
+        # Ograniczenie wychodzenia Crop poza granice głównego obrazu
+        if isinstance(item, CropOverlayItem):
+            scene_rect = self.scene.sceneRect()
+            new_rect = new_rect.intersected(scene_rect)
+            
         item.setRect(new_rect)
 
     def erase_at(self, pos):
@@ -2395,7 +2485,7 @@ class ImageEditorWindow(QMainWindow):
         # Row 1: Tools
         tbar = QHBoxLayout()
         self.btns = {}
-        for n, i in [("Select", "🖱️"), ("Rectangle", "⬜"), ("Circle", "⭕"), 
+        for n, i in [("Select", "🖱️"), ("Crop", "📐"), ("Rectangle", "⬜"), ("Circle", "⭕"), 
                      ("Line", "📏"), ("Freehand", "✏️"), ("Text", "T"), ("Eraser", "🧹")]:
             b = QPushButton(i); b.setCheckable(True)
             b.setFixedSize(40, 40)  # Większy stały rozmiar
@@ -2418,8 +2508,23 @@ class ImageEditorWindow(QMainWindow):
             
         tbar.addStretch()
         
+        # Dedykowany przycisk zatwierdzenia przycięcia (widoczny tylko w trybie Crop)
+        self.btn_apply_crop = QPushButton("✂️ Apply Crop")
+        self.btn_apply_crop.setStyleSheet("background: #e74c3c; color: white; font-weight: bold; padding: 5px 10px; font-size: 14px;")
+        self.btn_apply_crop.clicked.connect(self.apply_crop_action)
+        self.btn_apply_crop.hide()
+        tbar.addWidget(self.btn_apply_crop)
+
         # Save Buttons
-        btn_save = QPushButton("💾 Save"); btn_save.clicked.connect(self.save_default)
+        # Dodatkowe narzędzia (Import)
+        self.btn_import = QPushButton("🖼️ Import")
+        self.btn_import.setStyleSheet("background: #8e44ad; color: white; font-weight: bold; padding: 5px 10px;")
+        self.btn_import.clicked.connect(self.import_image)
+        tbar.addWidget(self.btn_import)
+
+        # Save Buttons
+        btn_save = QPushButton("💾 Save")
+        btn_save.clicked.connect(self.save_default)
         btn_save_as = QPushButton("💾 Save As..."); btn_save_as.clicked.connect(self.save_as)
         btn_save.setStyleSheet("background: #27ae60; color: white; font-weight: bold; padding: 5px 10px;")
         btn_save_as.setStyleSheet("background: #2980b9; color: white; font-weight: bold; padding: 5px 10px;")
@@ -2429,9 +2534,16 @@ class ImageEditorWindow(QMainWindow):
         
         # Row 2: Props
         pbar = QHBoxLayout()
-        self.btn_c = QPushButton("Color / Alpha"); self.btn_c.clicked.connect(self.pick_color)
+        self.btn_c = QPushButton("Color / Alpha")
+        self.btn_c.clicked.connect(self.pick_color)
         pbar.addWidget(self.btn_c)
+        
+        self.btn_hc = QPushButton("Highlight")
+        self.btn_hc.clicked.connect(self.pick_highlight_color)
+        pbar.addWidget(self.btn_hc)
+        
         pbar.addWidget(QLabel("Size:"))
+        
         self.spin = QSpinBox(); self.spin.setRange(1,100); self.spin.setValue(3)
         self.spin.valueChanged.connect(self.update_live_props)
         pbar.addWidget(self.spin)
@@ -2448,6 +2560,82 @@ class ImageEditorWindow(QMainWindow):
     def select_tool(self, name):
         self.canvas.current_tool = name
         for n, b in self.btns.items(): b.setChecked(n == name)
+        
+        # Zarządzanie widocznością i cyklem życia nakładki Crop
+        if name == "Crop":
+            self.btn_apply_crop.show()
+            self.canvas.scene.clearSelection()
+            
+            # Ustaw rozmiar sceny na twardo, aby odpowiadał wymiarom tła
+            bg_rect = QRectF(self.canvas.bg_pixmap.rect())
+            self.canvas.scene.setSceneRect(bg_rect)
+            
+            # Utwórz ramkę kadrującą na pełnym obszarze obrazu
+            if not self.canvas.crop_item:
+                self.canvas.crop_item = CropOverlayItem(bg_rect)
+                self.canvas.scene.addItem(self.canvas.crop_item)
+            self.canvas.crop_item.setSelected(True)
+            self.canvas.crop_item.show()
+        else:
+            self.btn_apply_crop.hide()
+            if self.canvas.crop_item:
+                self.canvas.scene.removeItem(self.canvas.crop_item)
+                self.canvas.crop_item = None
+
+    def apply_crop_action(self):
+        if not self.canvas.crop_item or not CV2_AVAILABLE:
+            if not CV2_AVAILABLE:
+                QMessageBox.warning(self, "Brak biblioteki", "Narzędzie Crop wymaga biblioteki OpenCV.\nZainstaluj ją poleceniem: pip install opencv-python")
+            return
+
+        import cv2
+        import numpy as np
+
+        # 1. Pobieramy docelowy obszar kadrowania (zaokrąglony do pełnych pikseli)
+        crop_rect = self.canvas.crop_item.rect().toRect()
+        
+        # 2. Renderujemy aktualny stan edytora (ze wszystkimi dotychczasowymi rysunkami) do QImage
+        # Najpierw tymczasowo ukrywamy samą ramkę Crop, by nie wkleiła się w kadr
+        self.canvas.crop_item.hide()
+        self.canvas.scene.clearSelection()
+        
+        # Renderowanie pełnego obszaru tła
+        full_img = QImage(self.canvas.bg_pixmap.size(), QImage.Format.Format_ARGB32)
+        full_img.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(full_img)
+        self.canvas.scene.render(painter, target=QRectF(full_img.rect()), source=self.canvas.scene.sceneRect())
+        painter.end()
+
+        # Konwersja QImage -> macierz numpy (BGRA)
+        ptr = full_img.bits()
+        ptr.setsize(full_img.sizeInBytes())
+        arr = np.array(ptr).reshape(full_img.height(), full_img.width(), 4)
+
+        # 3. Błyskawiczne przycięcie z wykorzystaniem OpenCV / slicingu numpy
+        x, y, w, h = crop_rect.x(), crop_rect.y(), crop_rect.width(), crop_rect.height()
+        # Zabezpieczenie przed wyjściem indeksów poza tablicę
+        x = max(0, min(x, arr.shape[1] - 1))
+        y = max(0, min(y, arr.shape[0] - 1))
+        w = max(1, min(w, arr.shape[1] - x))
+        h = max(1, min(h, arr.shape[0] - y))
+        
+        cropped_arr = arr[y:y+h, x:x+w].copy()
+
+        # 4. Konwersja z powrotem na QImage i załadowanie jako nowe płótno
+        height, width, _ = cropped_arr.shape
+        cropped_qimage = QImage(cropped_arr.data, width, height, cropped_arr.strides[0], QImage.Format.Format_ARGB32).copy()
+        new_pixmap = QPixmap.fromImage(cropped_qimage)
+
+        # Czyszczenie i restart płótna z nowym tłem
+        self.canvas.scene.clear()
+        self.canvas.bg_pixmap = new_pixmap
+        self.canvas.bg_item = self.canvas.scene.addPixmap(new_pixmap)
+        self.canvas.bg_item.setZValue(-100)
+        self.canvas.scene.setSceneRect(QRectF(new_pixmap.rect()))
+        
+        self.canvas.crop_item = None
+        self.canvas.is_dirty = True
+        self.select_tool("Select")
 
     def pick_color(self):
         # Tworzymy instancję okna zamiast metody statycznej
@@ -2487,7 +2675,47 @@ class ImageEditorWindow(QMainWindow):
         for item in self.canvas.scene.selectedItems():
             self.canvas.apply_props(item)
             self.canvas.is_dirty = True
+    def pick_highlight_color(self):
+        dialog = QColorDialog(self.canvas.text_highlight_color, self)
+        dialog.setWindowTitle("Pick Text Highlight Color & Alpha")
+        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        
+        if dialog.exec():
+            c = dialog.selectedColor()
+            if c.isValid():
+                self.canvas.text_highlight_color = c
+                rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
+                self.btn_hc.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
+                
+                # Natychmiast aplikuj tło do zaznaczonych tekstów
+                for item in self.canvas.scene.selectedItems():
+                    if isinstance(item, HighlightTextItem):
+                        item.highlight_color = c
+                        item.update()
+                self.canvas.is_dirty = True
 
+    def import_image(self):
+        from PyQt6.QtWidgets import QFileDialog
+        from PyQt6.QtGui import QPixmap
+        
+        # Używa wbudowanej zmiennej z folderem Screenshotów jako ścieżki startowej
+        path, _ = QFileDialog.getOpenFileName(self, "Import Image", self.default_dir, "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if path:
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                # Używamy nowej, skalowalnej klasy opartej o QGraphicsRectItem
+                item = ResizablePixmapItem(pixmap)
+                
+                # Wyśrodkowanie na środku aktualnego widoku ekranu
+                view_center = self.canvas.mapToScene(self.canvas.viewport().rect().center())
+                item.setPos(view_center - item.boundingRect().center())
+                
+                self.canvas.scene.addItem(item)
+                self.canvas.is_dirty = True
+                self.select_tool("Select")
+    
+    
     def save_default(self):
         img = self.render_scene()
         self.save_callback(img)
@@ -2546,8 +2774,6 @@ class MainWindow(QMainWindow):
         self._abort      = False
         self._gif_aborted = False
         self._hkl        = None
-        self.status_sig.connect(self._status)
-        self._notify_sig.connect(self._on_notify)
         self._ocr_done_sig.connect(self._show_ocr) # <--- DODANA LINIA
         self.last_rec_pixmap = None  # Tu będziemy trzymać miniaturkę
         self.setWindowTitle("PyshareX")
@@ -3193,9 +3419,41 @@ class MainWindow(QMainWindow):
         self._add_hist(path)
         notify(self.config, path, pixmap=pixmap)
         
-        
-        # Sprawdzenie czy użytkownik chce otworzyć edytor
         after = self.config.get("after_capture", {})
+        
+        # 1. Automatyczne rozpoznawanie tekstu (OCR)
+        if after.get("ocr_recognize"):
+            def do_auto_ocr():
+                engine = self.config.get("ocr_engine", "easyocr")
+                if engine == "easyocr":
+                    txt = self.engine._ocr_easyocr(path)
+                else:
+                    txt = self.engine._ocr_tesseract(path)
+                self._ocr_done_sig.emit(txt, "OCR Result")
+            threading.Thread(target=do_auto_ocr, daemon=True).start()
+
+        # 2. Automatyczne skanowanie kodu QR
+        if after.get("scan_qr"):
+            def do_auto_qr():
+                if not CV2_AVAILABLE:
+                    self._ocr_done_sig.emit("Brak biblioteki OpenCV.\n(pip install opencv-python)", "QR Code Result")
+                    return
+                try:
+                    import cv2
+                    import numpy as np
+                    # Używamy cv2.imdecode z numpy, aby uniknąć problemów z polskimi znakami w ścieżkach
+                    img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    detector = cv2.QRCodeDetector()
+                    data, bbox, _ = detector.detectAndDecode(img)
+                    if data:
+                        self._ocr_done_sig.emit(data, "QR Code Result")
+                    else:
+                        self._ocr_done_sig.emit("Nie wykryto kodu QR w zrobionym screenie.", "QR Code Result")
+                except Exception as e:
+                    self._ocr_done_sig.emit(f"Wystąpił błąd podczas dekodowania: {e}", "QR Code Result")
+            threading.Thread(target=do_auto_qr, daemon=True).start()
+
+        # 3. Sprawdzenie czy użytkownik chce otworzyć edytor
         if after.get("open_in_editor"):
             # Jeśli nie mamy pixmapy w pamięci, ładujemy z pliku
             if not pixmap and os.path.exists(path):
