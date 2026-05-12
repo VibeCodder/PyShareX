@@ -38,7 +38,6 @@ https://github.com/UB-Mannheim/tesseract/wiki <br>
 ```
 sudo apt install tesseract-ocr tesseract-ocr-pol
 ```
-<br>
 
 ### PyShareX allows you for:
 - capture screen region
@@ -52,7 +51,7 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 - OCR QR recognision
 - video converter
 - image editor
-
+  
 <img width="993" height="722" alt="region_2026-05-10_15-39-15" src="https://github.com/user-attachments/assets/fb465778-9e0c-4634-907f-9245862d68b4" />
 
 
