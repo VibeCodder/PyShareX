@@ -13,9 +13,21 @@ In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
 For the icon to be visible in the app, the .ico file must be inside "icons" folder and the "icons" folder must be in the same folder with .pyw script.
 
 ### Optional - video recording/converter (requires ffmpeg installed on the system)
-ffmpeg must be installed separately: <br>
-Windows: https://ffmpeg.org/download.html (or: winget install ffmpeg) <br>
-Linux: sudo apt install ffmpeg <br>
+ffmpeg must be installed separately: 
+<br>
+
+- Windows: https://ffmpeg.org/download.html
+or
+```
+winget install ffmpeg
+```
+
+- Linux: 
+
+```
+sudo apt install ffmpeg 
+```
+<br>
 
 ### Optional - OCR (requires tesseract in the system [or easyocr in pip]) <br>
 Windows: https://github.com/UB-Mannheim/tesseract/wiki <br>
