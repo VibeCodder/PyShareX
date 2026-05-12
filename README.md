@@ -31,8 +31,14 @@ sudo apt install ffmpeg
 <br>
 
 ### Optional - OCR (requires tesseract in the system [or easyocr in pip]) <br>
-Windows: https://github.com/UB-Mannheim/tesseract/wiki <br>
-Linux: sudo apt install tesseract-ocr tesseract-ocr-pol <br>
+#### Windows:   
+https://github.com/UB-Mannheim/tesseract/wiki <br>
+
+#### Linux: 
+```
+sudo apt install tesseract-ocr tesseract-ocr-pol
+```
+<br>
 
 ### PyShareX allows you for:
 - capture screen region
