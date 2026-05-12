@@ -29,7 +29,7 @@ winget install ffmpeg
 ```
 sudo apt install ffmpeg 
 ```
-<br>
+
 ----
 ### Optional - OCR (requires tesseract in the system [or easyocr in pip]) <br>
 #### Windows:   
