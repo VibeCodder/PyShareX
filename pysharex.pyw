@@ -2182,10 +2182,122 @@ class ImageEditorStartDialog(QDialog):
 #  FINAL IMAGE EDITOR (FIXED SCALING, DELETE, SAVE AS & CTRL PROPORTIONS)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class FreehandItem(QGraphicsPathItem):
+    def __init__(self, path, canvas=None):
+        super().__init__(path)
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        self._rect = path.boundingRect()
+        self._base_path = path
+
+    def rect(self):
+        return self._rect
+
+    def setRect(self, rect):
+        self.prepareGeometryChange()
+        self._rect = rect
+        base_rect = self._base_path.boundingRect()
+        if base_rect.width() == 0 or base_rect.height() == 0:
+            return
+        sx = rect.width() / base_rect.width()
+        sy = rect.height() / base_rect.height()
+        
+        from PyQt6.QtGui import QTransform
+        transform = QTransform()
+        transform.translate(rect.x(), rect.y())
+        transform.scale(sx, sy)
+        transform.translate(-base_rect.x(), -base_rect.y())
+        self.setPath(transform.map(self._base_path))
+
+    def update_base_path(self):
+        # Usunięto prepareGeometryChange(), ponieważ natywne setPath() 
+        # wywołane chwilę wcześniej w locie już zaktualizowało drzewo sceny Qt.
+        self._base_path = self.path()
+        self._rect = self._base_path.boundingRect()
+
+    def boundingRect(self):
+        return self._rect.adjusted(-5, -50, 5, 5)
+
+    def paint(self, painter, option, widget=None):
+        from PyQt6.QtWidgets import QStyle
+        option.state &= ~QStyle.StateFlag.State_Selected
+        painter.setPen(self.pen())
+        painter.drawPath(self.path())
+        
+        if self.isSelected():
+            pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.drawRect(self._rect)
+
+
+class LineItem(QGraphicsLineItem):
+    def __init__(self, line, canvas):
+        super().__init__(line)
+        self.canvas = canvas
+     
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.active_handle = None
+
+    def boundingRect(self):
+        # Powiększony obszar zapobiega smużeniu przy przemieszczaniu grubego pędzla
+        extra = (self.pen().width() + 30) / (self.canvas.transform().m11() if self.canvas else 1)
+        return super().boundingRect().adjusted(-extra, -extra, extra, extra)
+
+    def paint(self, painter, option, widget=None):
+        # Rysujemy samą linię
+        painter.setPen(self.pen())
+        painter.drawLine(self.line())
+        
+        # Rysujemy uchwyty tylko jeśli zaznaczone
+        if self.isSelected():
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setBrush(QBrush(Qt.GlobalColor.white))
+            painter.setPen(QPen(Qt.GlobalColor.blue, 1.5))
+            # Rozmiar uchwytu stały niezależnie od zoomu
+            s = 10 / (self.canvas.transform().m11() if self.canvas else 1)
+            painter.drawEllipse(self.line().p1(), s/2, s/2)
+            painter.drawEllipse(self.line().p2(), s/2, s/2)
+
+    def mousePressEvent(self, event):
+        p = event.pos()
+        p1, p2 = self.line().p1(), self.line().p2()
+        # Detekcja kliknięcia w uchwyt
+        dist = 15 / (self.canvas.transform().m11() if self.canvas else 1)
+        if (p - p1).manhattanLength() < dist: self.active_handle = 'p1'
+        elif (p - p2).manhattanLength() < dist: self.active_handle = 'p2'
+        else: self.active_handle = None; super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.active_handle:
+            self.prepareGeometryChange() # Usuwa smużenie
+            line = self.line()
+            new_pos = event.pos()
+            
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                anchor = line.p2() if self.active_handle == 'p1' else line.p1()
+                dx, dy = new_pos.x() - anchor.x(), new_pos.y() - anchor.y()
+                angle = math.atan2(dy, dx)
+                # Angle snapping co 45 stopni
+                snapped_angle = round(math.degrees(angle) / 45) * 45
+                dist = math.hypot(dx, dy)
+                new_pos = QPointF(anchor.x() + dist * math.cos(math.radians(snapped_angle)),
+                                 anchor.y() + dist * math.sin(math.radians(snapped_angle)))
+            
+            if self.active_handle == 'p1': line.setP1(new_pos)
+            else: line.setP2(new_pos)
+            self.setLine(line)
+        else:
+            super().mouseMoveEvent(event)
+
+
+
 class HighlightTextItem(QGraphicsTextItem):
-    def __init__(self, text, highlight_color=None):
-        super().__init__(text)
-        self.highlight_color = highlight_color
 
     def paint(self, painter, option, widget=None):
         # Rysowanie tła (podświetlenia) przed narysowaniem liter
@@ -2196,6 +2308,39 @@ class HighlightTextItem(QGraphicsTextItem):
             painter.drawRect(self.boundingRect())
             painter.restore()
         super().paint(painter, option, widget)
+
+class ResizableRectItem(QGraphicsRectItem):
+    def boundingRect(self):
+        # Powiększamy obszar odświeżania w górę o 50 pikseli, aby pomieścić linię i uchwyt obrotu
+        return super().boundingRect().adjusted(-5, -50, 5, 5)
+
+    def paint(self, painter, option, widget=None):
+        from PyQt6.QtWidgets import QStyle
+        # Wyłączamy domyślną ramkę zaznaczenia rysowaną przez Qt (bo bazuje na powiększonym boundingRect)
+        option.state &= ~QStyle.StateFlag.State_Selected
+        super().paint(painter, option, widget)
+        
+        # Rysujemy własną ramkę idealnie na krawędziach figury
+        if self.isSelected():
+            pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.drawRect(self.rect())
+
+class ResizableEllipseItem(QGraphicsEllipseItem):
+    def boundingRect(self):
+        return super().boundingRect().adjusted(-5, -50, 5, 5)
+
+    def paint(self, painter, option, widget=None):
+        from PyQt6.QtWidgets import QStyle
+        option.state &= ~QStyle.StateFlag.State_Selected
+        super().paint(painter, option, widget)
+        
+        if self.isSelected():
+            pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.drawRect(self.rect())
 
 class ResizablePixmapItem(QGraphicsRectItem):
     """
@@ -2219,10 +2364,13 @@ class ResizablePixmapItem(QGraphicsRectItem):
             painter.setPen(pen)
             painter.setBrush(Qt.GlobalColor.transparent)
             painter.drawRect(self.rect())
+    def boundingRect(self):
+        return super().boundingRect().adjusted(-5, -50, 5, 5)
 
 class EditorCanvas(QGraphicsView):
     def __init__(self, pixmap, parent=None):
         super().__init__(parent)
+        self.rotate_icon_pixmap = QPixmap("🔄")
         self.scene = QGraphicsScene(self)
         self.setScene(self.scene)
         
@@ -2304,13 +2452,18 @@ class EditorCanvas(QGraphicsView):
         # Drawing Mode
         self.is_dirty = True
         self.start_point = scene_pos
-        if self.current_tool == "Rectangle": self.current_item = QGraphicsRectItem()
-        elif self.current_tool == "Circle": self.current_item = QGraphicsEllipseItem()
-        elif self.current_tool == "Line": self.current_item = QGraphicsLineItem()
+        if self.current_tool == "Rectangle": 
+            self.current_item = ResizableRectItem()
+        elif self.current_tool == "Circle": 
+            self.current_item = ResizableEllipseItem()
+        elif self.current_tool == "Line":
+            self.current_item = LineItem(QLineF(self.start_point, self.start_point), self)
         elif self.current_tool == "Freehand":
-            self.current_item = QGraphicsPathItem()
-            self.current_item.setPath(QPainterPath(self.start_point))
+            self._freehand_path = QPainterPath()
+            self._freehand_path.moveTo(self.start_point)
+            self.current_item = FreehandItem(self._freehand_path)
         
+        # Właściwości i dodanie do sceny wykonujemy tylko raz dla wszystkich narzędzi
         if self.current_item:
             self.apply_props(self.current_item)
             self.scene.addItem(self.current_item)
@@ -2347,7 +2500,13 @@ class EditorCanvas(QGraphicsView):
         if self.current_tool in ["Rectangle", "Circle"]: self.current_item.setRect(rect)
         elif self.current_tool == "Line": self.current_item.setLine(QLineF(self.start_point, scene_pos))
         elif self.current_tool == "Freehand":
-            path = self.current_item.path(); path.lineTo(scene_pos); self.current_item.setPath(path)
+            if self.current_item and getattr(self, '_freehand_path', None) is not None:
+                new_pos = scene_pos
+                if self._freehand_path.currentPosition() != new_pos:
+                    self._freehand_path.lineTo(new_pos)
+                    self.current_item.setPath(self._freehand_path)
+                    if hasattr(self.current_item, 'update_base_path'):
+                        self.current_item.update_base_path()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -2362,6 +2521,7 @@ class EditorCanvas(QGraphicsView):
 
         self.current_item = None
         self.resizing_item = None
+        self._freehand_path = None
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
@@ -2389,16 +2549,47 @@ class EditorCanvas(QGraphicsView):
                     self.is_dirty = True
         else:
             super().contextMenuEvent(event)
+        if item and item != self.bg_item:
+            menu = QMenu(self)
+            
+            # Jeśli obiekt jest obrócony, pokaż opcję resetu
+            if abs(item.rotation()) > 0.1:
+                reset_rot = menu.addAction("🔄 Reset rotation")
+                reset_rot.triggered.connect(lambda: item.setRotation(0))
+                menu.addSeparator()
+
+            del_act = menu.addAction("Delete")
+            del_act.triggered.connect(lambda: self.scene.removeItem(item))
+            
+            # Pobieranie koloru dla menu (zachowanie Twojej logiki)
+            curr_col = QColor(Qt.GlobalColor.white)
+            if hasattr(item, 'pen'): curr_col = item.pen().color()
+            
+            color_act = menu.addAction("Change Color")
+            color_act.triggered.connect(lambda: self._change_item_color(item, curr_col))
+            
+            menu.exec(event.globalPos())
+        else:
+            super().contextMenuEvent(event)
 
     def get_handle_at(self, pos):
         """Returns (item, handle_name) if mouse is over a resize handle of a selected item."""
         for item in self.scene.selectedItems():
-            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, CropOverlayItem)):
-                rect = item.sceneBoundingRect()
+   
+             if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, CropOverlayItem, ResizablePixmapItem, FreehandItem)):
+                # Używamy lokalnych współrzędnych, żeby obrót nie psuł wykrywania krawędzi
+                local_pos = item.mapFromScene(pos)
+                rect = item.rect()
                 m = 10 / self.transform().m11() # Scale-aware margin
                 
-                L, R = abs(pos.x() - rect.left()) < m, abs(pos.x() - rect.right()) < m
-                T, B = abs(pos.y() - rect.top()) < m, abs(pos.y() - rect.bottom()) < m
+                # Detekcja uchwytu obrotu (tylko dla normalnych obiektów, nie dla Crop)
+                if not isinstance(item, CropOverlayItem):
+                    rot_pt = QPointF(rect.center().x(), rect.top() - 30)
+                    if abs(local_pos.x() - rot_pt.x()) < m * 1.5 and abs(local_pos.y() - rot_pt.y()) < m * 1.5:
+                        return item, 'ROTATE'
+
+                L, R = abs(local_pos.x() - rect.left()) < m, abs(local_pos.x() - rect.right()) < m
+                T, B = abs(local_pos.y() - rect.top()) < m, abs(local_pos.y() - rect.bottom()) < m
                 
                 if L and T: return item, 'TL'
                 if R and T: return item, 'TR'
@@ -2412,20 +2603,56 @@ class EditorCanvas(QGraphicsView):
 
     def update_cursor_by_handle(self, handle):
         if not handle: self.setCursor(Qt.CursorShape.ArrowCursor)
+        elif handle == 'ROTATE': self.setCursor(Qt.CursorShape.PointingHandCursor)
         elif handle in ['TL', 'BR']: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
         elif handle in ['TR', 'BL']: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
         elif handle in ['L', 'R']: self.setCursor(Qt.CursorShape.SizeHorCursor)
         elif handle in ['T', 'B']: self.setCursor(Qt.CursorShape.SizeVerCursor)
 
     def handle_resize_logic(self, pos, proportional):
+        import math
         item = self.resizing_item
-        # Pobieramy lokalne kordynaty obiektu (a nie z całej sceny)
-        rect = item.rect()
         
-        # Konwertujemy pozycję myszy ze sceny na lokalną dla danego obiektu
+        # --- 1. OBSŁUGA OBROTU ---
+        if self.resize_handle == 'ROTATE':
+            import math
+            # Odśwież widok przed zmianą kąta
+            item.update() 
+            
+            center_scene = item.mapToScene(item.rect().center())
+            diff = pos - center_scene
+            
+            angle = math.degrees(math.atan2(diff.y(), diff.x())) + 90
+            
+            if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
+                angle = round(angle / 45) * 45
+            
+            item.setTransformOriginPoint(item.rect().center())
+            item.setRotation(angle)
+            
+            # Odśwież widok po zmianie kąta oraz wymuś odświeżenie całej sceny w tym rejonie
+            item.update()
+            self.scene.update()
+            return
+
+        # --- 2. OBSŁUGA SKALOWANIA Z ZACHOWANIEM OBROTU ---
+        old_rect = item.rect()
         local_pos = item.mapFromScene(pos)
         
-        left, top, right, bottom = rect.left(), rect.top(), rect.right(), rect.bottom()
+        # Określamy punkt stały (przeciwległy do łapanego uchwytu), żeby figura nie "odfrunęła"
+        fixed_local = QPointF()
+        if 'L' in self.resize_handle: fixed_local.setX(old_rect.right())
+        elif 'R' in self.resize_handle: fixed_local.setX(old_rect.left())
+        else: fixed_local.setX(old_rect.center().x())
+
+        if 'T' in self.resize_handle: fixed_local.setY(old_rect.bottom())
+        elif 'B' in self.resize_handle: fixed_local.setY(old_rect.top())
+        else: fixed_local.setY(old_rect.center().y())
+        
+        old_scene_fixed = item.mapToScene(fixed_local)
+
+        # Obliczamy nowe wymiary (rect)
+        left, top, right, bottom = old_rect.left(), old_rect.top(), old_rect.right(), old_rect.bottom()
         
         if 'L' in self.resize_handle: left = local_pos.x()
         if 'R' in self.resize_handle: right = local_pos.x()
@@ -2436,7 +2663,6 @@ class EditorCanvas(QGraphicsView):
         
         if proportional:
             side = max(new_rect.width(), new_rect.height())
-            # Zachowaj punkt zaczepienia w zależności od chwyconego uchwytu
             if 'L' in self.resize_handle: left = right - side
             else: right = left + side
             
@@ -2445,18 +2671,56 @@ class EditorCanvas(QGraphicsView):
             
             new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
             
-        # Ograniczenie wychodzenia Crop poza granice głównego obrazu
         if isinstance(item, CropOverlayItem):
-            scene_rect = self.scene.sceneRect()
-            new_rect = new_rect.intersected(scene_rect)
+            new_rect = new_rect.intersected(self.scene.sceneRect())
             
+        # Zastosowanie wymiarów i NAPRAWA przesunięcia po obrocie
         item.setRect(new_rect)
+        item.setTransformOriginPoint(new_rect.center())
+        
+        new_scene_fixed = item.mapToScene(fixed_local)
+        delta = old_scene_fixed - new_scene_fixed
+        item.setPos(item.pos() + delta)
 
     def erase_at(self, pos):
         for item in self.scene.items(pos):
             if item != self.bg_item:
                 self.scene.removeItem(item)
                 self.is_dirty = True
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        # Włączamy wysoką jakość rysowania, aby uniknąć rozmazania
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        
+        for item in self.scene.selectedItems():
+            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, ResizablePixmapItem, FreehandItem)) and not isinstance(item, CropOverlayItem):
+                r = item.rect()
+                # Punkty w układzie lokalnym
+                top_center_local = QPointF(r.center().x(), r.top())
+                handle_local = QPointF(r.center().x(), r.top() - 30)
+                
+                # Mapujemy na scenę, aby znać pozycję po obrocie
+                p1 = item.mapToScene(top_center_local)
+                p2 = item.mapToScene(handle_local)
+                
+                # Rysowanie linii pomocniczej
+                painter.setPen(QPen(QColor(255, 255, 255, 200), 1.5, Qt.PenStyle.DashLine))
+                painter.drawLine(p1, p2)
+                
+                # Rysowanie ikony rotate handle.png
+                pix = QPixmap("rotate handle.png")
+                if not pix.isNull():
+                    # Obliczamy rozmiar ikony zależny od zoomu, by zawsze była czytelna
+                    s = 22 / self.transform().m11()
+                    target_rect = QRectF(p2.x() - s/2, p2.y() - s/2, s, s)
+                    painter.drawPixmap(target_rect, pix, QRectF(pix.rect()))
+                else:
+                    # Fallback (kółko) jeśli plik nie istnieje
+                    painter.setBrush(QColor(0, 255, 0))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.drawEllipse(p2, 5/self.transform().m11(), 5/self.transform().m11())
 
     def apply_props(self, item):
         item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | 
@@ -2525,7 +2789,13 @@ class ImageEditorWindow(QMainWindow):
         # Save Buttons
         btn_save = QPushButton("💾 Save")
         btn_save.clicked.connect(self.save_default)
-        btn_save_as = QPushButton("💾 Save As..."); btn_save_as.clicked.connect(self.save_as)
+        btn_save_as = QPushButton("💾 Save As..."); 
+        btn_save_as.clicked.connect(self.save_as)
+        
+        self.btn_copy = QPushButton("🖼️ to clipboard")
+        self.btn_copy.clicked.connect(self.copy_to_clipboard)
+        tbar.addWidget(self.btn_copy)
+        
         btn_save.setStyleSheet("background: #27ae60; color: white; font-weight: bold; padding: 5px 10px;")
         btn_save_as.setStyleSheet("background: #2980b9; color: white; font-weight: bold; padding: 5px 10px;")
         tbar.addWidget(btn_save)
@@ -2721,7 +2991,20 @@ class ImageEditorWindow(QMainWindow):
         self.save_callback(img)
         self.saved = True
         self.close()
+    
+    def copy_to_clipboard(self):
+        self.canvas.scene.clearSelection()
+        rect = self.canvas.scene.sceneRect()
+        pixmap = QPixmap(int(rect.width()), int(rect.height()))
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        self.canvas.scene.render(painter)
+        painter.end()
+        QApplication.clipboard().setPixmap(pixmap)
+        QMessageBox.information(self, "Success", "Image copied to clipboard!")
 
+
+    
     def save_as(self):
         import os
         from datetime import datetime
@@ -3867,7 +4150,18 @@ class MainWindow(QMainWindow):
                 # Otwarcie właściwego okna edytora (z przekazaniem screenshot_dir)
                 self.editor_win = ImageEditorWindow(pixmap, self.save_edited_image, screenshot_dir, self)
                 self.editor_win.show()
-
+    
+    def copy_to_clipboard(self):
+        self.scene.clearSelection()
+        rect = self.scene.sceneRect()
+        pixmap = QPixmap(int(rect.width()), int(rect.height()))
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        self.scene.render(painter)
+        painter.end()
+        QApplication.clipboard().setPixmap(pixmap)
+    
+    
     def save_edited_image(self, qimage):
         """Saves the output from the editor to the screenshots folder."""
         save_dir = Path(self.config.get("save_folder", "screenshots"))
