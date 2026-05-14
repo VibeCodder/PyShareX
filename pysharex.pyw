@@ -2095,7 +2095,9 @@ class CropOverlayItem(QGraphicsRectItem):
         self.setBrush(Qt.GlobalColor.transparent)
 
     def paint(self, painter, option, widget=None):
-        scene_rect = self.scene().sceneRect() if self.scene() else self.rect()
+        # Maska musi pokrywać też powiększony obszar (poza oryginalną sceną)
+        scene_rect = self.scene().sceneRect().united(self.rect()) if self.scene() else self.rect()
+        scene_rect = scene_rect.adjusted(-5000, -5000, 5000, 5000) # Ogromny margines, by pokryć wszystko przy oddaleniu
         crop_rect = self.rect()
 
         # 1. Rysowanie przyciemnionego tła poza wyciętym obszarem (maska)
@@ -2671,8 +2673,10 @@ class EditorCanvas(QGraphicsView):
             
             new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
             
-        if isinstance(item, CropOverlayItem):
-            new_rect = new_rect.intersected(self.scene.sceneRect())
+        # Usunięto ograniczenie intersected(), aby pozwolić na przeciąganie 
+        # narzędzia Crop poza krawędzie w celu powiększenia płótna
+        # if isinstance(item, CropOverlayItem):
+        #     new_rect = new_rect.intersected(self.scene.sceneRect())
             
         # Zastosowanie wymiarów i NAPRAWA przesunięcia po obrocie
         item.setRect(new_rect)
@@ -2687,6 +2691,25 @@ class EditorCanvas(QGraphicsView):
             if item != self.bg_item:
                 self.scene.removeItem(item)
                 self.is_dirty = True
+
+    def drawBackground(self, painter, rect):
+        super().drawBackground(painter, rect)
+        
+        scene_rect = self.scene.sceneRect()
+        
+        # 1. Przyciemniamy tło POZA krawędziami płótna, 
+        # aby obszar roboczy wyraźnie się odcinał od reszty edytora.
+        path = QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        path.addRect(QRectF(-50000, -50000, 100000, 100000)) # Nieskończone tło
+        path.addRect(scene_rect)                             # Wycięta dziura na płótno
+        painter.fillPath(path, QColor(0, 0, 0, 120)) 
+        
+        # 2. Rysujemy pomocniczą, przerywaną ramkę na samych granicach płótna
+        pen = QPen(QColor(137, 180, 250), 2, Qt.PenStyle.DashLine) # Kolor motywu PyshareX
+        painter.setPen(pen)
+        painter.setBrush(Qt.GlobalColor.transparent)
+        painter.drawRect(scene_rect)
 
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
@@ -2853,50 +2876,31 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.crop_item = None
 
     def apply_crop_action(self):
-        if not self.canvas.crop_item or not CV2_AVAILABLE:
-            if not CV2_AVAILABLE:
-                QMessageBox.warning(self, "Brak biblioteki", "Narzędzie Crop wymaga biblioteki OpenCV.\nZainstaluj ją poleceniem: pip install opencv-python")
+        if not self.canvas.crop_item:
             return
-
-        import cv2
-        import numpy as np
 
         # 1. Pobieramy docelowy obszar kadrowania (zaokrąglony do pełnych pikseli)
         crop_rect = self.canvas.crop_item.rect().toRect()
         
-        # 2. Renderujemy aktualny stan edytora (ze wszystkimi dotychczasowymi rysunkami) do QImage
-        # Najpierw tymczasowo ukrywamy samą ramkę Crop, by nie wkleiła się w kadr
+        # 2. Renderujemy aktualny stan edytora do QImage
         self.canvas.crop_item.hide()
         self.canvas.scene.clearSelection()
         
-        # Renderowanie pełnego obszaru tła
-        full_img = QImage(self.canvas.bg_pixmap.size(), QImage.Format.Format_ARGB32)
+        scene_rect = self.canvas.scene.sceneRect()
+        full_img = QImage(scene_rect.size().toSize(), QImage.Format.Format_ARGB32)
         full_img.fill(Qt.GlobalColor.transparent)
+        
         painter = QPainter(full_img)
-        self.canvas.scene.render(painter, target=QRectF(full_img.rect()), source=self.canvas.scene.sceneRect())
+        self.canvas.scene.render(painter, target=QRectF(full_img.rect()), source=scene_rect)
         painter.end()
 
-        # Konwersja QImage -> macierz numpy (BGRA)
-        ptr = full_img.bits()
-        ptr.setsize(full_img.sizeInBytes())
-        arr = np.array(ptr).reshape(full_img.height(), full_img.width(), 4)
-
-        # 3. Błyskawiczne przycięcie z wykorzystaniem OpenCV / slicingu numpy
-        x, y, w, h = crop_rect.x(), crop_rect.y(), crop_rect.width(), crop_rect.height()
-        # Zabezpieczenie przed wyjściem indeksów poza tablicę
-        x = max(0, min(x, arr.shape[1] - 1))
-        y = max(0, min(y, arr.shape[0] - 1))
-        w = max(1, min(w, arr.shape[1] - x))
-        h = max(1, min(h, arr.shape[0] - y))
-        
-        cropped_arr = arr[y:y+h, x:x+w].copy()
-
-        # 4. Konwersja z powrotem na QImage i załadowanie jako nowe płótno
-        height, width, _ = cropped_arr.shape
-        cropped_qimage = QImage(cropped_arr.data, width, height, cropped_arr.strides[0], QImage.Format.Format_ARGB32).copy()
+        # 3. Przycięcie ORAZ powiększenie płótna! 
+        # Natywna metoda QImage.copy() użyta na obszarze wykraczającym poza oryginalny obraz, 
+        # automatycznie wypełni brakujący obszar pustymi, przezroczystymi pikselami.
+        cropped_qimage = full_img.copy(crop_rect)
         new_pixmap = QPixmap.fromImage(cropped_qimage)
 
-        # Czyszczenie i restart płótna z nowym tłem
+        # 4. Czyszczenie i restart płótna z nowym, zaktualizowanym tłem
         self.canvas.scene.clear()
         self.canvas.bg_pixmap = new_pixmap
         self.canvas.bg_item = self.canvas.scene.addPixmap(new_pixmap)
