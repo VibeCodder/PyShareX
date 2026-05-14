@@ -57,8 +57,7 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 
 <img width="764" height="687" alt="region_2026-05-13_22-15-04" src="https://github.com/user-attachments/assets/556560f2-66ed-4679-b713-8bab0d2ff1f8" />
 
-<img width="1920" height="1020" alt="pythonw_X6oenMwGhT" src="https://github.com/user-attachments/assets/f5d72d2e-d3f8-4803-8057-873b111959bd" />
-
+<img width="1938" height="1038" alt="region_2026-05-15_00-00-20" src="https://github.com/user-attachments/assets/42fbdfbd-9eef-46e7-8763-c3848cda1053" />
 
 
 <br>
