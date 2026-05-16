@@ -2401,7 +2401,12 @@ class EditorCanvas(QGraphicsView):
         self.stroke_width = 3
         self.font_size = 14
         self.is_filled = False
-        self.text_highlight_color = QColor(255, 255, 0, 0) # Domyślnie przeźroczysty
+        self.text_highlight_color = QColor(255, 255, 0, 0)
+        self._pan_start = None
+        
+        # Massive sceneRect allows infinite panning regardless of zoom
+        bg_rect = QRectF(pixmap.rect())
+        self.scene.setSceneRect(bg_rect.center().x() - 50000, bg_rect.center().y() - 50000, 100000, 100000) # Domyślnie przeźroczysty
 
     def keyPressEvent(self, event):
         """Handle Delete key to remove selected items."""
@@ -2424,10 +2429,8 @@ class EditorCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         
         if event.button() == Qt.MouseButton.MiddleButton:
-            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            fake = QMouseEvent(event.type(), event.position(), Qt.MouseButton.LeftButton, 
-                               Qt.MouseButton.LeftButton, event.modifiers())
-            super().mousePressEvent(fake)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._pan_start = event.pos()
             return
 
         if self.current_tool == "Eraser":
@@ -2471,6 +2474,13 @@ class EditorCanvas(QGraphicsView):
             self.scene.addItem(self.current_item)
 
     def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.MiddleButton and getattr(self, '_pan_start', None) is not None:
+            delta = event.pos() - self._pan_start
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            self._pan_start = event.pos()
+            return
+
         scene_pos = self.mapToScene(event.pos())
         
         if self.current_tool in ["Select", "Crop"] and not self.resizing_item:
@@ -2512,7 +2522,10 @@ class EditorCanvas(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
-            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update_cursor_by_handle(None)
+            self._pan_start = None
+            return
         
         if self.current_tool == "Text" and self.start_point:
             txt, ok = QInputDialog.getMultiLineText(self, "Text", "Enter text:", "")
@@ -2694,22 +2707,18 @@ class EditorCanvas(QGraphicsView):
 
     def drawBackground(self, painter, rect):
         super().drawBackground(painter, rect)
-        
-        scene_rect = self.scene.sceneRect()
-        
-        # 1. Przyciemniamy tło POZA krawędziami płótna, 
-        # aby obszar roboczy wyraźnie się odcinał od reszty edytora.
+        # Base visual boundaries on the image, not the massive sceneRect
+        bg_rect = self.bg_item.sceneBoundingRect() if hasattr(self, 'bg_item') and self.bg_item else self.scene.sceneRect()
         path = QPainterPath()
         path.setFillRule(Qt.FillRule.OddEvenFill)
-        path.addRect(QRectF(-50000, -50000, 100000, 100000)) # Nieskończone tło
-        path.addRect(scene_rect)                             # Wycięta dziura na płótno
+        path.addRect(QRectF(-500000, -500000, 1000000, 1000000)) 
+        path.addRect(bg_rect)                             
         painter.fillPath(path, QColor(0, 0, 0, 120)) 
         
-        # 2. Rysujemy pomocniczą, przerywaną ramkę na samych granicach płótna
-        pen = QPen(QColor(137, 180, 250), 2, Qt.PenStyle.DashLine) # Kolor motywu PyshareX
+        pen = QPen(QColor(137, 180, 250), 2, Qt.PenStyle.DashLine) 
         painter.setPen(pen)
         painter.setBrush(Qt.GlobalColor.transparent)
-        painter.drawRect(scene_rect)
+        painter.drawRect(bg_rect)
 
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
@@ -2848,6 +2857,11 @@ class ImageEditorWindow(QMainWindow):
         self.canvas = EditorCanvas(pixmap)
         layout.addWidget(self.canvas)
         self.showMaximized()
+        
+        # Wyśrodkowanie obrazu po pełnym otwarciu i zmaksymalizowaniu okna
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: self.canvas.centerOn(self.canvas.bg_item))
+        
         self.select_tool("Select")
 
     def select_tool(self, name):
@@ -2874,6 +2888,10 @@ class ImageEditorWindow(QMainWindow):
             if self.canvas.crop_item:
                 self.canvas.scene.removeItem(self.canvas.crop_item)
                 self.canvas.crop_item = None
+            
+            # Restore massive sceneRect for free panning
+            bg_rect = QRectF(self.canvas.bg_pixmap.rect())
+            self.canvas.scene.setSceneRect(bg_rect.center().x() - 50000, bg_rect.center().y() - 50000, 100000, 100000)
 
     def apply_crop_action(self):
         if not self.canvas.crop_item:
@@ -2886,26 +2904,25 @@ class ImageEditorWindow(QMainWindow):
         self.canvas.crop_item.hide()
         self.canvas.scene.clearSelection()
         
-        scene_rect = self.canvas.scene.sceneRect()
-        full_img = QImage(scene_rect.size().toSize(), QImage.Format.Format_ARGB32)
-        full_img.fill(Qt.GlobalColor.transparent)
+        # Render only the cropped area to avoid massive memory usage
+        from PyQt6.QtCore import QRect
+        cropped_img = QImage(QRect(0, 0, crop_rect.width(), crop_rect.height()).size(), QImage.Format.Format_ARGB32)
+        cropped_img.fill(Qt.GlobalColor.transparent)
         
-        painter = QPainter(full_img)
-        self.canvas.scene.render(painter, target=QRectF(full_img.rect()), source=scene_rect)
+        painter = QPainter(cropped_img)
+        self.canvas.scene.render(painter, target=QRectF(cropped_img.rect()), source=QRectF(crop_rect))
         painter.end()
 
-        # 3. Przycięcie ORAZ powiększenie płótna! 
-        # Natywna metoda QImage.copy() użyta na obszarze wykraczającym poza oryginalny obraz, 
-        # automatycznie wypełni brakujący obszar pustymi, przezroczystymi pikselami.
-        cropped_qimage = full_img.copy(crop_rect)
-        new_pixmap = QPixmap.fromImage(cropped_qimage)
+        new_pixmap = QPixmap.fromImage(cropped_img)
 
-        # 4. Czyszczenie i restart płótna z nowym, zaktualizowanym tłem
         self.canvas.scene.clear()
         self.canvas.bg_pixmap = new_pixmap
         self.canvas.bg_item = self.canvas.scene.addPixmap(new_pixmap)
         self.canvas.bg_item.setZValue(-100)
-        self.canvas.scene.setSceneRect(QRectF(new_pixmap.rect()))
+        
+        # Restore massive sceneRect for free panning
+        bg_rect = QRectF(new_pixmap.rect())
+        self.canvas.scene.setSceneRect(bg_rect.center().x() - 50000, bg_rect.center().y() - 50000, 100000, 100000)
         
         self.canvas.crop_item = None
         self.canvas.is_dirty = True
