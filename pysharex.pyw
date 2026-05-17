@@ -2857,10 +2857,14 @@ class ImageEditorWindow(QMainWindow):
         self.canvas = EditorCanvas(pixmap)
         layout.addWidget(self.canvas)
         self.showMaximized()
-        
-        # Wyśrodkowanie obrazu po pełnym otwarciu i zmaksymalizowaniu okna
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: self.canvas.centerOn(self.canvas.bg_item))
+
+        # Fit image to fill the canvas view on startup (after window is fully rendered)
+        def _fit_on_open():
+            bg = self.canvas.bg_item.sceneBoundingRect()
+            self.canvas.fitInView(bg, Qt.AspectRatioMode.KeepAspectRatio)
+            self.canvas.centerOn(self.canvas.bg_item)
+
+        QTimer.singleShot(0, _fit_on_open)
         
         self.select_tool("Select")
 
