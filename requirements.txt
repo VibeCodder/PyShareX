@@ -7,3 +7,4 @@ opencv-python
 numpy
 screeninfo
 easyocr
+qrcode[pil]

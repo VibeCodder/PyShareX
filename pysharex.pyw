@@ -71,6 +71,12 @@ try:
 except ImportError:
     EASYOCR_AVAILABLE = False
 
+try:
+    import qrcode as _qrcode
+    QRCODE_AVAILABLE = True
+except ImportError:
+    QRCODE_AVAILABLE = False
+
 _easyocr_reader = None   # lazy singleton — first use initialises it
 
 
@@ -690,8 +696,9 @@ class Config:
         {"name": "Scrolling capture",        "action": "capture_scrolling",        "shortcut": "Shift+Print Screen",     "enabled": True},
         {"name": "Start/Stop recording",     "action": "toggle_recording",         "shortcut": "Ctrl+Shift+Print Screen","enabled": True},
         {"name": "Record GIF",               "action": "record_gif",               "shortcut": "Ctrl+Shift+G",           "enabled": True},
-        {"name": "OCR – Recognize text",     "action": "ocr_text",                "shortcut": "Ctrl+Alt+O",             "enabled": True},
-        {"name": "OCR – Recognize code",     "action": "ocr_code",                "shortcut": "Ctrl+Alt+K",             "enabled": True},
+        {"name": "Recognize text",           "action": "ocr_text",                "shortcut": "Ctrl+Alt+O",             "enabled": True},
+        {"name": "Recognize QR code",        "action": "ocr_code",                "shortcut": "Ctrl+Alt+K",             "enabled": True},
+        {"name": "OCR/QR Toolbox",           "action": "ocr_qr_toolbox",          "shortcut": "Ctrl+Alt+Q",             "enabled": True},
     ]
     DEFAULT_AFTER = {"copy_to_clipboard": True,  "save_to_file": True,
                      "show_in_explorer": False, "scan_qr": False, "ocr_recognize": False,
@@ -3059,6 +3066,285 @@ class ImageEditorWindow(QMainWindow):
 
 
 # ─────────────────────────────────────────────
+#  OCR / QR TOOLBOX DIALOG
+# ─────────────────────────────────────────────
+
+class OcrQrToolboxDialog(QDialog):
+    """Combined OCR text recognition + QR code generator/scanner toolbox."""
+
+    _ocr_result_sig = pyqtSignal(str)
+    _qr_result_sig  = pyqtSignal(str)
+
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self._qr_pixmap  = None
+        self._sel        = None
+        self.setWindowTitle("OCR / QR Toolbox")
+        self.setMinimumSize(720, 480)
+        self.setWindowFlags(Qt.WindowType.Window)
+        self._ocr_result_sig.connect(self._on_ocr_result)
+        self._qr_result_sig.connect(self._on_qr_result)
+        self._build()
+
+    # ── UI ──────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        # ── Top button bar ──────────────────────────────────────────────────
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+
+        btn_scan_text = QPushButton("🔍  Scan region to recognize text")
+        btn_scan_text.setMinimumHeight(36)
+        btn_scan_text.clicked.connect(self._scan_text)
+
+        btn_scan_qr = QPushButton("📷  Scan region for QR")
+        btn_scan_qr.setMinimumHeight(36)
+        btn_scan_qr.clicked.connect(self._scan_qr)
+
+        top_bar.addWidget(btn_scan_text)
+        top_bar.addWidget(btn_scan_qr)
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
+        # ── Main content (left text | right QR) ────────────────────────────
+        content = QHBoxLayout()
+        content.setSpacing(12)
+
+        # Left: editable text
+        self.text_edit = QTextEdit()
+        self.text_edit.setPlaceholderText(
+            "Recognized / scanned text will appear here.\n"
+            "You can also type or edit text — the QR code updates in real time.")
+        self.text_edit.textChanged.connect(self._on_text_changed)
+        content.addWidget(self.text_edit, 1)
+
+        # Right: QR panel
+        right_panel = QVBoxLayout()
+        right_panel.setSpacing(6)
+
+        self.show_qr_check = QCheckBox("Show QR code")
+        self.show_qr_check.setChecked(False)
+        self.show_qr_check.toggled.connect(self._toggle_qr_visibility)
+        right_panel.addWidget(self.show_qr_check)
+
+        self.qr_label = QLabel()
+        self.qr_label.setFixedSize(240, 240)
+        self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qr_label.setStyleSheet(
+            "border: 1px solid #444; background: #1e1e2e; color: #888; font-size: 11px;")
+        self.qr_label.setWordWrap(True)
+        self.qr_label.hide()
+        right_panel.addWidget(self.qr_label)
+
+        btn_copy_img = QPushButton("📋  Copy image to clipboard")
+        btn_copy_img.clicked.connect(self._copy_image)
+        btn_save_img = QPushButton("💾  Save image")
+        btn_save_img.clicked.connect(self._save_image)
+        btn_save_as  = QPushButton("📁  Save as…")
+        btn_save_as.clicked.connect(self._save_as)
+
+        right_panel.addWidget(btn_copy_img)
+        right_panel.addWidget(btn_save_img)
+        right_panel.addWidget(btn_save_as)
+        right_panel.addStretch()
+
+        content.addLayout(right_panel)
+        layout.addLayout(content, 1)
+
+    # ── Text / QR logic ─────────────────────────────────────────────────────
+
+    def _on_text_changed(self):
+        text = self.text_edit.toPlainText().strip()
+        if text:
+            self._generate_qr(text)
+        else:
+            self._qr_pixmap = None
+            if self.show_qr_check.isChecked():
+                self.qr_label.clear()
+                self.qr_label.setText("Enter text to generate a QR code.")
+
+    def _generate_qr(self, text: str):
+        if not QRCODE_AVAILABLE:
+            self._qr_pixmap = None
+            if self.show_qr_check.isChecked():
+                self.qr_label.setText(
+                    "qrcode library not installed.\n\npip install qrcode[pil]")
+            return
+        try:
+            qr = _qrcode.QRCode(
+                version=None,
+                error_correction=_qrcode.constants.ERROR_CORRECT_M,
+                box_size=6, border=2)
+            qr.add_data(text)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            qpix = QPixmap()
+            qpix.loadFromData(buf.getvalue())
+            self._qr_pixmap = qpix
+            if self.show_qr_check.isChecked():
+                self.qr_label.setPixmap(
+                    qpix.scaled(240, 240,
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation))
+        except Exception as e:
+            self._qr_pixmap = None
+            if self.show_qr_check.isChecked():
+                self.qr_label.setText(f"QR generation error:\n{e}")
+
+    def _toggle_qr_visibility(self, checked: bool):
+        if checked:
+            self.qr_label.show()
+            if self._qr_pixmap:
+                self.qr_label.setPixmap(
+                    self._qr_pixmap.scaled(240, 240,
+                                           Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation))
+            else:
+                text = self.text_edit.toPlainText().strip()
+                if text:
+                    self._generate_qr(text)
+                else:
+                    self.qr_label.setText("Enter text to generate a QR code.")
+        else:
+            self.qr_label.hide()
+
+    # ── Scan region → OCR ───────────────────────────────────────────────────
+
+    def _scan_text(self):
+        self.hide()
+        QTimer.singleShot(200, self._do_scan_text)
+
+    def _do_scan_text(self):
+        self._sel = RegionSelector()
+        self._sel.region_selected.connect(self._run_ocr_region)
+        self._sel.cancelled.connect(self.show)
+
+    def _run_ocr_region(self, x, y, w, h):
+        if w < 5 or h < 5:
+            self.show(); return
+
+        def go():
+            time.sleep(0.05)
+            path = self.main_window.engine.capture_region(x, y, w, h)
+            if not path:
+                self._ocr_result_sig.emit("Failed to capture screen region.")
+                return
+            engine = self.main_window.config.get("ocr_engine", "easyocr")
+            if engine == "easyocr":
+                txt = self.main_window.engine._ocr_easyocr(path)
+            else:
+                txt = self.main_window.engine._ocr_tesseract(path)
+            self._ocr_result_sig.emit(txt)
+
+        threading.Thread(target=go, daemon=True).start()
+
+    def _on_ocr_result(self, text: str):
+        self.text_edit.blockSignals(True)
+        self.text_edit.setPlainText(text)
+        self.text_edit.blockSignals(False)
+        self._on_text_changed()
+        self.show(); self.raise_(); self.activateWindow()
+
+    # ── Scan region → QR decode ─────────────────────────────────────────────
+
+    def _scan_qr(self):
+        self.hide()
+        QTimer.singleShot(200, self._do_scan_qr)
+
+    def _do_scan_qr(self):
+        self._sel = RegionSelector()
+        self._sel.region_selected.connect(self._run_qr_region)
+        self._sel.cancelled.connect(self.show)
+
+    def _run_qr_region(self, x, y, w, h):
+        if w < 5 or h < 5:
+            self.show(); return
+
+        def go():
+            time.sleep(0.05)
+            path = self.main_window.engine.capture_region(x, y, w, h)
+            if not path:
+                self._qr_result_sig.emit("__err__Failed to capture screen region.")
+                return
+            if not CV2_AVAILABLE:
+                self._qr_result_sig.emit("__err__OpenCV not installed.\npip install opencv-python")
+                return
+            try:
+                import cv2 as _cv2
+                import numpy as np
+                img = _cv2.imdecode(np.fromfile(path, dtype=np.uint8), _cv2.IMREAD_COLOR)
+                detector = _cv2.QRCodeDetector()
+                data, bbox, _ = detector.detectAndDecode(img)
+                if data:
+                    self._qr_result_sig.emit(data)
+                else:
+                    self._qr_result_sig.emit("__err__No QR code detected in the selected region.")
+            except Exception as e:
+                self._qr_result_sig.emit(f"__err__Error decoding QR: {e}")
+
+        threading.Thread(target=go, daemon=True).start()
+
+    def _on_qr_result(self, result: str):
+        if result.startswith("__err__"):
+            QMessageBox.warning(self, "QR Scan", result[7:])
+            self.show(); self.raise_(); self.activateWindow()
+            return
+        self.text_edit.blockSignals(True)
+        self.text_edit.setPlainText(result)
+        self.text_edit.blockSignals(False)
+        self._on_text_changed()
+        # Auto-enable QR display after a successful scan
+        self.show_qr_check.setChecked(True)
+        self.show(); self.raise_(); self.activateWindow()
+
+    # ── Image buttons ────────────────────────────────────────────────────────
+
+    def _copy_image(self):
+        if not self._qr_pixmap:
+            QMessageBox.information(self, "OCR / QR Toolbox", "No QR code generated yet.")
+            return
+        QApplication.clipboard().setPixmap(self._qr_pixmap)
+
+    def _save_image(self):
+        if not self._qr_pixmap:
+            QMessageBox.information(self, "OCR / QR Toolbox", "No QR code generated yet.")
+            return
+        save_dir = Path(self.main_window.config.get(
+            "save_folder",
+            str(QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.PicturesLocation))))
+        save_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"qrcode_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+        path = save_dir / filename
+        self._qr_pixmap.save(str(path), "PNG")
+        QMessageBox.information(self, "Saved", f"QR code image saved to:\n{path}")
+
+    def _save_as(self):
+        if not self._qr_pixmap:
+            QMessageBox.information(self, "OCR / QR Toolbox", "No QR code generated yet.")
+            return
+        save_dir = self.main_window.config.get(
+            "save_folder",
+            str(QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.PicturesLocation)))
+        default_path = str(
+            Path(save_dir) / f"qrcode_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save QR Code As", default_path,
+            "PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp)")
+        if path:
+            self._qr_pixmap.save(path)
+
+
+# ─────────────────────────────────────────────
 #  MAIN WINDOW  (settings embedded)
 # ─────────────────────────────────────────────
 
@@ -3221,8 +3507,7 @@ class MainWindow(QMainWindow):
         lbl = QLabel("🔧 Tools")
         lbl.setStyleSheet("color:#89b4fa;font-size:15px;font-weight:bold;")
         lay.addWidget(lbl)
-        items = [("🔤 OCR – text",       self.act_ocr_text),
-                 ("🔳 OCR – code",       self.act_ocr_code),
+        items = [("🧰  OCR/QR Toolbox",  self.act_ocr_qr_toolbox),
                  ("🖥  Full screen",     self.act_fullscreen),
                  ("🪟  Active window",   self.act_window),
                  ("🖥  Active monitor",  self.act_monitor),
@@ -3419,6 +3704,11 @@ class MainWindow(QMainWindow):
             if sc: a.setShortcut(QKeySequence(sc))
             a.triggered.connect(fn); cm.addAction(a)
         cm.addSeparator()
+        a = QAction("Recognize text", self)
+        a.triggered.connect(self.act_ocr_text); cm.addAction(a)
+        a = QAction("Recognize QR code", self)
+        a.triggered.connect(self.act_ocr_code); cm.addAction(a)
+        cm.addSeparator()
         for m in get_monitors():
             i = m["index"]
             cm.addAction(f"Monitor {i+1} – {m['name']}").triggered.connect(
@@ -3429,8 +3719,10 @@ class MainWindow(QMainWindow):
         rm.addAction("Record GIF").triggered.connect(self.act_gif)
 
         tm = mb.addMenu("Tools")
-        tm.addAction("OCR – Recognize text").triggered.connect(self.act_ocr_text)
-        tm.addAction("OCR – Recognize code").triggered.connect(self.act_ocr_code)
+        a = QAction("OCR/QR Toolbox", self)
+        a.setShortcut(QKeySequence("Ctrl+Alt+Q"))
+        a.triggered.connect(self.act_ocr_qr_toolbox); tm.addAction(a)
+        tm.addSeparator()
         tm.addAction("Video Converter").triggered.connect(self.act_video_converter)
         tm.addAction("Image Editor").triggered.connect(self.open_image_editor)
 
@@ -3453,6 +3745,9 @@ class MainWindow(QMainWindow):
         csub.addAction("Full screen").triggered.connect(self.act_fullscreen)
         csub.addAction("Scrolling capture").triggered.connect(self.act_scrolling)
         csub.addSeparator()
+        csub.addAction("Recognize text").triggered.connect(self.act_ocr_text)
+        csub.addAction("Recognize QR code").triggered.connect(self.act_ocr_code)
+        csub.addSeparator()
         for m in get_monitors():
             i = m["index"]
             csub.addAction(f"Monitor {i+1} – {m['name']}").triggered.connect(
@@ -3463,8 +3758,7 @@ class MainWindow(QMainWindow):
         rsub.addAction("Record GIF").triggered.connect(self.act_gif)
 
         tsub = menu.addMenu("Tools")
-        tsub.addAction("OCR – text").triggered.connect(self.act_ocr_text)
-        tsub.addAction("OCR – code").triggered.connect(self.act_ocr_code)
+        tsub.addAction("OCR/QR Toolbox").triggered.connect(self.act_ocr_qr_toolbox)
         tsub.addAction("Video Converter").triggered.connect(self.act_video_converter)
         tsub.addAction("Image Editor").triggered.connect(self.open_image_editor)
         
@@ -3667,6 +3961,7 @@ class MainWindow(QMainWindow):
         "record_gif":               "act_gif",
         "ocr_text":                 "act_ocr_text",
         "ocr_code":                 "act_ocr_code",
+        "ocr_qr_toolbox":           "act_ocr_qr_toolbox",
         "capture_fullscreen":       "act_fullscreen",
         "video_converter":          "act_video_converter",
     }
@@ -4157,6 +4452,16 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=go, daemon=True).start()
     
+    def act_ocr_qr_toolbox(self):
+        if not hasattr(self, "_toolbox_dlg") or self._toolbox_dlg is None:
+            self._toolbox_dlg = OcrQrToolboxDialog(self, parent=None)
+            self._toolbox_dlg.setStyleSheet(self.styleSheet())
+            self._toolbox_dlg.setWindowIcon(self._app_icon)
+            self._toolbox_dlg.finished.connect(lambda: setattr(self, "_toolbox_dlg", None))
+        self._toolbox_dlg.show()
+        self._toolbox_dlg.raise_()
+        self._toolbox_dlg.activateWindow()
+
     def act_video_converter(self):
         # Otwieramy okno konwertera
         dlg = VideoConverterDialog(self)
