@@ -1129,7 +1129,8 @@ class RegionSelector(QWidget):
         self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
         self.start_pos = self.end_pos = None
         self.drawing = False
-        self.setMouseTracking(True) # Ensure mouse tracking is active for hover detection
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._geo = QRect()
         for s in QApplication.screens():
@@ -1138,6 +1139,14 @@ class RegionSelector(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        # Force keyboard focus even when triggered from a global hotkey
+        QTimer.singleShot(50, self._force_focus)
+
+    def _force_focus(self):
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -1852,9 +1861,53 @@ class EnhancedRegionSelector(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
-        self.setFocus()
-        self.grabKeyboard() # Strictly lock keyboard input to this overlay
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        # grabKeyboard() must be deferred — it only works once the window
+        # is truly active at the OS level (e.g. when triggered via global hotkey
+        # the window isn't active yet at __init__ time, so ESC wouldn't fire
+        # until the user clicked, which finally made Qt the active window).
+        QTimer.singleShot(150, self._activate_and_grab)
         QTimer.singleShot(80, self._update_detection_at_cursor)
+
+    def _activate_and_grab(self):
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        self.grabKeyboard()
+        # BypassWindowManagerHint prevents the OS from giving this window
+        # real keyboard focus, so grabKeyboard() alone won't catch ESC when
+        # triggered via a global hotkey. Use pynput as a fallback listener.
+        self._start_esc_listener()
+
+    def _start_esc_listener(self):
+        if not PYNPUT_AVAILABLE:
+            return
+        from pynput import keyboard as _kb
+        def on_press(key):
+            try:
+                if key == _kb.Key.esc:
+                    QTimer.singleShot(0, self._esc_pressed)
+                    return False  # stop listener
+            except Exception:
+                pass
+        self._esc_listener = _kb.Listener(on_press=on_press)
+        self._esc_listener.start()
+
+    def _esc_pressed(self):
+        self._stop_esc_listener()
+        if self.isVisible():
+            self.releaseKeyboard()
+            self.close()
+            self.cancelled.emit()
+
+    def _stop_esc_listener(self):
+        listener = getattr(self, '_esc_listener', None)
+        if listener:
+            try:
+                listener.stop()
+            except Exception:
+                pass
+            self._esc_listener = None
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Window detection
@@ -2460,9 +2513,20 @@ class EnhancedRegionSelector(QWidget):
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
-            self.close(); self.cancelled.emit(); return
-        if e.key() == Qt.Key.Key_Delete:
-            self._canvas.delete_selected()
+            self._stop_esc_listener()
+            self.releaseKeyboard()
+            self.close()
+            self.cancelled.emit()
+            return
+        super().keyPressEvent(e)
+
+    def closeEvent(self, e):
+        self._stop_esc_listener()
+        try:
+            self.releaseKeyboard()
+        except Exception:
+            pass
+        super().closeEvent(e)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Capture
@@ -2666,8 +2730,9 @@ class EnhancedRegionSelector(QWidget):
                         else:
                             thumb = None
                         w._notify_sig.emit(saved_path, thumb)
-                        # Restore main window after capture
-                        QTimer.singleShot(300, w.show_win)
+                        # Restore main window only if it was visible before capture
+                        if getattr(w, '_win_was_visible', True):
+                            QTimer.singleShot(300, w.show_win)
                         break
             except Exception as ex:
                 print(f"[PyshareX] notify error: {ex}")
@@ -5629,23 +5694,46 @@ class MainWindow(QMainWindow):
         else: self._open_region()
 
     def _open_region(self):
-        self.hide(); QTimer.singleShot(160, self._do_region)
+        # Remember whether the main window was visible before hiding it.
+        # After capture / cancel we restore only if it was visible.
+        self._win_was_visible = self.isVisible()
+        self.hide()
+        # Longer delay when triggered from global hotkey to ensure
+        # the hotkey key-up event is fully processed before overlay grabs focus
+        QTimer.singleShot(200, self._do_region)
 
     def _do_region(self):
         self._sel = EnhancedRegionSelector()
         self._sel.region_selected.connect(self._on_region)
-        self._sel.cancelled.connect(self.show_win)
+        self._sel.cancelled.connect(self._on_region_cancelled)
+        # Force focus after the selector is fully constructed
+        QTimer.singleShot(80, self._focus_selector)
+
+    def _on_region_cancelled(self):
+        """Restore window only if it was visible before the selector opened."""
+        if getattr(self, '_win_was_visible', True):
+            self.show_win()
+
+    def _focus_selector(self):
+        if self._sel and self._sel.isVisible():
+            self._sel.raise_()
+            self._sel.activateWindow()
+            self._sel.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     def _on_region(self, x, y, w, h):
         # Fallback path only — normal path is handled by _grab_composite_and_close.
-        if w < 5 or h < 5: self.show_win(); return
+        if w < 5 or h < 5:
+            self._on_region_cancelled()
+            return
         def do():
             time.sleep(0.05)
             p = self.engine.capture_region(x, y, w, h)
             if p:
                 self.status_sig.emit(f"✅ Region: {Path(p).name}")
                 self._notify_sig.emit(p, None)
-            self.status_sig.emit("__show_win__")
+            # Restore window only if it was visible before capture started
+            if getattr(self, '_win_was_visible', True):
+                self.status_sig.emit("__show_win__")
         threading.Thread(target=do, daemon=True).start()
 
     def act_monitor(self):
