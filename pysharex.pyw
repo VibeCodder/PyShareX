@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     QPointF, Qt, QThread, pyqtSignal, QTimer, QSize, QRect, QPoint,
-    QStandardPaths, QElapsedTimer, QLineF, QRectF
+    QStandardPaths, QElapsedTimer, QLineF, QRectF, QSizeF
 )
 from PyQt6.QtGui import (
     QIcon, QKeySequence, QAction, QMouseEvent, QPixmap, QPainter, QColor,
@@ -919,7 +919,8 @@ def notify(config: Config, filepath: str, pixmap=None):
             img.thumbnail((250, 250)) 
             img = img.convert("RGBA")
             data = img.tobytes("raw", "RGBA")
-            qi = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+            # Force deep copy to prevent Segmentation Fault when bytes are garbage collected
+            qi = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888).copy()
             pixmap = QPixmap.fromImage(qi)
         except: pass
 
@@ -1107,7 +1108,6 @@ class RecordingBar(QWidget):
     def stop_display(self):
         self._tt.stop(); self.close()
 
-
 # ─────────────────────────────────────────────
 #  REGION SELECTOR
 # ─────────────────────────────────────────────
@@ -1121,18 +1121,16 @@ class RegionSelector(QWidget):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool |
             Qt.WindowType.BypassWindowManagerHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
         self.start_pos = self.end_pos = None
         self.drawing = False
+        self.setMouseTracking(True) # Ensure mouse tracking is active for hover detection
 
-        # Cover EVERY screen — compute the bounding rect of all screens
-        # in LOGICAL coordinates (Qt). Do NOT use showFullScreen() as that
-        # snaps to the primary screen only on Windows.
         self._geo = QRect()
         for s in QApplication.screens():
             self._geo = self._geo.united(s.geometry())
@@ -1160,14 +1158,11 @@ class RegionSelector(QWidget):
             self.close(); self.cancelled.emit()
 
     def _abs(self, local_pt: QPoint) -> QPoint:
-        """Convert widget-local point to absolute screen coordinates."""
-        # Use mapToGlobal which correctly handles multi-monitor + DPI
         return self.mapToGlobal(local_pt)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self.start_pos = self.end_pos = e.pos()
-            # Pobieramy absolutną pozycję globalną prosto ze zdarzenia (odporną na błędy DWM/DPI w wielkich oknach)
             self.global_start = self.global_end = e.globalPosition().toPoint()
             self.drawing = True
 
@@ -1184,11 +1179,9 @@ class RegionSelector(QWidget):
             self.drawing = False
             self.close()
 
-            # 1. Tworzymy zaznaczenie z nieprzekłamanych, globalnych koordynatów pulpitu wirtualnego
             r = QRect(self.global_start, self.global_end).normalized()
 
             if r.width() > 0 and r.height() > 0:
-                # 2. Wykrywamy ekran na podstawie ŚRODKA zaznaczenia (znacznie bezpieczniejsze niż topLeft)
                 screen = QApplication.screenAt(r.center())
                 if not screen:
                     screen = QApplication.primaryScreen()
@@ -1196,25 +1189,20 @@ class RegionSelector(QWidget):
                 ratio = screen.devicePixelRatio()
                 logical_geom = screen.geometry()
                 
-                # Zaznaczenie RELATYWNIE do lewego górnego rogu TEGO konkretnego ekranu
                 local_x = r.x() - logical_geom.x()
                 local_y = r.y() - logical_geom.y()
                 
-                # Zaznaczenie w pikselach FIZYCZNYCH (skalowane przez DPI)
                 phys_w = int(r.width() * ratio)
                 phys_h = int(r.height() * ratio)
                 phys_local_x = int(local_x * ratio)
                 phys_local_y = int(local_y * ratio)
                 
-                # 3. Zastosowanie poprawnego offsetu dla wielu monitorów (fizyczny punkt X/Y)
                 final_x = int(r.x() * ratio) 
                 final_y = int(r.y() * ratio)
                 
                 try:
                     import mss
                     with mss.mss() as sct:
-                        # KLUCZOWA ZMIANA: Sortujemy monitory po osi X ORAZ Y. 
-                        # Gwarantuje to identyczne sparowanie ekranów Qt i mss niezależnie od ułożenia.
                         qt_screens = sorted(QApplication.screens(), key=lambda s: (s.geometry().x(), s.geometry().y()))
                         mss_mons = sorted(sct.monitors[1:], key=lambda m: (m["left"], m["top"]))
                         
@@ -1222,14 +1210,1477 @@ class RegionSelector(QWidget):
                             screen_idx = qt_screens.index(screen)
                             if screen_idx < len(mss_mons):
                                 target_mon = mss_mons[screen_idx]
-                                # Dodajemy przeskalowany offset do twardego, fizycznego narożnika monitora
                                 final_x = target_mon["left"] + phys_local_x
                                 final_y = target_mon["top"]  + phys_local_y
                 except Exception as ex:
                     print(f"[PyshareX] Błąd przy parowaniu monitorów: {ex}")
 
-                # Emitujemy twarde, fizyczne koordynaty dla mss oraz ffmpeg
                 self.region_selected.emit(final_x, final_y, phys_w, phys_h)
+
+
+# ─────────────────────────────────────────────
+#  ENHANCED REGION SELECTOR (direct user capture only)
+# ─────────────────────────────────────────────
+
+def _emit_region_from_global_rect(r: QRect, signal):
+    """
+    Convert a global-logical QRect to physical MSS coordinates and emit
+    region_selected(x, y, w, h).  Uses exactly the same logic as
+    RegionSelector.mouseReleaseEvent so multi-monitor behaviour is identical.
+    """
+    # Find screen under the rect's top-left corner (more reliable than center
+    # when the selection spans a monitor boundary).
+    screen = QApplication.screenAt(r.topLeft())
+    if not screen:
+        screen = QApplication.screenAt(r.center())
+    if not screen:
+        screen = QApplication.primaryScreen()
+
+    ratio        = screen.devicePixelRatio()
+    logical_geom = screen.geometry()
+
+    # Offset inside this screen (logical px)
+    local_x = r.x() - logical_geom.x()
+    local_y = r.y() - logical_geom.y()
+
+    # Convert to physical px
+    phys_local_x = int(local_x * ratio)
+    phys_local_y = int(local_y * ratio)
+    phys_w       = int(r.width()  * ratio)
+    phys_h       = int(r.height() * ratio)
+
+    # Default (fallback) — may be wrong on mixed-DPI setups, overridden below
+    final_x = int(r.x() * ratio)
+    final_y = int(r.y() * ratio)
+
+    try:
+        with mss.mss() as sct:
+            # Sort both lists by top-left so indices match
+            qt_screens = sorted(QApplication.screens(),
+                                key=lambda s: (s.geometry().x(), s.geometry().y()))
+            mss_mons   = sorted(sct.monitors[1:],
+                                key=lambda m: (m["left"], m["top"]))
+            if screen in qt_screens:
+                idx = qt_screens.index(screen)
+                if idx < len(mss_mons):
+                    mon     = mss_mons[idx]
+                    final_x = mon["left"] + phys_local_x
+                    final_y = mon["top"]  + phys_local_y
+    except Exception as ex:
+        print(f"[PyshareX] monitor mapping error: {ex}")
+
+    signal.emit(final_x, final_y, phys_w, phys_h)
+
+class _OverlayCanvas(QGraphicsView):
+    """
+    Transparent annotation canvas used by EnhancedRegionSelector.
+    Uses QGraphicsScene so items are fully selectable, movable and resizable
+    (same infrastructure as the Image Editor).
+
+    Mouse routing strategy
+    ──────────────────────
+    The canvas sits on top of EnhancedRegionSelector (the dark overlay).
+    We always keep WA_TransparentForMouseEvents=True so every click reaches
+    the overlay parent first.  The parent's mouse-event handlers call back
+    into the canvas methods (add_rect, begin_freehand, …) and also call
+    scene.sendEvent() for SELECT-tool interactions so QGraphicsScene still
+    handles item drag/selection without us having to flip the transparency flag.
+    """
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self.setInteractive(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        # Always transparent — parent routes events manually via send_mouse_to_scene()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        self._marker_count = 0
+        self._current_freehand_item = None
+        self._freehand_path = None
+
+    def send_mouse_to_scene(self, qevent):
+        """
+        Forward a QMouseEvent from the parent overlay into the QGraphicsScene
+        so that item selection, dragging and resize handles work even though
+        WA_TransparentForMouseEvents is set.
+        """
+        # Map the event position from parent-widget coords → viewport coords
+        vp_pos  = self.mapFrom(self.parent(), qevent.pos())
+        scene_p = self.mapToScene(vp_pos)
+
+        from PyQt6.QtCore import QEvent
+        etype = qevent.type()
+
+        fake = QMouseEvent(
+            etype,
+            QPointF(vp_pos),
+            qevent.globalPosition(),
+            qevent.button(),
+            qevent.buttons(),
+            qevent.modifiers(),
+        )
+        # Let QGraphicsView process it — this triggers item hit-testing,
+        # rubber-band selection, and the scene's own event dispatch.
+        QGraphicsView.mousePressEvent(self, fake)   if etype == QMouseEvent.Type.MouseButtonPress   else None
+        QGraphicsView.mouseMoveEvent(self, fake)    if etype == QMouseEvent.Type.MouseMove          else None
+        QGraphicsView.mouseReleaseEvent(self, fake) if etype == QMouseEvent.Type.MouseButtonRelease else None
+
+    # ------------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------------
+    def sync_geometry(self):
+        """Call after parent resize to keep canvas covering the whole overlay."""
+        self.setGeometry(self.parent().rect())
+        self._scene.setSceneRect(QRectF(self.parent().rect()))
+
+    # ------------------------------------------------------------------
+    # Item factories (called by EnhancedRegionSelector)
+    # ------------------------------------------------------------------
+    def add_rect(self, rect: QRectF, color: QColor, width: int):
+        item = ResizableRectItem()
+        item.setRect(rect)
+        self._apply_props(item, color, width)
+        self._scene.addItem(item)
+        return item
+
+    def add_ellipse(self, rect: QRectF, color: QColor, width: int):
+        item = ResizableEllipseItem()
+        item.setRect(rect)
+        self._apply_props(item, color, width)
+        self._scene.addItem(item)
+        return item
+
+    def add_line(self, line: QLineF, color: QColor, width: int):
+        item = LineItem(line, self)
+        self._apply_props(item, color, width)
+        self._scene.addItem(item)
+        return item
+
+    def begin_freehand(self, pos: QPointF, color: QColor, width: int):
+        path = QPainterPath()
+        path.moveTo(pos)
+        item = FreehandItem(path)
+        self._apply_props(item, color, width)
+        self._scene.addItem(item)
+        self._current_freehand_item = item
+        self._freehand_path = path
+        return item
+
+    def extend_freehand(self, pos: QPointF):
+        if self._freehand_path and self._current_freehand_item:
+            self._freehand_path.lineTo(pos)
+            self._current_freehand_item.setPath(self._freehand_path)
+            if hasattr(self._current_freehand_item, 'update_base_path'):
+                self._current_freehand_item.update_base_path()
+
+    def end_freehand(self):
+        self._current_freehand_item = None
+        self._freehand_path = None
+
+    def add_marker(self, pos: QPointF, color: QColor):
+        # Always number after the highest existing marker so re-selecting
+        # the tool and adding more markers continues the sequence correctly.
+        existing = [it for it in self._scene.items() if isinstance(it, _MarkerItem)]
+        self._marker_count = max((it.number for it in existing), default=0) + 1
+        # Inherit scale from the most recently placed marker (highest number),
+        # falling back to 1.0 if no markers remain on the canvas.
+        last_scale = next(
+            (it._scale for it in sorted(existing, key=lambda m: m.number, reverse=True)),
+            1.0)
+        item = _MarkerItem(pos, self._marker_count)
+        item._scale = last_scale
+        item._bg_color = color
+        self._scene.addItem(item)
+        return item
+
+    def add_text(self, pos: QPointF, text: str, font_size: int,
+                 color: QColor, highlight: QColor):
+        item = HighlightTextItem(text)
+        item.highlight_color = highlight
+        item.setDefaultTextColor(color)
+        item.setFont(QFont("Arial", font_size))
+        item.setPos(pos)
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+        self._scene.addItem(item)
+        return item
+
+    def add_pixmap(self, pos: QPointF, pixmap: QPixmap):
+        item = ResizablePixmapItem(pixmap)
+        item.setPos(pos)
+        self._scene.addItem(item)
+        return item
+
+    def delete_selected(self):
+        for item in self._scene.selectedItems():
+            self._scene.removeItem(item)
+
+    def clear(self):
+        self._scene.clear()
+        self._marker_count = 0
+        self._current_freehand_item = None
+        self._freehand_path = None
+
+    def has_items(self) -> bool:
+        return len(self._scene.items()) > 0
+
+    # ------------------------------------------------------------------
+    # Resize handle detection (mirrors EditorCanvas.get_handle_at)
+    # ------------------------------------------------------------------
+    def get_handle_at(self, scene_pos: QPointF):
+        """Return (item, handle_name) if pos is over a resize handle."""
+        for item in self._scene.selectedItems():
+            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem,
+                                  ResizablePixmapItem, FreehandItem)):
+                local_pos = item.mapFromScene(scene_pos)
+                rect = item.rect()
+                m = 10.0
+                # Rotation handle — disabled for markers (they scale uniformly instead)
+                if not isinstance(item, _MarkerItem):
+                    rot_pt = QPointF(rect.center().x(), rect.top() - 30)
+                    if (abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
+                            abs(local_pos.y() - rot_pt.y()) < m * 1.5):
+                        return item, 'ROTATE'
+                L = abs(local_pos.x() - rect.left())  < m
+                R = abs(local_pos.x() - rect.right()) < m
+                T = abs(local_pos.y() - rect.top())   < m
+                B = abs(local_pos.y() - rect.bottom())< m
+                if L and T: return item, 'TL'
+                if R and T: return item, 'TR'
+                if L and B: return item, 'BL'
+                if R and B: return item, 'BR'
+                if L: return item, 'L'
+                if R: return item, 'R'
+                if T: return item, 'T'
+                if B: return item, 'B'
+        return None, None
+
+    def handle_resize(self, item, handle, scene_pos: QPointF, proportional=False):
+        """Resize/rotate item — same logic as EditorCanvas.handle_resize_logic."""
+        # _MarkerItem uses uniform scale — Ctrl always forces equal W/H
+        if isinstance(item, _MarkerItem):
+            local_pos = item.mapFromScene(scene_pos)
+            old_r = item.RADIUS * item._scale
+            if proportional or handle in ('TL', 'TR', 'BL', 'BR'):
+                # equal W/H: use the larger of dx/dy from centre
+                dist = max(abs(local_pos.x()), abs(local_pos.y()))
+            else:
+                dist = math.hypot(local_pos.x(), local_pos.y())
+            dist = max(dist, item.RADIUS * 0.2)   # minimum size guard
+            item.prepareGeometryChange()
+            item._scale = dist / item.RADIUS
+            item.update()
+            return
+        if handle == 'ROTATE':
+            center = item.mapToScene(item.rect().center())
+            diff  = scene_pos - center
+            angle = math.degrees(math.atan2(diff.y(), diff.x())) + 90
+            if proportional:
+                angle = round(angle / 45) * 45
+            item.setTransformOriginPoint(item.rect().center())
+            item.setRotation(angle)
+            return
+        old_rect   = item.rect()
+        local_pos  = item.mapFromScene(scene_pos)
+        fixed      = QPointF(
+            old_rect.right()  if 'L' in handle else
+            old_rect.left()   if 'R' in handle else old_rect.center().x(),
+            old_rect.bottom() if 'T' in handle else
+            old_rect.top()    if 'B' in handle else old_rect.center().y())
+        old_fixed_scene = item.mapToScene(fixed)
+        l = local_pos.x() if 'L' in handle else old_rect.left()
+        r = local_pos.x() if 'R' in handle else old_rect.right()
+        t = local_pos.y() if 'T' in handle else old_rect.top()
+        b = local_pos.y() if 'B' in handle else old_rect.bottom()
+        new_rect = QRectF(QPointF(l, t), QPointF(r, b)).normalized()
+        if proportional:
+            side = max(new_rect.width(), new_rect.height())
+            l = (r - side) if 'L' in handle else l
+            r = (l + side) if 'R' in handle else r
+            t = (b - side) if 'T' in handle else t
+            b = (t + side) if 'B' in handle else b
+            new_rect = QRectF(QPointF(l, t), QPointF(r, b)).normalized()
+        item.setRect(new_rect)
+        item.setTransformOriginPoint(new_rect.center())
+        new_fixed_scene = item.mapToScene(fixed)
+        item.setPos(item.pos() + old_fixed_scene - new_fixed_scene)
+
+    # ------------------------------------------------------------------
+    def _apply_props(self, item, color: QColor, width: int):
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        pen = QPen(color, width)
+        if hasattr(item, 'setPen'):
+            item.setPen(pen)
+        if hasattr(item, 'setBrush'):
+            item.setBrush(Qt.GlobalColor.transparent)
+
+
+class _MarkerItem(QGraphicsItem):
+    """Numbered circular marker with:
+    - a draggable spike handle (visible when selected, drag to reposition tip)
+    - a scale handle on the left edge (visible when selected, drag to resize)
+    Scaling is always uniform (equal W/H).
+    """
+    RADIUS = 14
+    HANDLE_RADIUS = 6
+
+    def __init__(self, pos: QPointF, number: int):
+        super().__init__()
+        self.setPos(pos)
+        self.number = number
+        self._scale = 1.0           # uniform scale factor
+        self._spike_offset = QPointF(0, 0)  # hidden inside circle by default
+        self._dragging_spike = False
+        self._dragging_scale = False
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setAcceptHoverEvents(True)
+
+    # ------------------------------------------------------------------
+    # rect / setRect — kept for compatibility with resize machinery
+    # ------------------------------------------------------------------
+    def rect(self) -> QRectF:
+        r = self.RADIUS * self._scale
+        return QRectF(-r, -r, r * 2, r * 2)
+
+    def setRect(self, new_rect: QRectF):
+        self.prepareGeometryChange()
+        half = (new_rect.width() + new_rect.height()) / 4.0
+        self._scale = max(0.2, half / self.RADIUS)
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Scale handle position — left edge of circle, in local coords
+    # ------------------------------------------------------------------
+    def _scale_handle_pos(self) -> QPointF:
+        r = self.RADIUS * self._scale
+        return QPointF(-r, 0)
+
+    def _over_scale_handle(self, local_pos: QPointF) -> bool:
+        hp = self._scale_handle_pos()
+        return math.hypot(local_pos.x() - hp.x(),
+                          local_pos.y() - hp.y()) <= self.HANDLE_RADIUS + 4
+
+    # ------------------------------------------------------------------
+    def boundingRect(self):
+        r = self.RADIUS * self._scale + 4
+        sx, sy = self._spike_offset.x(), self._spike_offset.y()
+        hr = self.HANDLE_RADIUS + 2
+        # also cover the scale handle on the left
+        left  = min(-r, sx - hr, self._scale_handle_pos().x() - hr) - 2
+        top   = min(-r, sy - hr) - 2
+        right  = max(r, abs(sx) + hr) + 2
+        bottom = max(r, abs(sy) + hr) + 2
+        return QRectF(left, top, right - left, bottom - top)
+
+    def _spike_path(self):
+        """Build the teardrop spike from circle edge to tip."""
+        r = self.RADIUS * self._scale
+        tip = self._spike_offset
+        dx, dy = tip.x(), tip.y()
+        length = math.hypot(dx, dy) or 1
+        nx, ny = -dy / length, dx / length
+        hw = r * 0.45
+        p1 = QPointF(nx * hw, ny * hw)
+        p2 = QPointF(-nx * hw, -ny * hw)
+        path = QPainterPath()
+        path.moveTo(p1)
+        path.quadTo(QPointF(tip.x() * 0.6 + nx * hw * 0.3,
+                            tip.y() * 0.6 + ny * hw * 0.3), tip)
+        path.quadTo(QPointF(tip.x() * 0.6 - nx * hw * 0.3,
+                            tip.y() * 0.6 - ny * hw * 0.3), p2)
+        path.lineTo(p1)
+        return path
+
+    def paint(self, painter, option, widget=None):
+        r = self.RADIUS * self._scale
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = getattr(self, '_bg_color', QColor(220, 50, 50))
+
+        # Spike (behind circle)
+        painter.setBrush(QBrush(color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawPath(self._spike_path())
+
+        # Circle
+        painter.setBrush(QBrush(color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QPointF(0, 0), r, r)
+
+        # Number
+        painter.setPen(QPen(Qt.GlobalColor.white, 1))
+        painter.setFont(QFont("Arial", max(8, int(r - 2)), QFont.Weight.Bold))
+        painter.drawText(QRectF(-r, -r, r * 2, r * 2),
+                         Qt.AlignmentFlag.AlignCenter, str(self.number))
+
+        if self.isSelected():
+            hr = self.HANDLE_RADIUS
+
+            # Spike handle
+            tip = self._spike_offset
+            painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(tip, hr, hr)
+
+            # Scale handle (left edge, white with arrows hint)
+            sp = self._scale_handle_pos()
+            painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(sp, hr, hr)
+            # small arrows inside scale handle to hint resize
+            painter.setPen(QPen(QColor(60, 60, 60), 1.2))
+            painter.drawLine(QPointF(sp.x() - hr + 2, sp.y()),
+                             QPointF(sp.x() + hr - 2, sp.y()))
+
+            # Dashed bounding rect
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.drawRect(QRectF(-r, -r, r * 2, r * 2))
+
+    def _over_spike_handle(self, local_pos: QPointF) -> bool:
+        tip = self._spike_offset
+        return math.hypot(local_pos.x() - tip.x(),
+                          local_pos.y() - tip.y()) <= self.HANDLE_RADIUS + 4
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.isSelected():
+            if self._over_scale_handle(event.pos()):
+                self._dragging_scale = True
+                event.accept()
+                return
+            if self._over_spike_handle(event.pos()):
+                self._dragging_spike = True
+                event.accept()
+                return
+        self._dragging_spike = False
+        self._dragging_scale = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_scale:
+            # Distance from centre → new radius → new scale
+            dist = math.hypot(event.pos().x(), event.pos().y())
+            dist = max(dist, self.RADIUS * 0.2)
+            self.prepareGeometryChange()
+            self._scale = dist / self.RADIUS
+            self.update()
+            event.accept()
+            return
+        if self._dragging_spike:
+            self.prepareGeometryChange()
+            self._spike_offset = event.pos()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging_spike = False
+        self._dragging_scale = False
+        super().mouseReleaseEvent(event)
+
+    def hoverMoveEvent(self, event):
+        if self.isSelected():
+            if self._over_scale_handle(event.pos()):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                super().hoverMoveEvent(event)
+                return
+            if self._over_spike_handle(event.pos()):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                super().hoverMoveEvent(event)
+                return
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().hoverMoveEvent(event)
+
+class _TextInputDialog(QDialog):
+    def __init__(self, color, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Add Text")
+        self.color = color
+        lay = QVBoxLayout(self)
+        self.edit = QTextEdit(); self.edit.setFixedHeight(80)
+        lay.addWidget(QLabel("Text:")); lay.addWidget(self.edit)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Font size:"))
+        self.sz = QSpinBox(); self.sz.setRange(6, 120); self.sz.setValue(18)
+        row.addWidget(self.sz)
+        lay.addLayout(row)
+        row2 = QHBoxLayout()
+        self.btn_col = QPushButton("Text color"); self.btn_col.clicked.connect(self._pick_col)
+        self.btn_hl  = QPushButton("Highlight"); self.btn_hl.clicked.connect(self._pick_hl)
+        row2.addWidget(self.btn_col); row2.addWidget(self.btn_hl)
+        lay.addLayout(row2)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self.highlight = QColor(255, 255, 0, 255)  # fully opaque yellow highlight by default
+        self._update_btn_color()
+
+    def _pick_col(self):
+        dlg = QColorDialog(self.color, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                self.color = c
+                self._update_btn_color()
+
+    def _pick_hl(self):
+        dlg = QColorDialog(self.highlight, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                self.highlight = c
+
+    def _update_btn_color(self):
+        c = self.color
+        self.btn_col.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); color: white;")
+
+    def result_data(self):
+        return self.edit.toPlainText(), self.sz.value(), self.color, self.highlight
+
+class EnhancedRegionSelector(QWidget):
+    """
+    Advanced region capture overlay.
+    - DETECT mode: hover highlights windows, click captures.
+    - DRAW mode: annotation tools (rect/ellipse/line/freehand/marker/text/image).
+      In draw mode a dedicated 📷 Capture button triggers the screenshot.
+    - ESC cancels at any time.
+    - All annotation items are fully selectable, movable and resizable
+      (uses the same QGraphicsScene infrastructure as the Image Editor).
+    """
+    region_selected = pyqtSignal(int, int, int, int)
+    cancelled       = pyqtSignal()
+
+    TOOL_DETECT   = "detect"
+    TOOL_SELECT   = "select"
+    TOOL_RECT     = "rect"
+    TOOL_CIRCLE   = "circle"
+    TOOL_FREEHAND = "freehand"
+    TOOL_LINE     = "line"
+    TOOL_MARKER   = "marker"
+    TOOL_TEXT     = "text"
+    TOOL_IMAGE    = "image"
+    TOOL_COLOR    = "color"
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool |
+            Qt.WindowType.BypassWindowManagerHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setMouseTracking(True)
+
+        # Cover all screens
+        self._geo = QRect()
+        for s in QApplication.screens():
+            self._geo = self._geo.united(s.geometry())
+        self.setGeometry(self._geo)
+
+        # ── State ──────────────────────────────────────────────────────────────
+        self._current_tool      = self.TOOL_RECT
+        self._detected_rect     = QRect()   # LOCAL widget coords
+        self._drag_start        = None      # QPoint local
+        self._drag_end          = None
+        self._dragging          = False
+        self._draw_color        = QColor(255, 0, 0)
+        self._draw_width        = 3
+        self._hide_bg           = False
+
+        # Drawing state
+        self._draw_start_scene   = None     # QPointF scene coords
+        self._preview_item       = None     # live shape while dragging
+        self._resizing_item      = None
+        self._resize_handle      = None
+        self._resize_start_pos   = None
+        self._last_detected_global = QRect()   # instance-level, updated on each capture
+        # Inline capture-selection state
+        self._inline_selecting   = False
+        self._inline_start       = None
+        self._inline_end         = None
+        self._prev_tool          = self.TOOL_RECT
+        self._capture_geo        = QRect()
+
+        # ── Annotation canvas ─────────────────────────────────────────────────
+        self._canvas = _OverlayCanvas(self)
+        self._canvas.sync_geometry()
+        self._canvas.raise_()
+
+        # ── Window-rect cache — disabled (detection mode removed) ──────────────
+        self._win_rects: list[QRect] = []
+        self._cache_timer = QTimer(self)  # kept as reference but not started
+
+        # ── Toolbar ───────────────────────────────────────────────────────────
+        self._toolbar = self._build_toolbar()
+        
+        # Place toolbar on the screen where the cursor is currently located
+        cursor_screen = QApplication.screenAt(QCursor.pos())
+        if not cursor_screen:
+            cursor_screen = QApplication.primaryScreen()
+            
+        screen_geo = cursor_screen.geometry()
+        tx = screen_geo.x() - self._geo.x() + screen_geo.width() // 2 - self._toolbar.width() // 2
+        ty = screen_geo.y() - self._geo.y() + 8
+        self._toolbar.move(tx, ty)
+        self._toolbar.show()
+
+        self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+        self.grabKeyboard() # Strictly lock keyboard input to this overlay
+        QTimer.singleShot(80, self._update_detection_at_cursor)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Window detection
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _refresh_win_rects(self):
+        """
+        Collect visible window rects (Win32 physical px → logical → LOCAL coords).
+        On Linux falls back to per-screen full-rect entries.
+        """
+        rects = []
+        if IS_WINDOWS:
+            try:
+                import win32gui
+                screens = QApplication.screens()
+
+                def _cb(hwnd, _):
+                    if not (win32gui.IsWindowVisible(hwnd) and
+                            win32gui.GetWindowText(hwnd)):
+                        return
+                    try:
+                        r = win32gui.GetWindowRect(hwnd)
+                    except Exception:
+                        return
+                    pl, pt, pr, pb = r
+                    pw, ph = pr - pl, pb - pt
+                    if pw < 20 or ph < 20:
+                        return
+
+                    # Find screen by physical origin
+                    scr = None
+                    for s in screens:
+                        lg  = s.geometry()
+                        dpr = s.devicePixelRatio()
+                        sx  = round(lg.x()      * dpr)
+                        sy  = round(lg.y()      * dpr)
+                        sw  = round(lg.width()  * dpr)
+                        sh  = round(lg.height() * dpr)
+                        if sx <= pl < sx + sw and sy <= pt < sy + sh:
+                            scr = s
+                            break
+                    if scr is None:
+                        scr = QApplication.primaryScreen()
+
+                    lg  = scr.geometry()
+                    dpr = scr.devicePixelRatio()
+                    ox  = round(lg.x() * dpr)
+                    oy  = round(lg.y() * dpr)
+
+                    # physical → logical global
+                    lx = lg.x() + (pl - ox) / dpr
+                    ly = lg.y() + (pt - oy) / dpr
+                    lw = max(1, pw / dpr)
+                    lh = max(1, ph / dpr)
+
+                    # logical global → LOCAL widget
+                    loc_x = int(lx) - self._geo.x()
+                    loc_y = int(ly) - self._geo.y()
+                    rects.append(QRect(loc_x, loc_y, int(lw), int(lh)))
+
+                win32gui.EnumWindows(_cb, None)
+            except Exception:
+                pass
+        else:
+            for s in QApplication.screens():
+                lg = s.geometry()
+                rects.append(QRect(
+                    lg.x() - self._geo.x(), lg.y() - self._geo.y(),
+                    lg.width(), lg.height()))
+        self._win_rects = rects
+        self._update_detection_at_cursor()
+
+    def _update_detection_at_cursor(self):
+        if self._current_tool != self.TOOL_DETECT or self._dragging:
+            return
+        gpos  = QCursor.pos()
+        found = self._best_rect_at_global(gpos)
+        if found != self._detected_rect:
+            self._detected_rect = found
+            self.update()
+
+    def _best_rect_at_global(self, gpos: QPoint) -> QRect:
+        """Smallest LOCAL-coord rect containing global logical pos gpos."""
+        local = gpos - self._geo.topLeft()
+        best, best_area = QRect(), 10**9
+        for r in self._win_rects:
+            if r.contains(local) and r.width() * r.height() < best_area:
+                best, best_area = r, r.width() * r.height()
+        return best
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Toolbar
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_toolbar(self):
+        bar = QWidget(self,
+                      Qt.WindowType.FramelessWindowHint |
+                      Qt.WindowType.WindowStaysOnTopHint)
+        bar.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        bar.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        bar.setStyleSheet("""
+            QWidget { background: rgba(24,24,37,220); border-radius: 10px; }
+            QPushButton {
+                background: rgba(40,40,60,200); color: #cdd6f4;
+                border: 1px solid #45475a; border-radius: 6px;
+                font-size: 16px; min-width: 36px; min-height: 36px;
+                max-width: 36px; max-height: 36px;
+            }
+            QPushButton:checked { background: #313264; border: 2px solid #89b4fa; }
+            QPushButton:hover   { background: #45475a; }
+            QPushButton#captureBtn {
+                background: #1e6e1e; border: 2px solid #4caf50;
+                min-width: 80px; max-width: 80px; font-size: 13px;
+            }
+            QPushButton#captureBtn:hover { background: #2e9e2e; }
+        """)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(4)
+
+        tools = [
+            (self.TOOL_SELECT,   "🖱️", "Select / move / resize annotations (Del to delete)"),
+            (self.TOOL_RECT,     "⬜", "Draw rectangle annotation"),
+            (self.TOOL_CIRCLE,   "⭕", "Draw ellipse annotation"),
+            (self.TOOL_FREEHAND, "✏️", "Freehand drawing"),
+            (self.TOOL_LINE,     "📏", "Draw straight line"),
+            (self.TOOL_MARKER,   "📍", "Add numbered marker"),
+            (self.TOOL_TEXT,     "T",  "Add text annotation"),
+            (self.TOOL_IMAGE,    "🖼️", "Import image onto canvas"),
+            (self.TOOL_COLOR,    "🎨", "Change annotation color / width"),
+        ]
+        self._tool_btns = {}
+        for tid, icon, tip in tools:
+            btn = QPushButton(icon)
+            btn.setCheckable(tid not in (self.TOOL_COLOR, self.TOOL_IMAGE))
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda _, t=tid: self._select_tool(t))
+            lay.addWidget(btn)
+            self._tool_btns[tid] = btn
+        self._tool_btns[self.TOOL_RECT].setChecked(True)
+
+        # Color swatch
+        self._color_preview = QLabel()
+        self._color_preview.setFixedSize(18, 18)
+        self._color_preview.setStyleSheet(
+            f"background:{self._draw_color.name()}; border:1px solid white; border-radius:3px;")
+        lay.addWidget(self._color_preview)
+
+        lay.addSpacing(6)
+
+        # ── 📷 Capture button (shown only in annotation / draw modes) ─────────
+        self._capture_btn = QPushButton("📷 Capture")
+        self._capture_btn.setObjectName("captureBtn")
+        self._capture_btn.setToolTip(
+            "Capture the last detected / dragged region together with annotations")
+        self._capture_btn.clicked.connect(self._capture_with_annotations)
+        self._capture_btn.show()   # always visible — detection mode is disabled
+        lay.addWidget(self._capture_btn)
+
+        bar.adjustSize()
+        return bar
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _is_draw_tool(self, tid=None):
+        t = tid if tid is not None else self._current_tool
+        return t in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_FREEHAND,
+                     self.TOOL_LINE, self.TOOL_MARKER, self.TOOL_TEXT,
+                     self.TOOL_IMAGE, self.TOOL_SELECT)
+
+    def _select_tool(self, tool_id):
+        if tool_id == self.TOOL_IMAGE:
+            self._import_image(); return
+        if tool_id == self.TOOL_COLOR:
+            self._pick_color(); return
+
+        self._current_tool = tool_id
+        for tid, btn in self._tool_btns.items():
+            if btn.isCheckable():
+                btn.setChecked(tid == tool_id)
+
+        # Show/hide capture button
+        if self._is_draw_tool(tool_id):
+            self._capture_btn.show()
+        else:
+            self._capture_btn.hide()
+        # Canvas is ALWAYS transparent — mouse routing is done manually
+
+        cross = (self.TOOL_DETECT, self.TOOL_RECT, self.TOOL_CIRCLE,
+                 self.TOOL_LINE, self.TOOL_FREEHAND)
+        cur = Qt.CursorShape.CrossCursor if tool_id in cross else Qt.CursorShape.ArrowCursor
+        self.setCursor(QCursor(cur))
+        self._toolbar.adjustSize()
+
+        if tool_id == self.TOOL_DETECT:
+            self._update_detection_at_cursor()
+
+    def _pick_color(self):
+        self._toolbar.hide()
+        self.releaseKeyboard() # Allow input in color hex fields
+        dlg = QColorDialog(self._draw_color, None)
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                self._draw_color = c
+                self._color_preview.setStyleSheet(
+                    f"background:{c.name()}; border:1px solid white; border-radius:3px;")
+                
+                # Apply new color to currently selected items in the canvas
+                for item in self._canvas._scene.selectedItems():
+                    self._canvas._apply_props(item, c, self._draw_width)
+                    
+                    if hasattr(item, 'setDefaultTextColor'):
+                        item.setDefaultTextColor(c)
+                        
+                    # Apply color dynamically to selected markers
+                    if isinstance(item, _MarkerItem):
+                        item._bg_color = c
+                        
+                    item.update()
+                    
+        self._toolbar.show()
+        self.activateWindow(); self.setFocus()
+        self.grabKeyboard() # Re-lock keyboard
+
+    def _import_image(self):
+        self._toolbar.hide()
+        self.releaseKeyboard() # Allow navigating folders via keyboard
+        path, _ = QFileDialog.getOpenFileName(
+            None, "Import Image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if path:
+            pix = QPixmap(path)
+            if not pix.isNull():
+                center = QPointF(self._geo.width() / 2 - pix.width()  / 2,
+                                 self._geo.height()/ 2 - pix.height() / 2)
+                self._canvas.add_pixmap(center, pix)
+                # Switch to SELECT so the user can move/resize it immediately
+                self._select_tool(self.TOOL_SELECT)
+        self._toolbar.show()
+        self.activateWindow(); self.setFocus()
+        self.grabKeyboard() # Re-lock keyboard
+
+    def _capture_with_annotations(self):
+        """
+        Capture button clicked: hide the toolbar, keep the canvas visible so
+        annotations remain, let the user drag a selection rectangle on top of
+        the current overlay, then composite annotations + screenshot and save.
+        """
+        self._toolbar.hide()
+        self.releaseKeyboard()
+        # Enter inline-selection mode: next mouse drag will define the capture rect
+        self._inline_selecting = True
+        self._inline_start = None
+        self._inline_end   = None
+        self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+        # Temporarily switch to a neutral tool so drawing tools don't fire
+        self._prev_tool = self._current_tool
+        self._current_tool = "_capture_select"
+        self.grabKeyboard()
+
+    def _open_sub_selector(self):
+        """Unused — kept for compatibility."""
+        pass
+
+    def _on_sub_selector_cancelled(self):
+        """User pressed Escape — restore the annotation overlay."""
+        self._sub_sel = None
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+        self.grabKeyboard()
+        self._toolbar.show()
+
+    def _on_sub_region_selected(self, x, y, w, h):
+        """
+        Called with physical MSS coordinates after the user drew the selection.
+        Composite the annotations over that region and save.
+        """
+        self._sub_sel = None
+
+        if w < 5 or h < 5:
+            self._on_sub_selector_cancelled()
+            return
+
+        # Convert physical MSS coords back to a logical global QRect
+        # so _do_capture_global_rect can work with it.
+        # We need the logical rect for rendering canvas annotations.
+        # Strategy: find the Qt screen that owns (x,y) in physical space,
+        # then convert physical→logical.
+        logical_x, logical_y, logical_w, logical_h = x, y, w, h
+        try:
+            with mss.mss() as sct:
+                qt_screens = sorted(QApplication.screens(),
+                                    key=lambda s: (s.geometry().x(), s.geometry().y()))
+                mss_mons   = sorted(sct.monitors[1:],
+                                    key=lambda m: (m["left"], m["top"]))
+                for qt_scr, mss_mon in zip(qt_screens, mss_mons):
+                    mon_x = mss_mon["left"]
+                    mon_y = mss_mon["top"]
+                    mon_w = mss_mon["width"]
+                    mon_h = mss_mon["height"]
+                    if (mon_x <= x < mon_x + mon_w and
+                            mon_y <= y < mon_y + mon_h):
+                        dpr = qt_scr.devicePixelRatio()
+                        lg  = qt_scr.geometry()
+                        off_phys_x = x - mon_x
+                        off_phys_y = y - mon_y
+                        logical_x = lg.x() + int(off_phys_x / dpr)
+                        logical_y = lg.y() + int(off_phys_y / dpr)
+                        logical_w = int(w / dpr)
+                        logical_h = int(h / dpr)
+                        break
+        except Exception as ex:
+            print(f"[PyshareX] coord conversion error: {ex}")
+
+        global_rect = QRect(logical_x, logical_y, logical_w, logical_h)
+
+        # Now composite annotations + screenshot and save directly
+        # (same logic as _emit_and_close but we have the rect already)
+        self._do_capture_global_rect(global_rect)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Paint (background overlay only — annotations are drawn by _canvas)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def paintEvent(self, e):
+        if self._hide_bg:
+            return
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 90))
+
+        # ── Draw inline capture selection rectangle ────────────────────────────
+        if (self._current_tool == "_capture_select" and
+                self._inline_start and self._inline_end):
+            r = QRect(self._inline_start, self._inline_end).normalized()
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            p.fillRect(r, QColor(0, 0, 0, 1))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            p.setPen(QPen(QColor(0, 200, 255), 2))
+            p.drawRect(r)
+            p.setPen(QColor(255, 255, 255))
+            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+            p.drawText(r.x() + 4, r.y() - 6 if r.y() > 20 else r.bottom() + 14,
+                       f"{r.width()} × {r.height()} px")
+
+        if self._dragging and self._drag_start and self._drag_end:
+            r = QRect(self._drag_start, self._drag_end).normalized()
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            p.fillRect(r, QColor(0, 0, 0, 1))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            p.setPen(QPen(QColor(0, 174, 255), 2))
+            p.drawRect(r)
+            p.setPen(QColor(255, 255, 255))
+            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+            label = f"{r.width()} × {r.height()} px"
+            ty = r.y() - 6 if r.y() > 20 else r.bottom() + 14
+            p.drawText(r.x() + 4, ty, label)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Mouse — DETECT / DRAG mode (only when canvas is transparent)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _toolbar_contains(self, gpos: QPoint) -> bool:
+        return QRect(self._toolbar.mapToGlobal(QPoint(0, 0)),
+                     self._toolbar.size()).contains(gpos)
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        gpos = e.globalPosition().toPoint()
+        if self._toolbar_contains(gpos):
+            return
+        lpos = e.pos()
+
+        # ── Inline capture-selection mode ─────────────────────────────────────
+        if self._current_tool == "_capture_select":
+            self._inline_start = lpos
+            self._inline_end   = lpos
+            return
+
+        # ── DETECT mode ───────────────────────────────────────────────────────
+        if self._current_tool == self.TOOL_DETECT:
+            return
+
+        # ── SELECT mode — route into QGraphicsScene for item picking ──────────
+        if self._current_tool == self.TOOL_SELECT:
+            scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
+            item, handle = self._canvas.get_handle_at(scene_pos)
+            if item and handle:
+                self._resizing_item = item
+                self._resize_handle = handle
+                return
+            self._canvas.send_mouse_to_scene(e)
+            return
+
+        # ── Drawing tools ─────────────────────────────────────────────────────
+        scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
+        self._draw_start_scene = scene_pos
+        self._preview_item = None
+
+        if self._current_tool == self.TOOL_FREEHAND:
+            self._canvas.begin_freehand(scene_pos, self._draw_color, self._draw_width)
+
+        elif self._current_tool == self.TOOL_MARKER:
+            self._canvas.add_marker(scene_pos, self._draw_color)
+
+        elif self._current_tool == self.TOOL_TEXT:
+            self._toolbar.hide()
+            self.releaseKeyboard() # Allow keyboard input for the dialog
+            dlg = _TextInputDialog(QColor(self._draw_color), None)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                txt, fsz, col, hl = dlg.result_data()
+                if txt.strip():
+                    self._canvas.add_text(scene_pos, txt, fsz, col, hl)
+            self._toolbar.show()
+            self.activateWindow(); self.setFocus()
+            self.grabKeyboard() # Re-lock keyboard interactions to the overlay
+
+    def mouseMoveEvent(self, e):
+        gpos = e.globalPosition().toPoint()
+        lpos = e.pos()
+
+        # Dynamically move the toolbar to the monitor where the cursor currently is
+        cursor_screen = QApplication.screenAt(gpos)
+        if cursor_screen:
+            screen_geo = cursor_screen.geometry()
+            tx = screen_geo.x() - self._geo.x() + screen_geo.width() // 2 - self._toolbar.width() // 2
+            ty = screen_geo.y() - self._geo.y() + 8
+            # Only move if the toolbar is on the wrong monitor (avoids micro-stutters)
+            if abs(self._toolbar.x() - tx) > 100 or abs(self._toolbar.y() - ty) > 100:
+                self._toolbar.move(tx, ty)
+
+        # ── Inline capture-selection mode ─────────────────────────────────────
+        if self._current_tool == "_capture_select":
+            if e.buttons() & Qt.MouseButton.LeftButton and self._inline_start is not None:
+                self._inline_end = lpos
+                self.update()
+            return
+
+        # ── DETECT mode disabled
+        if self._current_tool == self.TOOL_DETECT:
+            return
+
+        # ── SELECT mode — route into QGraphicsScene ───────────────────────────
+        if self._current_tool == self.TOOL_SELECT:
+            scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
+
+            # Handle Active Resizing
+            if getattr(self, '_resizing_item', None) and getattr(self, '_resize_handle', None):
+                proportional = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
+                self._canvas.handle_resize(self._resizing_item, self._resize_handle, scene_pos, proportional)
+                return
+
+            # Handle Cursor Hover Updates for Handles
+            _, handle = self._canvas.get_handle_at(scene_pos)
+            if handle:
+                if handle == 'ROTATE': self.setCursor(Qt.CursorShape.PointingHandCursor)
+                elif handle in ['TL', 'BR']: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                elif handle in ['TR', 'BL']: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                elif handle in ['L', 'R']: self.setCursor(Qt.CursorShape.SizeHorCursor)
+                elif handle in ['T', 'B']: self.setCursor(Qt.CursorShape.SizeVerCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+
+            self._canvas.send_mouse_to_scene(e)
+            return
+
+        # ── Drawing tools (LMB held) ──────────────────────────────────────────
+        if not (e.buttons() & Qt.MouseButton.LeftButton):
+            return
+        scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
+
+        if self._current_tool == self.TOOL_FREEHAND:
+            self._canvas.extend_freehand(scene_pos)
+
+        elif self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_LINE):
+            if self._draw_start_scene is None:
+                return
+            end_scene = scene_pos
+            # Ctrl held: constrain rect/circle to equal width and height (perfect square/circle)
+            if (self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE) and
+                    e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                dx = end_scene.x() - self._draw_start_scene.x()
+                dy = end_scene.y() - self._draw_start_scene.y()
+                side = min(abs(dx), abs(dy))
+                end_scene = QPointF(
+                    self._draw_start_scene.x() + math.copysign(side, dx),
+                    self._draw_start_scene.y() + math.copysign(side, dy))
+            r = QRectF(self._draw_start_scene, end_scene).normalized()
+            if self._preview_item is not None:
+                self._canvas._scene.removeItem(self._preview_item)
+                self._preview_item = None
+            if self._current_tool == self.TOOL_RECT:
+                self._preview_item = self._canvas.add_rect(
+                    r, self._draw_color, self._draw_width)
+            elif self._current_tool == self.TOOL_CIRCLE:
+                self._preview_item = self._canvas.add_ellipse(
+                    r, self._draw_color, self._draw_width)
+            elif self._current_tool == self.TOOL_LINE:
+                end_pos = scene_pos
+                if e.modifiers() & (Qt.KeyboardModifier.ShiftModifier |
+                                    Qt.KeyboardModifier.ControlModifier):
+                    dx = end_pos.x() - self._draw_start_scene.x()
+                    dy = end_pos.y() - self._draw_start_scene.y()
+                    angle = math.atan2(dy, dx)
+                    snapped = round(math.degrees(angle) / 45) * 45
+                    dist = math.hypot(dx, dy)
+                    end_pos = QPointF(
+                        self._draw_start_scene.x() + dist * math.cos(math.radians(snapped)),
+                        self._draw_start_scene.y() + dist * math.sin(math.radians(snapped)))
+                self._preview_item = self._canvas.add_line(
+                    QLineF(self._draw_start_scene, end_pos),
+                    self._draw_color, self._draw_width)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        lpos = e.pos()
+
+        # ── Inline capture-selection mode — finalize rect ─────────────────────
+        if self._current_tool == "_capture_select":
+            if self._inline_start and self._inline_end:
+                local_rect = QRect(self._inline_start, self._inline_end).normalized()
+                if local_rect.width() > 4 and local_rect.height() > 4:
+                    global_rect = local_rect.translated(self._geo.topLeft())
+                    self._current_tool = self._prev_tool
+                    self._inline_selecting = False
+                    self._inline_start = None
+                    self._inline_end = None
+                    self._do_capture_global_rect(global_rect)
+                    return
+            # Selection too small — cancel and restore toolbar
+            self._current_tool = self._prev_tool
+            self._inline_selecting = False
+            self._inline_start = None
+            self._inline_end = None
+            self._toolbar.show()
+            self.activateWindow()
+            self.setFocus()
+            self.grabKeyboard()
+            return
+
+        # DETECT mode disabled
+        if self._current_tool == self.TOOL_DETECT:
+            return
+
+        # ── SELECT mode ───────────────────────────────────────────────────────
+        if self._current_tool == self.TOOL_SELECT:
+            if getattr(self, '_resizing_item', None):
+                self._resizing_item = None
+                self._resize_handle = None
+                return
+            self._canvas.send_mouse_to_scene(e)
+            return
+
+        # ── Draw tools — finalise ─────────────────────────────────────────────
+        if self._current_tool == self.TOOL_FREEHAND:
+            self._canvas.end_freehand()
+        self._preview_item     = None
+        self._draw_start_scene = None
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        # Allow editing text if we are in SELECT mode
+        if self._current_tool == self.TOOL_SELECT:
+            lpos = e.pos()
+            scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
+            item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
+            
+            if isinstance(item, HighlightTextItem):
+                self._toolbar.hide()
+                self.releaseKeyboard() 
+                
+                # Pre-fill dialog with existing text item data
+                dlg = _TextInputDialog(item.defaultTextColor(), None)
+                dlg.edit.setPlainText(item.toPlainText())
+                dlg.sz.setValue(item.font().pointSize())
+                if hasattr(item, 'highlight_color'):
+                    dlg.highlight = item.highlight_color
+                
+                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    txt, fsz, col, hl = dlg.result_data()
+                    if txt.strip():
+                        item.setPlainText(txt)
+                        item.setFont(QFont("Arial", fsz))
+                        item.setDefaultTextColor(col)
+                        item.highlight_color = hl
+                        item.update()
+                    else:
+                        self._canvas._scene.removeItem(item)
+                
+                self._toolbar.show()
+                self.activateWindow()
+                self.setFocus()
+                self.grabKeyboard()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.close(); self.cancelled.emit(); return
+        if e.key() == Qt.Key.Key_Delete:
+            self._canvas.delete_selected()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Capture
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _open_region_selector(self):
+        """
+        Hide the annotation overlay and open the classic RegionSelector crosshair.
+        After the user draws a selection, composite annotations on top and save.
+        """
+        self._toolbar.hide()
+        self.releaseKeyboard()
+        self.hide()
+        QTimer.singleShot(180, self._launch_region_selector)
+
+    def _launch_region_selector(self):
+        self._sub_sel = RegionSelector()
+        self._sub_sel.region_selected.connect(self._on_sub_region_selected)
+        self._sub_sel.cancelled.connect(self._on_sub_selector_cancelled)
+
+    def _on_sub_selector_cancelled(self):
+        """User pressed Escape — restore the annotation overlay."""
+        self._sub_sel = None
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+        self.grabKeyboard()
+        self._toolbar.show()
+
+    def _on_sub_region_selected(self, x, y, w, h):
+        """
+        Called with physical MSS coordinates after the user drew the selection.
+        Convert to logical Qt coords, then composite annotations and save.
+        """
+        self._sub_sel = None
+        if w < 5 or h < 5:
+            self._on_sub_selector_cancelled()
+            return
+
+        # Convert physical MSS coords → logical global Qt rect
+        logical_x, logical_y, logical_w, logical_h = x, y, w, h
+        try:
+            with mss.mss() as sct:
+                qt_screens = sorted(QApplication.screens(),
+                                    key=lambda s: (s.geometry().x(), s.geometry().y()))
+                mss_mons   = sorted(sct.monitors[1:],
+                                    key=lambda m: (m["left"], m["top"]))
+                for qt_scr, mss_mon in zip(qt_screens, mss_mons):
+                    mon_x, mon_y = mss_mon["left"], mss_mon["top"]
+                    mon_w, mon_h = mss_mon["width"], mss_mon["height"]
+                    if mon_x <= x < mon_x + mon_w and mon_y <= y < mon_y + mon_h:
+                        dpr = qt_scr.devicePixelRatio()
+                        lg  = qt_scr.geometry()
+                        logical_x = lg.x() + int((x - mon_x) / dpr)
+                        logical_y = lg.y() + int((y - mon_y) / dpr)
+                        logical_w = int(w / dpr)
+                        logical_h = int(h / dpr)
+                        break
+        except Exception as ex:
+            print(f"[PyshareX] coord conversion error: {ex}")
+
+        global_rect = QRect(logical_x, logical_y, logical_w, logical_h)
+        self._do_capture_global_rect(global_rect)
+
+    def _do_capture_global_rect(self, global_rect: QRect):
+        """
+        Hide overlay completely, then after a short delay grab + composite + save.
+        The widget hides (not closes) first so MSS sees the real screen.
+        """
+        self._last_detected_global = global_rect
+        self._toolbar.hide()
+        self._hide_bg = True
+        self.update()
+        self.hide()                        # hide so MSS sees real screen
+        QApplication.processEvents()
+        QTimer.singleShot(200, lambda: self._grab_composite_and_close(global_rect))
+
+    def _grab_composite_and_close(self, global_rect: QRect):
+        """
+        Grab screenshot, composite annotations, save, notify — then close.
+        Widget is already hidden (not closed) so MSS sees the real screen.
+        All self.* access happens before close() to avoid use-after-free.
+        """
+        # ── 1. Collect everything from self while widget is alive ─────────────
+        captured_geo    = QRect(self._geo)
+        has_annotations = self._canvas.has_items()
+
+        screen = QApplication.screenAt(global_rect.topLeft())
+        if not screen:
+            screen = QApplication.screenAt(global_rect.center())
+        if not screen:
+            screen = QApplication.primaryScreen()
+
+        ratio        = screen.devicePixelRatio()
+        logical_geom = screen.geometry()
+        phys_x       = int((global_rect.x() - logical_geom.x()) * ratio)
+        phys_y       = int((global_rect.y() - logical_geom.y()) * ratio)
+        phys_w       = max(1, int(global_rect.width()  * ratio))
+        phys_h       = max(1, int(global_rect.height() * ratio))
+        final_x      = phys_x
+        final_y      = phys_y
+
+        try:
+            with mss.mss() as sct:
+                qt_screens = sorted(QApplication.screens(),
+                                    key=lambda s: (s.geometry().x(), s.geometry().y()))
+                mss_mons   = sorted(sct.monitors[1:],
+                                    key=lambda m: (m["left"], m["top"]))
+                if screen in qt_screens:
+                    idx = qt_screens.index(screen)
+                    if idx < len(mss_mons):
+                        mon     = mss_mons[idx]
+                        final_x = mon["left"] + phys_x
+                        final_y = mon["top"]  + phys_y
+        except Exception as ex:
+            print(f"[PyshareX] monitor mapping error: {ex}")
+
+        # ── 2. Render annotation layer while canvas is still alive ────────────
+        ann_pixmap = None
+        if has_annotations:
+            logical_rect_f = QRectF(global_rect.translated(-captured_geo.topLeft()))
+            pw = max(1, int(logical_rect_f.width()))
+            ph = max(1, int(logical_rect_f.height()))
+            ann_pixmap = QPixmap(pw, ph)
+            ann_pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(ann_pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            self._canvas._scene.render(painter,
+                                       target=QRectF(ann_pixmap.rect()),
+                                       source=logical_rect_f)
+            painter.end()
+
+        # ── 3. Grab screenshot (widget already hidden — real screen visible) ───
+        base_img = None
+        try:
+            with mss.mss() as sct:
+                shot     = sct.grab({"left": final_x, "top": final_y,
+                                     "width": phys_w, "height": phys_h})
+                base_img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        except Exception as ex:
+            print(f"[PyshareX] mss grab error: {ex}")
+
+        # ── 4. Composite annotations onto screenshot ──────────────────────────
+        composited = base_img
+        if base_img and ann_pixmap and has_annotations:
+            try:
+                from PyQt6.QtCore import QBuffer, QIODevice
+                qbuf = QBuffer()
+                qbuf.open(QIODevice.OpenModeFlag.WriteOnly)
+                ann_pixmap.save(qbuf, "PNG")
+                qbuf.close()
+                buf = io.BytesIO(qbuf.data().data())
+                buf.seek(0)
+            except Exception as ex:
+                print(f"[PyshareX] pixmap-to-bytes error: {ex}")
+                buf = None
+            try:
+                if buf is None:
+                    raise Exception("pixmap buffer empty")
+                ann_pil   = Image.open(buf).convert("RGBA")
+                ann_pil   = ann_pil.resize((phys_w, phys_h), Image.LANCZOS)
+                base_rgba = base_img.convert("RGBA")
+                base_rgba.paste(ann_pil, (0, 0), ann_pil)
+                composited = base_rgba.convert("RGB")
+            except Exception as ex:
+                print(f"[PyshareX] composite error: {ex}")
+
+        # ── 5. Save file and notify main window ───────────────────────────────
+        saved_path = None
+        if composited:
+            try:
+                engine = None
+                for w in QApplication.topLevelWidgets():
+                    if hasattr(w, "engine") and hasattr(w.engine, "_save"):
+                        engine = w.engine
+                        break
+                if engine:
+                    saved_path = engine._save(composited, "region")
+            except Exception as ex:
+                print(f"[PyshareX] save error: {ex}")
+
+        # ── 6. Close widget LAST — after all self.* access is done ────────────
+        self.close()
+
+        # ── 7. Notify main window (after close — no self.* needed) ────────────
+        if saved_path:
+            try:
+                for w in QApplication.topLevelWidgets():
+                    if hasattr(w, "_notify_sig"):
+                        if composited:
+                            # Store bytes in a local variable to prevent Garbage Collection 
+                            # before QPixmap reads the memory buffer
+                            raw_data = composited.tobytes()
+                            # Force deep copy to prevent Segmentation Fault
+                            qim   = QImage(raw_data,
+                                           composited.width, composited.height,
+                                           composited.width * 3,
+                                           QImage.Format.Format_RGB888).copy()
+                            thumb = QPixmap.fromImage(qim)
+                        else:
+                            thumb = None
+                        w._notify_sig.emit(saved_path, thumb)
+                        # Restore main window after capture
+                        QTimer.singleShot(300, w.show_win)
+                        break
+            except Exception as ex:
+                print(f"[PyshareX] notify error: {ex}")
+        else:
+            # Fallback: tell main window to re-grab the region normally
+            try:
+                self.region_selected.emit(final_x, final_y, phys_w, phys_h)
+            except Exception:
+                pass
+
+    def _emit_and_close(self, global_rect: QRect):
+        """Kept for compatibility — delegates to _grab_composite_and_close."""
+        self._grab_composite_and_close(global_rect)
 
 
 # ─────────────────────────────────────────────
@@ -2474,7 +3925,27 @@ class EditorCanvas(QGraphicsView):
             self._freehand_path = QPainterPath()
             self._freehand_path.moveTo(self.start_point)
             self.current_item = FreehandItem(self._freehand_path)
-        
+        elif self.current_tool == "Marker":
+            # Number after the highest existing marker so switching tools
+            # and coming back continues the sequence correctly.
+            existing = [it for it in self.scene.items() if isinstance(it, _MarkerItem)]
+            number = max((it.number for it in existing), default=0) + 1
+            # Inherit scale from the most recently placed marker (highest number),
+            # falling back to 1.0 if no markers remain on the canvas.
+            last_scale = next(
+                (it._scale for it in sorted(existing, key=lambda m: m.number, reverse=True)),
+                1.0)
+            marker = _MarkerItem(self.start_point, number)
+            marker._scale = last_scale
+            marker._bg_color = QColor(self.stroke_color)
+            marker.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+            self.scene.addItem(marker)
+            self.is_dirty = True
+            self.start_point = None
+            return  # marker is complete on press — no drag needed
+
         # Właściwości i dodanie do sceny wykonujemy tylko raz dla wszystkich narzędzi
         if self.current_item:
             self.apply_props(self.current_item)
@@ -2540,6 +4011,10 @@ class EditorCanvas(QGraphicsView):
                 item = HighlightTextItem(txt, self.text_highlight_color)
                 item.setPos(self.start_point); self.apply_props(item)
                 self.scene.addItem(item); self.is_dirty = True
+        # Marker is fully handled in mousePressEvent — nothing to do on release
+        elif self.current_tool == "Marker":
+            self.start_point = None
+            return
 
         self.current_item = None
         self.resizing_item = None
@@ -2604,8 +4079,8 @@ class EditorCanvas(QGraphicsView):
                 rect = item.rect()
                 m = 10 / self.transform().m11() # Scale-aware margin
                 
-                # Detekcja uchwytu obrotu (tylko dla normalnych obiektów, nie dla Crop)
-                if not isinstance(item, CropOverlayItem):
+                # Rotation handle — disabled for markers (they scale uniformly instead)
+                if not isinstance(item, (CropOverlayItem, _MarkerItem)):
                     rot_pt = QPointF(rect.center().x(), rect.top() - 30)
                     if abs(local_pos.x() - rot_pt.x()) < m * 1.5 and abs(local_pos.y() - rot_pt.y()) < m * 1.5:
                         return item, 'ROTATE'
@@ -2634,7 +4109,18 @@ class EditorCanvas(QGraphicsView):
     def handle_resize_logic(self, pos, proportional):
         import math
         item = self.resizing_item
-        
+
+        # --- _MarkerItem: uniform scale only (always equal W/H) ---
+        if isinstance(item, _MarkerItem):
+            local_pos = item.mapFromScene(pos)
+            dist = math.hypot(local_pos.x(), local_pos.y())
+            dist = max(dist, item.RADIUS * 0.2)  # minimum size guard
+            item.prepareGeometryChange()
+            item._scale = dist / item.RADIUS
+            item.update()
+            self.scene.update()
+            return
+
         # --- 1. OBSŁUGA OBROTU ---
         if self.resize_handle == 'ROTATE':
             import math
@@ -2774,22 +4260,39 @@ class EditorCanvas(QGraphicsView):
             if hasattr(item, "setBrush"): item.setBrush(brush)
 
 class ImageEditorWindow(QMainWindow):
-    def __init__(self, pixmap, save_callback, default_dir="", parent=None):
+    def __init__(self, pixmap, save_callback, default_dir="", parent=None,
+                 annotation_mode=False):
         super().__init__(parent)
-        self.setWindowTitle("PyshareX Image Editor")
-        self.setWindowIcon(load_app_icon())  # Naprawa ikonki okna
+        self.setWindowTitle("PyshareX – Annotation Editor" if annotation_mode
+                            else "PyshareX Image Editor")
+        self.setWindowIcon(load_app_icon())
         self.save_callback = save_callback
         self.default_dir = default_dir
         self.saved = False
-        
+        self._annotation_mode = annotation_mode   # True = opened from "Capture Region"
+        self._full_pixmap = pixmap                # keep for region-capture compositing
+
         central = QWidget(); self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        
+
         # Row 1: Tools
         tbar = QHBoxLayout()
         self.btns = {}
-        for n, i in [("Select", "🖱️"), ("Crop", "📐"), ("Rectangle", "⬜"), ("Circle", "⭕"), 
-                     ("Line", "📏"), ("Freehand", "✏️"), ("Text", "T"), ("Eraser", "🧹")]:
+
+        # ── Capture Region button (annotation mode only) ──────────────────────
+        if annotation_mode:
+            self.btn_capture_region = QPushButton("📷 Capture Region")
+            self.btn_capture_region.setToolTip(
+                "Draw a selection rectangle on the canvas, then click this button "
+                "to save that region with all annotations")
+            self.btn_capture_region.setStyleSheet(
+                "background:#e74c3c; color:white; font-weight:bold; padding:5px 12px;")
+            self.btn_capture_region.clicked.connect(self._capture_annotated_region)
+            tbar.addWidget(self.btn_capture_region)
+            tbar.addSpacing(8)
+
+        for n, i in [("Select", "🖱️"), ("Crop", "📐"), ("Rectangle", "⬜"), ("Circle", "⭕"),
+                     ("Line", "📏"), ("Freehand", "✏️"), ("Text", "T"), ("Marker", "📍"), ("Eraser", "🧹")]:
             b = QPushButton(i); b.setCheckable(True)
             b.setFixedSize(40, 40)  # Większy stały rozmiar
             # Styl: usunięcie marginesów i wyśrodkowanie tekstu/emoji
@@ -2908,36 +4411,17 @@ class ImageEditorWindow(QMainWindow):
         if not self.canvas.crop_item:
             return
 
-        # 1. Pobieramy docelowy obszar kadrowania (zaokrąglony do pełnych pikseli)
-        crop_rect = self.canvas.crop_item.rect().toRect()
-        
-        # 2. Renderujemy aktualny stan edytora do QImage
-        self.canvas.crop_item.hide()
-        self.canvas.scene.clearSelection()
-        
-        # Render only the cropped area to avoid massive memory usage
-        from PyQt6.QtCore import QRect
-        cropped_img = QImage(QRect(0, 0, crop_rect.width(), crop_rect.height()).size(), QImage.Format.Format_ARGB32)
-        cropped_img.fill(Qt.GlobalColor.transparent)
-        
-        painter = QPainter(cropped_img)
-        self.canvas.scene.render(painter, target=QRectF(cropped_img.rect()), source=QRectF(crop_rect))
-        painter.end()
+        crop_rect = self.canvas.crop_item.rect()
 
-        new_pixmap = QPixmap.fromImage(cropped_img)
+        # ── Annotation mode: save the crop region with annotations, don't crop the canvas ──
+        if self._annotation_mode:
+            self.canvas.scene.removeItem(self.canvas.crop_item)
+            self.canvas.crop_item = None
+            self.btn_apply_crop.hide()
+            self._finish_annotated_capture(crop_rect)
+            return
 
-        self.canvas.scene.clear()
-        self.canvas.bg_pixmap = new_pixmap
-        self.canvas.bg_item = self.canvas.scene.addPixmap(new_pixmap)
-        self.canvas.bg_item.setZValue(-100)
-        
-        # Restore massive sceneRect for free panning
-        bg_rect = QRectF(new_pixmap.rect())
-        self.canvas.scene.setSceneRect(bg_rect.center().x() - 50000, bg_rect.center().y() - 50000, 100000, 100000)
-        
-        self.canvas.crop_item = None
-        self.canvas.is_dirty = True
-        self.select_tool("Select")
+        # ── Normal editor mode: crop the canvas as before ──────────────────────
 
     def pick_color(self):
         # Tworzymy instancję okna zamiast metody statycznej
@@ -3048,12 +4532,51 @@ class ImageEditorWindow(QMainWindow):
             self.saved = True
             self.close()
 
-    def render_scene(self):
+    def _capture_annotated_region(self):
+        """
+        In annotation mode: let the user draw a Crop rectangle, then
+        composite the visible annotations over that region of the original
+        full-screen grab and save it.
+        """
+        # Switch to Crop tool so the user can draw the selection rectangle
+        self.select_tool("Crop")
+        QMessageBox.information(
+            self, "Capture Region",
+            "Draw a crop rectangle on the canvas to mark the region you want to capture.\n"
+            "Then click  ✂️ Apply Crop  — the region will be saved with annotations.")
+
+    def _finish_annotated_capture(self, crop_rect_scene: QRectF):
+        """
+        Called after the user confirms the crop rectangle.
+        Renders the annotated area and saves it via save_callback.
+        """
         self.canvas.scene.clearSelection()
-        rect = self.canvas.scene.itemsBoundingRect()
-        img = QImage(rect.size().toSize(), QImage.Format.Format_ARGB32)
+        img = QImage(crop_rect_scene.size().toSize(), QImage.Format.Format_ARGB32)
         img.fill(Qt.GlobalColor.transparent)
-        p = QPainter(img); self.canvas.scene.render(p); p.end()
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.canvas.scene.render(p,
+                                 target=QRectF(img.rect()),
+                                 source=crop_rect_scene)
+        p.end()
+        self.save_callback(img)
+        self.saved = True
+        self.close()
+
+    def render_scene(self):
+        """Render the scene cropped exactly to the background image bounds."""
+        self.canvas.scene.clearSelection()
+        bg_rect = self.canvas.bg_item.sceneBoundingRect()
+        img = QImage(bg_rect.size().toSize(), QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.canvas.scene.render(p,
+                                 target=QRectF(img.rect()),
+                                 source=bg_rect)
+        p.end()
         return img
 
     def closeEvent(self, event):
@@ -3922,6 +5445,9 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════
 
     def _status(self, msg):
+        if msg == "__show_win__":
+            self.show_win()
+            return
         self.status_lbl.setText(msg)
         QTimer.singleShot(6000, lambda: self.status_lbl.setText("Ready"))
 
@@ -4023,7 +5549,31 @@ class MainWindow(QMainWindow):
         notify(self.config, path, pixmap=pixmap)
         
         after = self.config.get("after_capture", {})
-        
+
+        # 0a. Copy to clipboard
+        if after.get("copy_to_clipboard"):
+            try:
+                pix = QPixmap(path)
+                if not pix.isNull():
+                    QApplication.clipboard().setPixmap(pix)
+            except Exception as e:
+                print(f"[after_capture] copy_to_clipboard error: {e}")
+
+        # 0b. Show in explorer
+        if after.get("show_in_explorer"):
+            try:
+                if IS_WINDOWS:
+                    _popen(["explorer", "/select,", path.replace("/", "\\")])
+                else:
+                    _popen(["xdg-open", str(Path(path).parent)])
+            except Exception as e:
+                print(f"[after_capture] show_in_explorer error: {e}")
+
+        # 0c. Save to file — file is already saved by the engine,
+        #     but if the flag is OFF we optionally skip saving (future use).
+        #     Currently we just show a status note when the flag is enabled.
+        # (no additional action needed — engine always saves)
+
         # 1. Automatyczne rozpoznawanie tekstu (OCR)
         if after.get("ocr_recognize"):
             def do_auto_ocr():
@@ -4082,16 +5632,20 @@ class MainWindow(QMainWindow):
         self.hide(); QTimer.singleShot(160, self._do_region)
 
     def _do_region(self):
-        self._sel = RegionSelector()
+        self._sel = EnhancedRegionSelector()
         self._sel.region_selected.connect(self._on_region)
         self._sel.cancelled.connect(self.show_win)
 
     def _on_region(self, x, y, w, h):
+        # Fallback path only — normal path is handled by _grab_composite_and_close.
         if w < 5 or h < 5: self.show_win(); return
         def do():
             time.sleep(0.05)
             p = self.engine.capture_region(x, y, w, h)
-            self._done(p, "Region")
+            if p:
+                self.status_sig.emit(f"✅ Region: {Path(p).name}")
+                self._notify_sig.emit(p, None)
+            self.status_sig.emit("__show_win__")
         threading.Thread(target=do, daemon=True).start()
 
     def act_monitor(self):
@@ -4226,7 +5780,9 @@ class MainWindow(QMainWindow):
                 img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
                 
                 # Konwersja PIL -> QPixmap
-                qim = QImage(img.tobytes(), img.size[0], img.size[1], QImage.Format.Format_RGB888)
+                raw_data = img.tobytes()
+                # Force deep copy to prevent Segmentation Fault
+                qim = QImage(raw_data, img.size[0], img.size[1], QImage.Format.Format_RGB888).copy()
                 self.last_rec_pixmap = QPixmap.fromImage(qim)
         except:
             self.last_rec_pixmap = None
@@ -4326,7 +5882,9 @@ class MainWindow(QMainWindow):
                 mon = {"top": y, "left": x, "width": w, "height": h}
                 sct_img = sct.grab(mon)
                 img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-                qim = QImage(img.tobytes(), img.size[0], img.size[1], QImage.Format.Format_RGB888)
+                raw_data = img.tobytes()
+                # Force deep copy to prevent Segmentation Fault
+                qim = QImage(raw_data, img.size[0], img.size[1], QImage.Format.Format_RGB888).copy()
                 self.last_rec_pixmap = QPixmap.fromImage(qim)
         except:
             self.last_rec_pixmap = None
