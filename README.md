@@ -52,16 +52,22 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 - OCR QR recognision
 - video converter
 - image editor
+- OCR/QR Toolbox recognizing text/QR code, creating QR in one window
   
 <img width="993" height="722" alt="region_2026-05-10_15-39-15" src="https://github.com/user-attachments/assets/fb465778-9e0c-4634-907f-9245862d68b4" />
 
 <img width="764" height="687" alt="region_2026-05-13_22-15-04" src="https://github.com/user-attachments/assets/556560f2-66ed-4679-b713-8bab0d2ff1f8" />
 
+<img width="918" height="647" alt="image" src="https://github.com/user-attachments/assets/e24f6bfc-a74d-42a3-89ba-5dbff2dcbbf3" />
+
 <img width="1938" height="1038" alt="region_2026-05-15_00-00-20" src="https://github.com/user-attachments/assets/42fbdfbd-9eef-46e7-8763-c3848cda1053" />
+
+
 
 
 <br>
 <img width="346" height="501" alt="Zrzut ekranu 2026-05-10 001729" src="https://github.com/user-attachments/assets/3d73ef5d-05ed-42fd-be35-db082947fb97" />
+
 
 
 
