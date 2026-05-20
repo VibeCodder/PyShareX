@@ -1360,6 +1360,7 @@ class _OverlayCanvas(QGraphicsView):
         item = ResizableRectItem()
         item.setRect(rect)
         self._apply_props(item, color, width)
+        item.setAcceptHoverEvents(True)
         self._scene.addItem(item)
         return item
 
@@ -1367,12 +1368,37 @@ class _OverlayCanvas(QGraphicsView):
         item = ResizableEllipseItem()
         item.setRect(rect)
         self._apply_props(item, color, width)
+        item.setAcceptHoverEvents(True)
         self._scene.addItem(item)
         return item
 
     def add_line(self, line: QLineF, color: QColor, width: int):
         item = LineItem(line, self)
         self._apply_props(item, color, width)
+        self._scene.addItem(item)
+        return item
+
+    def add_highlight(self, rect: QRectF):
+        item = HighlightRectItem()
+        item.setRect(rect)
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self._scene.addItem(item)
+        return item
+
+    def add_arrow(self, line: QLineF, color: QColor, width: int):
+        item = ArrowItem(line, self)
+        self._apply_props(item, color, width)
+        self._scene.addItem(item)
+        return item
+
+    def add_bubble(self, pos: QPointF, text: str, fg_color: QColor, bg_color: QColor):
+        item = TextBubbleItem(text, fg_color, bg_color)
+        item.setPos(pos)
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self._scene.addItem(item)
         return item
 
@@ -1402,14 +1428,20 @@ class _OverlayCanvas(QGraphicsView):
         # the tool and adding more markers continues the sequence correctly.
         existing = [it for it in self._scene.items() if isinstance(it, _MarkerItem)]
         self._marker_count = max((it.number for it in existing), default=0) + 1
-        # Inherit scale from the most recently placed marker (highest number),
-        # falling back to 1.0 if no markers remain on the canvas.
-        last_scale = next(
-            (it._scale for it in sorted(existing, key=lambda m: m.number, reverse=True)),
-            1.0)
+
+        # Inherit scale, bg_color and text_color from the most recently placed marker.
+        # Falls back to defaults if no markers remain on the canvas.
+        last_marker = next(
+            (it for it in sorted(existing, key=lambda m: m.number, reverse=True)),
+            None)
+        last_scale      = last_marker._scale      if last_marker else 1.0
+        last_bg_color   = QColor(last_marker._bg_color)   if last_marker else color
+        last_text_color = QColor(last_marker._text_color) if last_marker else QColor(Qt.GlobalColor.white)
+
         item = _MarkerItem(pos, self._marker_count)
-        item._scale = last_scale
-        item._bg_color = color
+        item._scale      = last_scale
+        item._bg_color   = last_bg_color
+        item._text_color = last_text_color
         self._scene.addItem(item)
         return item
 
@@ -1428,6 +1460,10 @@ class _OverlayCanvas(QGraphicsView):
     def add_pixmap(self, pos: QPointF, pixmap: QPixmap):
         item = ResizablePixmapItem(pixmap)
         item.setPos(pos)
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        item.setAcceptHoverEvents(True)
         self._scene.addItem(item)
         return item
 
@@ -1451,7 +1487,8 @@ class _OverlayCanvas(QGraphicsView):
         """Return (item, handle_name) if pos is over a resize handle."""
         for item in self._scene.selectedItems():
             if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem,
-                                  ResizablePixmapItem, FreehandItem)):
+                                  ResizablePixmapItem, FreehandItem,
+                                  TextBubbleItem)):
                 local_pos = item.mapFromScene(scene_pos)
                 rect = item.rect()
                 m = 10.0
@@ -1461,22 +1498,47 @@ class _OverlayCanvas(QGraphicsView):
                     if (abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
                             abs(local_pos.y() - rot_pt.y()) < m * 1.5):
                         return item, 'ROTATE'
+                # Width handle (yellow dot below bottom edge) for Rect and Ellipse
+                if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+                    wp = item._width_handle_pos()
+                    if math.hypot(local_pos.x() - wp.x(), local_pos.y() - wp.y()) <= 14:
+                        return item, 'WIDTH'
                 L = abs(local_pos.x() - rect.left())  < m
                 R = abs(local_pos.x() - rect.right()) < m
                 T = abs(local_pos.y() - rect.top())   < m
                 B = abs(local_pos.y() - rect.bottom())< m
-                if L and T: return item, 'TL'
-                if R and T: return item, 'TR'
-                if L and B: return item, 'BL'
-                if R and B: return item, 'BR'
-                if L: return item, 'L'
-                if R: return item, 'R'
-                if T: return item, 'T'
-                if B: return item, 'B'
+                # TextBubbleItem: only bottom-right corner allowed for scaling
+                if isinstance(item, TextBubbleItem):
+                    if R and B: return item, 'BR'
+                else:
+                    if L and T: return item, 'TL'
+                    if R and T: return item, 'TR'
+                    if L and B: return item, 'BL'
+                    if R and B: return item, 'BR'
+                    if L: return item, 'L'
+                    if R: return item, 'R'
+                    if T: return item, 'T'
+                    if B: return item, 'B'
         return None, None
 
     def handle_resize(self, item, handle, scene_pos: QPointF, proportional=False):
         """Resize/rotate item — same logic as EditorCanvas.handle_resize_logic."""
+        # Width handle — drag vertically to change pen width (same logic as LineItem)
+        if handle == 'WIDTH' and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+            local_pos = item.mapFromScene(scene_pos)
+            # Initialise drag baseline on first call (reset when mouse is released)
+            if not getattr(item, '_width_drag_active', False):
+                item._width_drag_active = True
+                item._width_drag_start_pos = local_pos
+                item._width_drag_start_w   = item.pen().width()
+            dy = local_pos.y() - item._width_drag_start_pos.y()
+            new_w = max(1, int(item._width_drag_start_w + dy * 0.3))
+            pen = item.pen()
+            pen.setWidth(new_w)
+            item.setPen(pen)
+            item.prepareGeometryChange()
+            item.update()
+            return
         # _MarkerItem uses uniform scale — Ctrl always forces equal W/H
         if isinstance(item, _MarkerItem):
             local_pos = item.mapFromScene(scene_pos)
@@ -1535,6 +1597,633 @@ class _OverlayCanvas(QGraphicsView):
             item.setPen(pen)
         if hasattr(item, 'setBrush'):
             item.setBrush(Qt.GlobalColor.transparent)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NEW ANNOTATION ITEMS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HighlightEditDialog(QDialog):
+    """Dialog for editing Highlight color and opacity."""
+    def __init__(self, current_color: QColor, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Edit Highlight")
+        self.color = QColor(current_color)
+        lay = QVBoxLayout(self)
+
+        # Color picker button
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Background color:"))
+        self.btn_color = QPushButton()
+        self.btn_color.setFixedSize(80, 28)
+        self.btn_color.clicked.connect(self._pick_color)
+        row.addWidget(self.btn_color)
+        lay.addLayout(row)
+
+        # Opacity slider
+        lay.addWidget(QLabel("Opacity:"))
+        slider_row = QHBoxLayout()
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(0, 255)
+        self.opacity_slider.setValue(self.color.alpha())
+        self.opacity_label = QLabel(f"{int(self.color.alpha() / 255 * 100)}%")
+        self.opacity_label.setFixedWidth(38)
+        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        slider_row.addWidget(self.opacity_slider)
+        slider_row.addWidget(self.opacity_label)
+        lay.addLayout(slider_row)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._update_btn()
+
+    def _pick_color(self):
+        dlg = QColorDialog(self.color, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                c.setAlpha(self.color.alpha())
+                self.color = c
+                self._update_btn()
+
+    def _on_opacity_changed(self, val):
+        self.color.setAlpha(val)
+        self.opacity_label.setText(f"{int(val / 255 * 100)}%")
+        self._update_btn()
+
+    def _update_btn(self):
+        c = self.color
+        self.btn_color.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"color: {'black' if c.lightness() > 128 else 'white'}; border: 1px solid #888;")
+
+    def result_color(self) -> QColor:
+        return self.color
+
+
+class HighlightRectItem(QGraphicsRectItem):
+    """Semi-transparent yellow highlight rectangle."""
+    HIGHLIGHT_COLOR = QColor(255, 255, 0, 90)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._color = QColor(self.HIGHLIGHT_COLOR)
+        pen = QPen(QColor(255, 220, 0, 160), 1.5)
+        self.setPen(pen)
+        self.setBrush(QBrush(self._color))
+        self.setAcceptHoverEvents(True)
+
+    def boundingRect(self):
+        return super().boundingRect().adjusted(-5, -50, 5, 5)
+
+    def paint(self, painter, option, widget=None):
+        from PyQt6.QtWidgets import QStyle
+        option.state &= ~QStyle.StateFlag.State_Selected
+        painter.setPen(self.pen())
+        painter.setBrush(QBrush(self._color))
+        painter.drawRect(self.rect())
+        if self.isSelected():
+            pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.drawRect(self.rect())
+
+    # Width handle support (same as ResizableRectItem)
+    def rect(self):
+        return super().rect()
+
+    def setRect(self, r):
+        super().setRect(r)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._open_edit_dialog(event)
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        edit_act = menu.addAction("✏️ Edit")
+        del_act  = menu.addAction("🗑️ Delete")
+        action = menu.exec(event.screenPos().toPoint())
+        if action == edit_act:
+            self._open_edit_dialog(event)
+        elif action == del_act:
+            if self.scene():
+                self.scene().removeItem(self)
+        event.accept()
+
+    def _open_edit_dialog(self, event=None):
+        dlg = HighlightEditDialog(self._color)
+        # Show near the item
+        if event:
+            dlg.move(event.screenPos().toPoint())
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_color = dlg.result_color()
+            self._color = new_color
+            border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
+            self.setPen(QPen(border, 1.5))
+            self.setBrush(QBrush(self._color))
+            self.update()
+
+
+class ArrowItem(QGraphicsLineItem):
+    """Line with an arrowhead at p2."""
+    ARROW_BASE_SIZE = 14  # base arrow size at pen width=1
+
+    def __init__(self, line, canvas=None):
+        super().__init__(line)
+        self.canvas = canvas
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.active_handle = None
+
+    def boundingRect(self):
+        extra = (self.pen().width() + self._arrow_size() + 30) / (self.canvas.transform().m11() if self.canvas else 1)
+        return super().boundingRect().adjusted(-extra, -extra, extra, extra)
+
+    def _arrow_size(self):
+        """Arrow head size scales with pen width."""
+        w = max(1, self.pen().width())
+        return self.ARROW_BASE_SIZE + (w - 1) * 3
+
+    def _arrow_head_points(self):
+        line = self.line()
+        if line.length() < 1:
+            return []
+        angle = math.atan2(-line.dy(), line.dx())
+        sz = self._arrow_size()
+        # Tip is exactly at p2
+        tip = line.p2()
+        p_left  = QPointF(tip.x() + sz * math.cos(angle + math.pi * 0.75),
+                          tip.y() - sz * math.sin(angle + math.pi * 0.75))
+        p_right = QPointF(tip.x() + sz * math.cos(angle - math.pi * 0.75),
+                          tip.y() - sz * math.sin(angle - math.pi * 0.75))
+        # Shorten the line so it ends at the base of the arrow, not the tip
+        arrow_len = sz * math.cos(math.pi * 0.25)
+        line_end = QPointF(tip.x() + arrow_len * math.cos(angle + math.pi),
+                           tip.y() - arrow_len * math.sin(angle + math.pi))
+        return [tip, p_left, p_right, line_end]
+
+    def paint(self, painter, option, widget=None):
+        pts = self._arrow_head_points()
+        # Draw line only up to the arrow base (not overlapping the head)
+        if pts:
+            shortened = QLineF(self.line().p1(), pts[3])
+            painter.setPen(self.pen())
+            painter.drawLine(shortened)
+        else:
+            painter.setPen(self.pen())
+            painter.drawLine(self.line())
+        pts = self._arrow_head_points()
+        if len(pts) >= 3:
+            path = QPainterPath()
+            path.moveTo(pts[0])
+            path.lineTo(pts[1])
+            path.lineTo(pts[2])
+            path.closeSubpath()
+            painter.setBrush(QBrush(self.pen().color()))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPath(path)
+        if self.isSelected():
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setBrush(QBrush(Qt.GlobalColor.white))
+            painter.setPen(QPen(Qt.GlobalColor.blue, 1.5))
+            s = 10 / (self.canvas.transform().m11() if self.canvas else 1)
+            painter.drawEllipse(self.line().p1(), s/2, s/2)
+            painter.drawEllipse(self.line().p2(), s/2, s/2)
+            # Width handle at midpoint
+            mid = QPointF((self.line().p1().x() + self.line().p2().x()) / 2,
+                          (self.line().p1().y() + self.line().p2().y()) / 2)
+            painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(mid, s/2, s/2)
+
+    def mousePressEvent(self, event):
+        p = event.pos()
+        p1, p2 = self.line().p1(), self.line().p2()
+        dist = 22 / (self.canvas.transform().m11() if self.canvas else 1)
+        if (p - p1).manhattanLength() < dist:
+            self.active_handle = 'p1'
+        elif (p - p2).manhattanLength() < dist:
+            self.active_handle = 'p2'
+        else:
+            # Check width handle at midpoint
+            mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+            if (p - mid).manhattanLength() < dist:
+                self.active_handle = 'width'
+                self._width_drag_start_pos = p
+                self._width_drag_start_w   = self.pen().width()
+            else:
+                self.active_handle = None
+                super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.active_handle in ('p1', 'p2'):
+            self.prepareGeometryChange()
+            line = self.line()
+            new_pos = event.pos()
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                anchor = line.p2() if self.active_handle == 'p1' else line.p1()
+                dx, dy = new_pos.x() - anchor.x(), new_pos.y() - anchor.y()
+                angle = math.atan2(dy, dx)
+                snapped_angle = round(math.degrees(angle) / 45) * 45
+                d = math.hypot(dx, dy)
+                new_pos = QPointF(anchor.x() + d * math.cos(math.radians(snapped_angle)),
+                                  anchor.y() + d * math.sin(math.radians(snapped_angle)))
+            if self.active_handle == 'p1':
+                line.setP1(new_pos)
+            else:
+                line.setP2(new_pos)
+            self.setLine(line)
+        elif self.active_handle == 'width':
+            # Drag to change pen width starting from current width
+            line = self.line()
+            if line.length() > 0:
+                start_pos = getattr(self, '_width_drag_start_pos', event.pos())
+                start_w   = getattr(self, '_width_drag_start_w', self.pen().width())
+                dy = event.pos().y() - start_pos.y()
+                new_w = max(1, int(start_w + dy * 0.3))
+                pen = self.pen()
+                pen.setWidth(new_w)
+                self.setPen(pen)
+                self.prepareGeometryChange()
+                self.update()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.active_handle = None
+        super().mouseReleaseEvent(event)
+
+
+class TextBubbleItem(QGraphicsItem):
+    """Square text bubble with a draggable cone (spike) handle.
+    Cone offset is stored relative to the box centre so it scales
+    automatically when the box is resized — same logic as _MarkerItem spike.
+    Double-click or right-click → Edit to change text and colors.
+    """
+    PADDING   = 12
+    MIN_SIZE  = 60
+    HANDLE_R  = 7
+
+    def __init__(self, text: str, fg_color: QColor = None, bg_color: QColor = None):
+        super().__init__()
+        self._text     = text
+        self._fg_color = fg_color or QColor(Qt.GlobalColor.black)
+        self._bg_color = bg_color or QColor(230, 230, 230, 240)
+        self._w = 140
+        self._h = 70
+        # Cone offset stored relative to box centre (like _MarkerItem._spike_offset
+        # relative to circle centre). Default: cone tip points to bottom-right,
+        # placed just outside the box at (w*0.9, h*1.4) from centre.
+        self._cone_rel = QPointF(self._w * 0.9, self._h * 1.4)
+        self._drag_cone = False
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setAcceptHoverEvents(True)
+
+    # ------------------------------------------------------------------
+    # Helpers — cone tip in local (item) coordinates
+    # ------------------------------------------------------------------
+    def _cone_tip_local(self) -> QPointF:
+        """Cone tip in local coords: centre + relative offset."""
+        return QPointF(self._w / 2 + self._cone_rel.x(),
+                       self._h / 2 + self._cone_rel.y())
+
+    # ------------------------------------------------------------------
+    # rect / setRect — for resize machinery compatibility
+    # ------------------------------------------------------------------
+    def rect(self) -> QRectF:
+        return QRectF(0, 0, self._w, self._h)
+
+    def setRect(self, r: QRectF):
+        """Resize box. Cone offset is relative to centre so it scales
+        automatically with the box — no manual adjustment needed."""
+        self.prepareGeometryChange()
+        self._w = max(self.MIN_SIZE, r.width())
+        self._h = max(self.MIN_SIZE, r.height())
+        self.update()
+
+    def boundingRect(self) -> QRectF:
+        tip = self._cone_tip_local()
+        hr  = self.HANDLE_R + 5
+        left   = min(0.0, tip.x()) - hr
+        top    = min(0.0, tip.y()) - hr - 50   # room for rotate handle above
+        right  = max(self._w, tip.x()) + hr
+        bottom = max(self._h, tip.y()) + hr
+        return QRectF(left, top, right - left, bottom - top)
+
+    # ------------------------------------------------------------------
+    # Cone geometry — mirrors _MarkerItem._spike_path() logic
+    # ------------------------------------------------------------------
+    def _cone_path(self) -> QPainterPath:
+        tip = self._cone_tip_local()
+        cx, cy = self._w / 2, self._h / 2
+        dx, dy = tip.x() - cx, tip.y() - cy
+        length = math.hypot(dx, dy) or 1.0
+        nx, ny = -dy / length, dx / length
+        # Base half-width scales with box size (like _MarkerItem hw = r*0.45)
+        hw = min(self._w, self._h) * 0.12
+        b1 = QPointF(cx + nx * hw, cy + ny * hw)
+        b2 = QPointF(cx - nx * hw, cy - ny * hw)
+        path = QPainterPath()
+        path.moveTo(b1)
+        path.quadTo(QPointF(tip.x() * 0.6 + cx * 0.4 + nx * hw * 0.3,
+                            tip.y() * 0.6 + cy * 0.4 + ny * hw * 0.3), tip)
+        path.quadTo(QPointF(tip.x() * 0.6 + cx * 0.4 - nx * hw * 0.3,
+                            tip.y() * 0.6 + cy * 0.4 - ny * hw * 0.3), b2)
+        path.lineTo(b1)
+        return path
+
+    def _over_cone_handle(self, local_pos: QPointF) -> bool:
+        tip = self._cone_tip_local()
+        return math.hypot(local_pos.x() - tip.x(),
+                          local_pos.y() - tip.y()) <= self.HANDLE_R + 6
+
+    # ------------------------------------------------------------------
+    def paint(self, painter, option, widget=None):
+        from PyQt6.QtWidgets import QStyle
+        option.state &= ~QStyle.StateFlag.State_Selected
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        bg = QColor(self._bg_color)
+        bg.setAlpha(255)  # force fully opaque background
+
+        # Cone (behind box) — draw first so box covers the base
+        painter.setBrush(QBrush(bg))
+        painter.setPen(QPen(self._fg_color.darker(150), 1.5))
+        painter.drawPath(self._cone_path())
+
+        # Box — opaque fill covers the cone base cleanly
+        box = QRectF(0, 0, self._w, self._h)
+        painter.setBrush(QBrush(bg))
+        painter.setPen(QPen(self._fg_color.darker(150), 1.5))
+        painter.drawRoundedRect(box, 6, 6)
+
+        # Text — auto-fit font size to fill the bubble box, then centre it
+        text_box = box.adjusted(self.PADDING, self.PADDING, -self.PADDING, -self.PADDING)
+        if text_box.width() > 0 and text_box.height() > 0 and self._text:
+            lo, hi = 6, 200
+            while lo < hi - 1:
+                mid = (lo + hi) // 2
+                test_font = QFont("Arial", mid)
+                painter.setFont(test_font)
+                fm = painter.fontMetrics()
+                br = fm.boundingRect(
+                    text_box.toRect(),
+                    int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
+                    self._text)
+                if br.width() <= text_box.width() and br.height() <= text_box.height():
+                    lo = mid
+                else:
+                    hi = mid
+            font_size = max(6, lo)
+        else:
+            font_size = 6
+        painter.setPen(QPen(self._fg_color))
+        painter.setFont(QFont("Arial", font_size))
+        painter.drawText(text_box,
+                         Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                         self._text)
+
+        if self.isSelected():
+            # Dashed selection rect around the box
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.drawRect(box)
+            # Cone handle — same visual style as _MarkerItem spike handle
+            tip = self._cone_tip_local()
+            painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(tip, self.HANDLE_R, self.HANDLE_R)
+
+    # ------------------------------------------------------------------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._over_cone_handle(event.pos()):
+                self._drag_cone = True
+                event.accept()
+                return
+        self._drag_cone = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_cone:
+            self.prepareGeometryChange()
+            # Store offset relative to box centre (so it survives resize)
+            tip = event.pos()
+            self._cone_rel = QPointF(tip.x() - self._w / 2,
+                                     tip.y() - self._h / 2)
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_cone = False
+        super().mouseReleaseEvent(event)
+
+    def hoverMoveEvent(self, event):
+        if self.isSelected() and self._over_cone_handle(event.pos()):
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().hoverMoveEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        # Trigger edit via the scene/overlay's handler
+        event.accept()
+
+# ─── Dialogs for new items ────────────────────────────────────────────────────
+
+class _BubbleInputDialog(QDialog):
+    def __init__(self, fg_color: QColor = None, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Text Bubble")
+        self.fg_color = fg_color or QColor(Qt.GlobalColor.black)
+        self.bg_color = QColor(230, 230, 230, 240)
+        lay = QVBoxLayout(self)
+        self.edit = QTextEdit()
+        self.edit.setFixedHeight(80)
+        lay.addWidget(QLabel("Text:"))
+        lay.addWidget(self.edit)
+        row = QHBoxLayout()
+        self.btn_fg = QPushButton("Text color")
+        self.btn_fg.clicked.connect(self._pick_fg)
+        self.btn_bg = QPushButton("Background color")
+        self.btn_bg.clicked.connect(self._pick_bg)
+        row.addWidget(self.btn_fg)
+        row.addWidget(self.btn_bg)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._update_btn_styles()
+
+    def _pick_fg(self):
+        dlg = QColorDialog(self.fg_color, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                self.fg_color = c
+                self._update_btn_styles()
+
+    def _pick_bg(self):
+        dlg = QColorDialog(self.bg_color, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                self.bg_color = c
+                self._update_btn_styles()
+
+    def _update_btn_styles(self):
+        c = self.fg_color
+        self.btn_fg.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"color: {'black' if c.lightness() > 128 else 'white'};")
+        c = self.bg_color
+        self.btn_bg.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"color: {'black' if c.lightness() > 128 else 'white'};")
+
+    def result_data(self):
+        return self.edit.toPlainText(), self.fg_color, self.bg_color
+
+
+class _BubbleEditDialog(QDialog):
+    """Edit dialog for an existing TextBubbleItem (text + fg/bg colours)."""
+    def __init__(self, fg_color: QColor = None, bg_color: QColor = None,
+                 text: str = "", parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Edit Text Bubble")
+        self.fg_color = QColor(fg_color) if fg_color else QColor(Qt.GlobalColor.black)
+        self.bg_color = QColor(bg_color) if bg_color else QColor(230, 230, 230, 240)
+        lay = QVBoxLayout(self)
+
+        lay.addWidget(QLabel("Text:"))
+        self.edit = QTextEdit()
+        self.edit.setPlainText(text)
+        self.edit.setFixedHeight(80)
+        lay.addWidget(self.edit)
+
+        row = QHBoxLayout()
+        self.btn_fg = QPushButton("Text color")
+        self.btn_fg.clicked.connect(self._pick_fg)
+        self.btn_bg = QPushButton("Background color")
+        self.btn_bg.clicked.connect(self._pick_bg)
+        row.addWidget(self.btn_fg)
+        row.addWidget(self.btn_bg)
+        lay.addLayout(row)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._update_btn_styles()
+
+    def _pick_fg(self):
+        dlg = QColorDialog(self.fg_color, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                self.fg_color = c
+                self._update_btn_styles()
+
+    def _pick_bg(self):
+        dlg = QColorDialog(self.bg_color, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                self.bg_color = c
+                self._update_btn_styles()
+
+    def _update_btn_styles(self):
+        c = self.fg_color
+        self.btn_fg.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"color: {'black' if c.lightness() > 128 else 'white'};")
+        c = self.bg_color
+        self.btn_bg.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"color: {'black' if c.lightness() > 128 else 'white'};")
+
+    def result_data(self):
+        return self.edit.toPlainText(), self.fg_color, self.bg_color
+
+
+class _MarkerEditDialog(QDialog):
+    def __init__(self, bg_color: QColor = None, text_color: QColor = None, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Edit Marker")
+        self.bg_color   = bg_color   or QColor(220, 50, 50)
+        self.text_color = text_color or QColor(Qt.GlobalColor.white)
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        self.btn_bg   = QPushButton("Background color")
+        self.btn_txt  = QPushButton("Text color")
+        self.btn_bg.clicked.connect(self._pick_bg)
+        self.btn_txt.clicked.connect(self._pick_txt)
+        row.addWidget(self.btn_bg)
+        row.addWidget(self.btn_txt)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._update_styles()
+
+    def _pick_bg(self):
+        dlg = QColorDialog(self.bg_color, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                self.bg_color = c
+                self._update_styles()
+
+    def _pick_txt(self):
+        dlg = QColorDialog(self.text_color, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            c = dlg.selectedColor()
+            if c.isValid():
+                self.text_color = c
+                self._update_styles()
+
+    def _update_styles(self):
+        c = self.bg_color
+        self.btn_bg.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"color: {'black' if c.lightness() > 128 else 'white'};")
+        c = self.text_color
+        self.btn_txt.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"color: {'black' if c.lightness() > 128 else 'white'};")
+
+    def result_data(self):
+        return self.bg_color, self.text_color
 
 
 class _MarkerItem(QGraphicsItem):
@@ -1631,7 +2320,8 @@ class _MarkerItem(QGraphicsItem):
         painter.drawEllipse(QPointF(0, 0), r, r)
 
         # Number
-        painter.setPen(QPen(Qt.GlobalColor.white, 1))
+        text_col = getattr(self, '_text_color', QColor(Qt.GlobalColor.white))
+        painter.setPen(QPen(text_col, 1))
         painter.setFont(QFont("Arial", max(8, int(r - 2)), QFont.Weight.Bold))
         painter.drawText(QRectF(-r, -r, r * 2, r * 2),
                          Qt.AlignmentFlag.AlignCenter, str(self.number))
@@ -1779,16 +2469,19 @@ class EnhancedRegionSelector(QWidget):
     region_selected = pyqtSignal(int, int, int, int)
     cancelled       = pyqtSignal()
 
-    TOOL_DETECT   = "detect"
-    TOOL_SELECT   = "select"
-    TOOL_RECT     = "rect"
-    TOOL_CIRCLE   = "circle"
-    TOOL_FREEHAND = "freehand"
-    TOOL_LINE     = "line"
-    TOOL_MARKER   = "marker"
-    TOOL_TEXT     = "text"
-    TOOL_IMAGE    = "image"
-    TOOL_COLOR    = "color"
+    TOOL_DETECT    = "detect"
+    TOOL_SELECT    = "select"
+    TOOL_RECT      = "rect"
+    TOOL_CIRCLE    = "circle"
+    TOOL_FREEHAND  = "freehand"
+    TOOL_LINE      = "line"
+    TOOL_ARROW     = "arrow"
+    TOOL_HIGHLIGHT = "highlight"
+    TOOL_BUBBLE    = "bubble"
+    TOOL_MARKER    = "marker"
+    TOOL_TEXT      = "text"
+    TOOL_IMAGE     = "image"
+    TOOL_COLOR     = "color"
 
     def __init__(self):
         super().__init__()
@@ -2029,15 +2722,18 @@ class EnhancedRegionSelector(QWidget):
         lay.setSpacing(4)
 
         tools = [
-            (self.TOOL_SELECT,   "🖱️", "Select / move / resize annotations (Del to delete)"),
-            (self.TOOL_RECT,     "⬜", "Draw rectangle annotation"),
-            (self.TOOL_CIRCLE,   "⭕", "Draw ellipse annotation"),
-            (self.TOOL_FREEHAND, "✏️", "Freehand drawing"),
-            (self.TOOL_LINE,     "📏", "Draw straight line"),
-            (self.TOOL_MARKER,   "📍", "Add numbered marker"),
-            (self.TOOL_TEXT,     "T",  "Add text annotation"),
-            (self.TOOL_IMAGE,    "🖼️", "Import image onto canvas"),
-            (self.TOOL_COLOR,    "🎨", "Change annotation color / width"),
+            (self.TOOL_SELECT,    "🖱️", "Select / move / resize annotations (Del to delete)"),
+            (self.TOOL_RECT,      "⬜", "Draw rectangle annotation"),
+            (self.TOOL_CIRCLE,    "⭕", "Draw ellipse annotation"),
+            (self.TOOL_HIGHLIGHT, "🟨", "Draw highlight (semi-transparent yellow rectangle)"),
+            (self.TOOL_FREEHAND,  "✏️", "Freehand drawing"),
+            (self.TOOL_LINE,      "📏", "Draw straight line"),
+            (self.TOOL_ARROW,     "➡️", "Draw arrow"),
+            (self.TOOL_BUBBLE,    "💬", "Add text bubble"),
+            (self.TOOL_MARKER,    "📍", "Add numbered marker"),
+            (self.TOOL_TEXT,      "T",  "Add text annotation"),
+            (self.TOOL_IMAGE,     "🖼️", "Import image onto canvas"),
+            (self.TOOL_COLOR,     "🎨", "Change annotation color / width"),
         ]
         self._tool_btns = {}
         for tid, icon, tip in tools:
@@ -2074,7 +2770,8 @@ class EnhancedRegionSelector(QWidget):
     def _is_draw_tool(self, tid=None):
         t = tid if tid is not None else self._current_tool
         return t in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_FREEHAND,
-                     self.TOOL_LINE, self.TOOL_MARKER, self.TOOL_TEXT,
+                     self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
+                     self.TOOL_BUBBLE, self.TOOL_MARKER, self.TOOL_TEXT,
                      self.TOOL_IMAGE, self.TOOL_SELECT)
 
     def _select_tool(self, tool_id):
@@ -2096,7 +2793,8 @@ class EnhancedRegionSelector(QWidget):
         # Canvas is ALWAYS transparent — mouse routing is done manually
 
         cross = (self.TOOL_DETECT, self.TOOL_RECT, self.TOOL_CIRCLE,
-                 self.TOOL_LINE, self.TOOL_FREEHAND)
+                 self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
+                 self.TOOL_FREEHAND)
         cur = Qt.CursorShape.CrossCursor if tool_id in cross else Qt.CursorShape.ArrowCursor
         self.setCursor(QCursor(cur))
         self._toolbar.adjustSize()
@@ -2105,8 +2803,69 @@ class EnhancedRegionSelector(QWidget):
             self._update_detection_at_cursor()
 
     def _pick_color(self):
+        """Open a context-aware edit dialog for the selected item, or a plain
+        colour picker if no item is selected / the item has no dedicated dialog."""
         self._toolbar.hide()
-        self.releaseKeyboard() # Allow input in color hex fields
+        self.releaseKeyboard()
+
+        selected = self._canvas._scene.selectedItems()
+
+        if selected:
+            item = selected[0]
+            handled = self._open_item_edit_dialog(item)
+            if not handled:
+                # Fallback: plain colour picker applied to selected item
+                self._open_generic_color_picker(apply_to_item=item)
+        else:
+            # No selection — just pick the drawing colour
+            self._open_generic_color_picker(apply_to_item=None)
+
+        self._toolbar.show()
+        self.activateWindow(); self.setFocus()
+        self.grabKeyboard()
+
+    def _open_item_edit_dialog(self, item) -> bool:
+        """Open the dedicated edit dialog for *item*.
+        Returns True if a dedicated dialog was shown, False otherwise."""
+        if isinstance(item, HighlightRectItem):
+            dlg = HighlightEditDialog(item._color)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                new_color = dlg.result_color()
+                item._color = new_color
+                border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
+                item.setPen(QPen(border, 1.5))
+                item.setBrush(QBrush(new_color))
+                item.update()
+            return True
+
+        if isinstance(item, TextBubbleItem):
+            dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                text, fg, bg = dlg.result_data()
+                item._text     = text
+                item._fg_color = fg
+                item._bg_color = bg
+                item.update()
+            return True
+
+        if isinstance(item, _MarkerItem):
+            dlg = _MarkerEditDialog(
+                QColor(item._bg_color),
+                QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))))
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                item._bg_color   = dlg.bg_color
+                item._text_color = dlg.text_color
+                item.update()
+            return True
+
+        return False  # no dedicated dialog for this type
+
+    def _open_generic_color_picker(self, apply_to_item=None):
+        """Show a plain QColorDialog and apply result to the drawing colour
+        and optionally to *apply_to_item*."""
         dlg = QColorDialog(self._draw_color, None)
         dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
         dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
@@ -2117,23 +2876,11 @@ class EnhancedRegionSelector(QWidget):
                 self._draw_color = c
                 self._color_preview.setStyleSheet(
                     f"background:{c.name()}; border:1px solid white; border-radius:3px;")
-                
-                # Apply new color to currently selected items in the canvas
-                for item in self._canvas._scene.selectedItems():
-                    self._canvas._apply_props(item, c, self._draw_width)
-                    
-                    if hasattr(item, 'setDefaultTextColor'):
-                        item.setDefaultTextColor(c)
-                        
-                    # Apply color dynamically to selected markers
-                    if isinstance(item, _MarkerItem):
-                        item._bg_color = c
-                        
-                    item.update()
-                    
-        self._toolbar.show()
-        self.activateWindow(); self.setFocus()
-        self.grabKeyboard() # Re-lock keyboard
+                if apply_to_item is not None:
+                    self._canvas._apply_props(apply_to_item, c, self._draw_width)
+                    if hasattr(apply_to_item, 'setDefaultTextColor'):
+                        apply_to_item.setDefaultTextColor(c)
+                    apply_to_item.update()
 
     def _import_image(self):
         self._toolbar.hide()
@@ -2331,6 +3078,19 @@ class EnhancedRegionSelector(QWidget):
             self.activateWindow(); self.setFocus()
             self.grabKeyboard() # Re-lock keyboard interactions to the overlay
 
+        elif self._current_tool == self.TOOL_BUBBLE:
+            self._toolbar.hide()
+            self.releaseKeyboard()
+            dlg = _BubbleInputDialog(QColor(self._draw_color), None)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                txt, fg_col, bg_col = dlg.result_data()
+                if txt.strip():
+                    self._canvas.add_bubble(scene_pos, txt, fg_col, bg_col)
+            self._toolbar.show()
+            self.activateWindow(); self.setFocus()
+            self.grabKeyboard()
+
     def mouseMoveEvent(self, e):
         gpos = e.globalPosition().toPoint()
         lpos = e.pos()
@@ -2370,6 +3130,7 @@ class EnhancedRegionSelector(QWidget):
             _, handle = self._canvas.get_handle_at(scene_pos)
             if handle:
                 if handle == 'ROTATE': self.setCursor(Qt.CursorShape.PointingHandCursor)
+                elif handle == 'WIDTH': self.setCursor(Qt.CursorShape.SizeVerCursor)
                 elif handle in ['TL', 'BR']: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
                 elif handle in ['TR', 'BL']: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
                 elif handle in ['L', 'R']: self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -2388,7 +3149,7 @@ class EnhancedRegionSelector(QWidget):
         if self._current_tool == self.TOOL_FREEHAND:
             self._canvas.extend_freehand(scene_pos)
 
-        elif self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_LINE):
+        elif self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_LINE, self.TOOL_HIGHLIGHT, self.TOOL_ARROW):
             if self._draw_start_scene is None:
                 return
             end_scene = scene_pos
@@ -2408,6 +3169,8 @@ class EnhancedRegionSelector(QWidget):
             if self._current_tool == self.TOOL_RECT:
                 self._preview_item = self._canvas.add_rect(
                     r, self._draw_color, self._draw_width)
+            elif self._current_tool == self.TOOL_HIGHLIGHT:
+                self._preview_item = self._canvas.add_highlight(r)
             elif self._current_tool == self.TOOL_CIRCLE:
                 self._preview_item = self._canvas.add_ellipse(
                     r, self._draw_color, self._draw_width)
@@ -2426,10 +3189,29 @@ class EnhancedRegionSelector(QWidget):
                 self._preview_item = self._canvas.add_line(
                     QLineF(self._draw_start_scene, end_pos),
                     self._draw_color, self._draw_width)
+            elif self._current_tool == self.TOOL_ARROW:
+                end_pos = scene_pos
+                if e.modifiers() & (Qt.KeyboardModifier.ShiftModifier |
+                                    Qt.KeyboardModifier.ControlModifier):
+                    dx = end_pos.x() - self._draw_start_scene.x()
+                    dy = end_pos.y() - self._draw_start_scene.y()
+                    angle = math.atan2(dy, dx)
+                    snapped = round(math.degrees(angle) / 45) * 45
+                    dist = math.hypot(dx, dy)
+                    end_pos = QPointF(
+                        self._draw_start_scene.x() + dist * math.cos(math.radians(snapped)),
+                        self._draw_start_scene.y() + dist * math.sin(math.radians(snapped)))
+                self._preview_item = self._canvas.add_arrow(
+                    QLineF(self._draw_start_scene, end_pos),
+                    self._draw_color, self._draw_width)
 
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
             return
+        # Reset WIDTH drag state on any selected ResizableRect/Ellipse
+        for item in self._canvas._scene.selectedItems():
+            if hasattr(item, '_width_drag_active'):
+                item._width_drag_active = False
         lpos = e.pos()
 
         # ── Inline capture-selection mode — finalize rect ─────────────────────
@@ -2510,6 +3292,103 @@ class EnhancedRegionSelector(QWidget):
                 self.activateWindow()
                 self.setFocus()
                 self.grabKeyboard()
+
+            elif isinstance(item, HighlightRectItem):
+                self._edit_highlight(item)
+
+            elif isinstance(item, TextBubbleItem):
+                self._edit_bubble(item)
+
+            elif isinstance(item, _MarkerItem):
+                self._edit_marker(item)
+
+    def _edit_bubble(self, item):
+        self._toolbar.hide()
+        self.releaseKeyboard()
+        dlg = _BubbleInputDialog(item._fg_color, None)
+        dlg.edit.setPlainText(item._text)
+        dlg.bg_color = item._bg_color
+        dlg._update_btn_styles()
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            txt, fg_col, bg_col = dlg.result_data()
+            if txt.strip():
+                item._text = txt
+                item._fg_color = fg_col
+                item._bg_color = bg_col
+                item.prepareGeometryChange()
+                item.update()
+        self._toolbar.show()
+        self.activateWindow(); self.setFocus()
+        self.grabKeyboard()
+
+    def _edit_marker(self, item):
+        self._toolbar.hide()
+        self.releaseKeyboard()
+        dlg = _MarkerEditDialog(item._bg_color,
+                                getattr(item, '_text_color', QColor(Qt.GlobalColor.white)),
+                                None)
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            bg, fg = dlg.result_data()
+            item._bg_color = bg
+            item._text_color = fg
+            item.update()
+        self._toolbar.show()
+        self.activateWindow(); self.setFocus()
+        self.grabKeyboard()
+
+    def _edit_highlight(self, item):
+        self._toolbar.hide()
+        self.releaseKeyboard()
+        dlg = HighlightEditDialog(item._color)
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_color = dlg.result_color()
+            item._color = new_color
+            border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
+            item.setPen(QPen(border, 1.5))
+            item.setBrush(QBrush(new_color))
+            item.update()
+        self._toolbar.show()
+        self.activateWindow(); self.setFocus()
+        self.grabKeyboard()
+
+    def contextMenuEvent(self, e):
+        lpos = e.pos()
+        scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
+        item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
+        if item is not None:
+            menu = QMenu(self)
+            if isinstance(item, TextBubbleItem):
+                edit_act = menu.addAction("✏️ Edit")
+                del_act  = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action == edit_act:
+                    self._edit_bubble(item)
+                elif action == del_act:
+                    self._canvas._scene.removeItem(item)
+            elif isinstance(item, _MarkerItem):
+                edit_act = menu.addAction("✏️ Edit")
+                del_act  = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action == edit_act:
+                    self._edit_marker(item)
+                elif action == del_act:
+                    self._canvas._scene.removeItem(item)
+            elif isinstance(item, HighlightRectItem):
+                edit_act = menu.addAction("✏️ Edit")
+                del_act  = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action == edit_act:
+                    self._edit_highlight(item)
+                elif action == del_act:
+                    self._canvas._scene.removeItem(item)
+            else:
+                del_act = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action == del_act:
+                    self._canvas._scene.removeItem(item)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
@@ -3788,18 +4667,35 @@ class LineItem(QGraphicsLineItem):
             s = 10 / (self.canvas.transform().m11() if self.canvas else 1)
             painter.drawEllipse(self.line().p1(), s/2, s/2)
             painter.drawEllipse(self.line().p2(), s/2, s/2)
+            # Width handle at midpoint
+            mid = QPointF((self.line().p1().x() + self.line().p2().x()) / 2,
+                          (self.line().p1().y() + self.line().p2().y()) / 2)
+            painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(mid, s/2, s/2)
 
     def mousePressEvent(self, event):
         p = event.pos()
         p1, p2 = self.line().p1(), self.line().p2()
-        # Detekcja kliknięcia w uchwyt
-        dist = 15 / (self.canvas.transform().m11() if self.canvas else 1)
-        if (p - p1).manhattanLength() < dist: self.active_handle = 'p1'
-        elif (p - p2).manhattanLength() < dist: self.active_handle = 'p2'
-        else: self.active_handle = None; super().mousePressEvent(event)
+        # Larger hit area for handles (easier to grab)
+        dist = 22 / (self.canvas.transform().m11() if self.canvas else 1)
+        if (p - p1).manhattanLength() < dist:
+            self.active_handle = 'p1'
+        elif (p - p2).manhattanLength() < dist:
+            self.active_handle = 'p2'
+        else:
+            # Width handle at midpoint
+            mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+            if (p - mid).manhattanLength() < dist:
+                self.active_handle = 'width'
+                self._width_drag_start_pos = p
+                self._width_drag_start_w   = self.pen().width()
+            else:
+                self.active_handle = None
+                super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.active_handle:
+        if self.active_handle in ('p1', 'p2'):
             self.prepareGeometryChange() # Usuwa smużenie
             line = self.line()
             new_pos = event.pos()
@@ -3817,9 +4713,20 @@ class LineItem(QGraphicsLineItem):
             if self.active_handle == 'p1': line.setP1(new_pos)
             else: line.setP2(new_pos)
             self.setLine(line)
+        elif self.active_handle == 'width':
+            line = self.line()
+            if line.length() > 0:
+                start_pos = getattr(self, '_width_drag_start_pos', event.pos())
+                start_w   = getattr(self, '_width_drag_start_w', self.pen().width())
+                dy = event.pos().y() - start_pos.y()
+                new_w = max(1, int(start_w + dy * 0.3))
+                pen = self.pen()
+                pen.setWidth(new_w)
+                self.setPen(pen)
+                self.prepareGeometryChange()
+                self.update()
         else:
             super().mouseMoveEvent(event)
-
 
 
 class HighlightTextItem(QGraphicsTextItem):
@@ -3835,37 +4742,184 @@ class HighlightTextItem(QGraphicsTextItem):
         super().paint(painter, option, widget)
 
 class ResizableRectItem(QGraphicsRectItem):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dragging_width = False
+
     def boundingRect(self):
-        # Powiększamy obszar odświeżania w górę o 50 pikseli, aby pomieścić linię i uchwyt obrotu
-        return super().boundingRect().adjusted(-5, -50, 5, 5)
+        return super().boundingRect().adjusted(-5, -50, 5, 20)
+
+    def _width_handle_pos(self) -> QPointF:
+        r = self.rect()
+        return QPointF(r.center().x(), r.bottom() + 12)
 
     def paint(self, painter, option, widget=None):
         from PyQt6.QtWidgets import QStyle
-        # Wyłączamy domyślną ramkę zaznaczenia rysowaną przez Qt (bo bazuje na powiększonym boundingRect)
         option.state &= ~QStyle.StateFlag.State_Selected
         super().paint(painter, option, widget)
-        
-        # Rysujemy własną ramkę idealnie na krawędziach figury
         if self.isSelected():
             pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.GlobalColor.transparent)
             painter.drawRect(self.rect())
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # Corner & edge resize handles
+            r = self.rect()
+            handles = [r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight(),
+                       QPointF(r.center().x(), r.top()), QPointF(r.center().x(), r.bottom()),
+                       QPointF(r.left(), r.center().y()), QPointF(r.right(), r.center().y())]
+            for hp in handles:
+                painter.setBrush(QBrush(Qt.GlobalColor.white))
+                painter.setPen(QPen(QColor(60, 120, 255), 1.5))
+                painter.drawEllipse(hp, 5, 5)
+            # Rotation handle above top edge
+            rot_pt = QPointF(r.center().x(), r.top() - 30)
+            painter.setBrush(QBrush(QColor(180, 255, 180, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(rot_pt, 6, 6)
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DotLine))
+            painter.drawLine(QPointF(r.center().x(), r.top()), rot_pt)
+            # Width handle below bottom edge
+            wp = self._width_handle_pos()
+            painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(wp, 8, 8)
+
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            wp = self._width_handle_pos()
+            p  = event.pos()
+            if math.hypot(p.x() - wp.x(), p.y() - wp.y()) <= 14:
+                self._dragging_width = True
+                self._drag_start_pos = p
+                self._drag_start_w   = self.pen().width()
+                event.accept()
+                return
+        self._dragging_width = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_width:
+            rect   = self.rect()
+            centre = rect.center()
+            wp     = self._width_handle_pos()
+            ref_dx = wp.x() - centre.x()
+            ref_dy = wp.y() - centre.y()
+            ref_len = math.hypot(ref_dx, ref_dy) or 1.0
+            dp = event.pos() - self._drag_start_pos
+            projection = (dp.x() * ref_dx + dp.y() * ref_dy) / ref_len
+            new_w = max(1, int(self._drag_start_w + projection * 0.15))
+            pen = self.pen()
+            pen.setWidth(new_w)
+            self.setPen(pen)
+            self.prepareGeometryChange()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging_width = False
+        super().mouseReleaseEvent(event)
+
+    def hoverMoveEvent(self, event):
+        if self.isSelected():
+            wp = self._width_handle_pos()
+            p  = event.pos()
+            if math.hypot(p.x() - wp.x(), p.y() - wp.y()) <= 14:
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+                return
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().hoverMoveEvent(event)
 
 class ResizableEllipseItem(QGraphicsEllipseItem):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dragging_width = False
+
     def boundingRect(self):
-        return super().boundingRect().adjusted(-5, -50, 5, 5)
+        return super().boundingRect().adjusted(-5, -50, 5, 20)
+
+    def _width_handle_pos(self) -> QPointF:
+        r = self.rect()
+        return QPointF(r.center().x(), r.bottom() + 12)
 
     def paint(self, painter, option, widget=None):
         from PyQt6.QtWidgets import QStyle
         option.state &= ~QStyle.StateFlag.State_Selected
         super().paint(painter, option, widget)
-        
         if self.isSelected():
             pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.GlobalColor.transparent)
             painter.drawRect(self.rect())
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = self.rect()
+            handles = [r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight(),
+                       QPointF(r.center().x(), r.top()), QPointF(r.center().x(), r.bottom()),
+                       QPointF(r.left(), r.center().y()), QPointF(r.right(), r.center().y())]
+            for hp in handles:
+                painter.setBrush(QBrush(Qt.GlobalColor.white))
+                painter.setPen(QPen(QColor(60, 120, 255), 1.5))
+                painter.drawEllipse(hp, 5, 5)
+            rot_pt = QPointF(r.center().x(), r.top() - 30)
+            painter.setBrush(QBrush(QColor(180, 255, 180, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(rot_pt, 6, 6)
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DotLine))
+            painter.drawLine(QPointF(r.center().x(), r.top()), rot_pt)
+            wp = self._width_handle_pos()
+            painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(wp, 8, 8)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            wp = self._width_handle_pos()
+            p  = event.pos()
+            if math.hypot(p.x() - wp.x(), p.y() - wp.y()) <= 14:
+                self._dragging_width = True
+                self._drag_start_pos = p
+                self._drag_start_w   = self.pen().width()
+                event.accept()
+                return
+        self._dragging_width = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_width:
+            rect   = self.rect()
+            centre = rect.center()
+            wp     = self._width_handle_pos()
+            ref_dx = wp.x() - centre.x()
+            ref_dy = wp.y() - centre.y()
+            ref_len = math.hypot(ref_dx, ref_dy) or 1.0
+            dp = event.pos() - self._drag_start_pos
+            projection = (dp.x() * ref_dx + dp.y() * ref_dy) / ref_len
+            new_w = max(1, int(self._drag_start_w + projection * 0.15))
+            pen = self.pen()
+            pen.setWidth(new_w)
+            self.setPen(pen)
+            self.prepareGeometryChange()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging_width = False
+        super().mouseReleaseEvent(event)
+
+    def hoverMoveEvent(self, event):
+        if self.isSelected():
+            wp = self._width_handle_pos()
+            p  = event.pos()
+            if math.hypot(p.x() - wp.x(), p.y() - wp.y()) <= 14:
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+                return
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().hoverMoveEvent(event)
 
 class ResizablePixmapItem(QGraphicsRectItem):
     """
@@ -3885,10 +4939,26 @@ class ResizablePixmapItem(QGraphicsRectItem):
         
         # Jeśli obrazek jest zaznaczony, możemy narysować przerywaną ramkę
         if self.isSelected():
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.GlobalColor.transparent)
             painter.drawRect(self.rect())
+            r = self.rect()
+            handles = [r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight(),
+                       QPointF(r.center().x(), r.top()), QPointF(r.center().x(), r.bottom()),
+                       QPointF(r.left(), r.center().y()), QPointF(r.right(), r.center().y())]
+            for hp in handles:
+                painter.setBrush(QBrush(Qt.GlobalColor.white))
+                painter.setPen(QPen(QColor(60, 120, 255), 1.5))
+                painter.drawEllipse(hp, 5, 5)
+            rot_pt = QPointF(r.center().x(), r.top() - 30)
+            painter.setBrush(QBrush(QColor(180, 255, 180, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(rot_pt, 6, 6)
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DotLine))
+            painter.drawLine(QPointF(r.center().x(), r.top()), rot_pt)
+
     def boundingRect(self):
         return super().boundingRect().adjusted(-5, -50, 5, 5)
 
@@ -4053,7 +5123,17 @@ class EditorCanvas(QGraphicsView):
                           side if scene_pos.y() > self.start_point.y() else -side).normalized()
 
         if self.current_tool in ["Rectangle", "Circle"]: self.current_item.setRect(rect)
-        elif self.current_tool == "Line": self.current_item.setLine(QLineF(self.start_point, scene_pos))
+        elif self.current_tool == "Line":
+            end_pos = scene_pos
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                dx = end_pos.x() - self.start_point.x()
+                dy = end_pos.y() - self.start_point.y()
+                dist = math.hypot(dx, dy)
+                snapped_angle = round(math.degrees(math.atan2(dy, dx)) / 45) * 45
+                end_pos = QPointF(
+                    self.start_point.x() + dist * math.cos(math.radians(snapped_angle)),
+                    self.start_point.y() + dist * math.sin(math.radians(snapped_angle)))
+            self.current_item.setLine(QLineF(self.start_point, end_pos))
         elif self.current_tool == "Freehand":
             if self.current_item and getattr(self, '_freehand_path', None) is not None:
                 new_pos = scene_pos
