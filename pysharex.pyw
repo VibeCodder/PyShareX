@@ -1507,7 +1507,7 @@ class _OverlayCanvas(QGraphicsView):
                 R = abs(local_pos.x() - rect.right()) < m
                 T = abs(local_pos.y() - rect.top())   < m
                 B = abs(local_pos.y() - rect.bottom())< m
-                # TextBubbleItem: only bottom-right corner allowed for scaling
+                # TextBubbleItem: only bottom-right corner (BR) for scaling
                 if isinstance(item, TextBubbleItem):
                     if R and B: return item, 'BR'
                 else:
@@ -2004,6 +2004,12 @@ class TextBubbleItem(QGraphicsItem):
             painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
             painter.setPen(QPen(QColor(60, 60, 60), 1.5))
             painter.drawEllipse(tip, self.HANDLE_R, self.HANDLE_R)
+            # Resize handle — bottom-right corner (BR)
+            br = QPointF(box.right(), box.bottom())
+            painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawRect(QRectF(br.x() - self.HANDLE_R, br.y() - self.HANDLE_R,
+                                    self.HANDLE_R * 2, self.HANDLE_R * 2))
 
     # ------------------------------------------------------------------
     def mousePressEvent(self, event):
@@ -2031,9 +2037,17 @@ class TextBubbleItem(QGraphicsItem):
         self._drag_cone = False
         super().mouseReleaseEvent(event)
 
+    def _over_resize_handle_br(self, local_pos: QPointF) -> bool:
+        """Check if pos is over the bottom-right resize handle."""
+        br = QPointF(self._w, self._h)
+        return (abs(local_pos.x() - br.x()) <= self.HANDLE_R + 4 and
+                abs(local_pos.y() - br.y()) <= self.HANDLE_R + 4)
+
     def hoverMoveEvent(self, event):
         if self.isSelected() and self._over_cone_handle(event.pos()):
             self.setCursor(Qt.CursorShape.SizeAllCursor)
+        elif self.isSelected() and self._over_resize_handle_br(event.pos()):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
         super().hoverMoveEvent(event)
