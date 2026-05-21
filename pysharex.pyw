@@ -1670,28 +1670,32 @@ class HighlightRectItem(QGraphicsRectItem):
     """Semi-transparent yellow highlight rectangle."""
     HIGHLIGHT_COLOR = QColor(255, 255, 0, 90)
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._color = QColor(self.HIGHLIGHT_COLOR)
-        pen = QPen(QColor(255, 220, 0, 160), 1.5)
-        self.setPen(pen)
-        self.setBrush(QBrush(self._color))
-        self.setAcceptHoverEvents(True)
+    def __init__(self, rect=QRectF(), parent=None):
+        super().__init__(rect, parent)
+        self.highlight_color = QColor(255, 255, 0, 100)  # Semi-transparent yellow
+        self.setPen(QPen(Qt.PenStyle.NoPen))
 
     def boundingRect(self):
-        return super().boundingRect().adjusted(-5, -50, 5, 5)
+        r = super().boundingRect()
+        # Guard: if rect is empty/zero-size, return a minimal valid rect
+        # to prevent Qt painter crash on zero-dimension geometry
+        if r.width() < 1 or r.height() < 1:
+            return QRectF(r.x() - 5, r.y() - 5, 10, 10)
+        return r.adjusted(-5, -50, 5, 5)
 
     def paint(self, painter, option, widget=None):
-        from PyQt6.QtWidgets import QStyle
-        option.state &= ~QStyle.StateFlag.State_Selected
-        painter.setPen(self.pen())
-        painter.setBrush(QBrush(self._color))
-        painter.drawRect(self.rect())
+        painter.save()
+        # Use fillRect instead of drawRect to safely support QRectF bounding boxes without crashing
+        painter.fillRect(self.rect(), QBrush(self.highlight_color))
+        # Draw dashed selection border when selected
         if self.isSelected():
-            pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            sel_pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
+            sel_pen.setDashPattern([4, 3])
+            painter.setPen(sel_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(self.rect())
+        painter.restore()
 
     # Width handle support (same as ResizableRectItem)
     def rect(self):
@@ -1726,8 +1730,7 @@ class HighlightRectItem(QGraphicsRectItem):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_color = dlg.result_color()
             self._color = new_color
-            border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
-            self.setPen(QPen(border, 1.5))
+            self.setPen(Qt.PenStyle.NoPen)
             self.setBrush(QBrush(self._color))
             self.update()
 
@@ -1855,6 +1858,12 @@ class ArrowItem(QGraphicsLineItem):
                 self.setPen(pen)
                 self.prepareGeometryChange()
                 self.update()
+                if hasattr(self, 'canvas') and self.canvas:
+                    win = self.canvas.window()
+                    if hasattr(win, 'spin'):
+                        win.spin.blockSignals(True)
+                        win.spin.setValue(new_w)
+                        win.spin.blockSignals(False)
         else:
             super().mouseMoveEvent(event)
 
@@ -1869,9 +1878,12 @@ class TextBubbleItem(QGraphicsItem):
     automatically when the box is resized — same logic as _MarkerItem spike.
     Double-click or right-click → Edit to change text and colors.
     """
-    PADDING   = 12
-    MIN_SIZE  = 60
-    HANDLE_R  = 7
+    
+
+    # ── Class-level constants ──────────────────────────────────────────
+    MIN_SIZE  = 40     # minimum box width / height in pixels
+    PADDING   = 10     # inner padding between box edge and text
+    HANDLE_R  = 7      # radius of the cone-tip and resize handles
 
     def __init__(self, text: str, fg_color: QColor = None, bg_color: QColor = None):
         super().__init__()
@@ -1880,6 +1892,7 @@ class TextBubbleItem(QGraphicsItem):
         self._bg_color = bg_color or QColor(230, 230, 230, 240)
         self._w = 140
         self._h = 70
+       
         # Cone offset stored relative to box centre (like _MarkerItem._spike_offset
         # relative to circle centre). Default: cone tip points to bottom-right,
         # placed just outside the box at (w*0.9, h*1.4) from centre.
@@ -1910,7 +1923,26 @@ class TextBubbleItem(QGraphicsItem):
         self.prepareGeometryChange()
         self._w = max(self.MIN_SIZE, r.width())
         self._h = max(self.MIN_SIZE, r.height())
+        self._auto_grow()
         self.update()
+
+    def _auto_grow(self):
+        """Expand the box height only if text cannot fit at the minimum font
+        size — so we never shrink a manually-resized box."""
+        if not self._text:
+            return
+        pad = self.PADDING * 2
+        from PyQt6.QtGui import QFontMetrics
+        fm = QFontMetrics(QFont("Arial", self.MIN_SIZE // 5 or 8))
+        text_w = max(1, int(self._w) - pad)
+        needed_h = fm.boundingRect(
+            0, 0, text_w, 0,
+            int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
+            self._text
+        ).height() + pad
+        if needed_h > self._h:
+            self.prepareGeometryChange()
+            self._h = needed_h
 
     def boundingRect(self) -> QRectF:
         tip = self._cone_tip_local()
@@ -1951,6 +1983,7 @@ class TextBubbleItem(QGraphicsItem):
     # ------------------------------------------------------------------
     def paint(self, painter, option, widget=None):
         from PyQt6.QtWidgets import QStyle
+        from PyQt6.QtGui import QFontMetrics
         option.state &= ~QStyle.StateFlag.State_Selected
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -1968,30 +2001,36 @@ class TextBubbleItem(QGraphicsItem):
         painter.setPen(QPen(self._fg_color.darker(150), 1.5))
         painter.drawRoundedRect(box, 6, 6)
 
-        # Text — auto-fit font size to fill the bubble box, then centre it
+        # Text — binary-search the largest font that fits the box both in
+        # width and height, then draw centred so it fills the box visually.
+        MIN_FONT = 8
+        MAX_FONT = 200
         text_box = box.adjusted(self.PADDING, self.PADDING, -self.PADDING, -self.PADDING)
-        if text_box.width() > 0 and text_box.height() > 0 and self._text:
-            lo, hi = 6, 200
+        tw = int(text_box.width())
+        th = int(text_box.height())
+        if tw > 0 and th > 0 and self._text:
+            lo, hi = MIN_FONT, MAX_FONT
             while lo < hi - 1:
                 mid = (lo + hi) // 2
-                test_font = QFont("Arial", mid)
-                painter.setFont(test_font)
-                fm = painter.fontMetrics()
-                br = fm.boundingRect(
-                    text_box.toRect(),
-                    int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
+                fm = QFontMetrics(QFont("Arial", mid))
+                needed = fm.boundingRect(
+                    0, 0, tw, 0,
+                    int(Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap),
                     self._text)
-                if br.width() <= text_box.width() and br.height() <= text_box.height():
+                if needed.width() <= tw and needed.height() <= th:
                     lo = mid
                 else:
                     hi = mid
-            font_size = max(6, lo)
+            font_size = max(MIN_FONT, lo)
         else:
-            font_size = 6
+            font_size = MIN_FONT
         painter.setPen(QPen(self._fg_color))
         painter.setFont(QFont("Arial", font_size))
-        painter.drawText(text_box,
-                         Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+        # AlignVCenter + AlignHCenter: text block is centred inside the box,
+        # filling it proportionally from top to bottom as seen in the reference.
+        painter.drawText(text_box.toRect(),
+                         int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter |
+                             Qt.TextFlag.TextWordWrap),
                          self._text)
 
         if self.isSelected():
@@ -4743,6 +4782,12 @@ class LineItem(QGraphicsLineItem):
                 self.setPen(pen)
                 self.prepareGeometryChange()
                 self.update()
+                if hasattr(self, 'canvas') and self.canvas:
+                    win = self.canvas.window()
+                    if hasattr(win, 'spin'):
+                        win.spin.blockSignals(True)
+                        win.spin.setValue(new_w)
+                        win.spin.blockSignals(False)
         else:
             super().mouseMoveEvent(event)
 
@@ -4750,12 +4795,15 @@ class LineItem(QGraphicsLineItem):
 class HighlightTextItem(QGraphicsTextItem):
 
     def paint(self, painter, option, widget=None):
-        # Rysowanie tła (podświetlenia) przed narysowaniem liter
+        # Draw highlight background before text — use document rect to avoid recursion
         if hasattr(self, 'highlight_color') and self.highlight_color and self.highlight_color.alpha() > 0:
             painter.save()
             painter.setBrush(QBrush(self.highlight_color))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(self.boundingRect())
+            from PyQt6.QtCore import QRectF
+            # Use document().size() instead of boundingRect() to prevent paint recursion crash
+            doc_size = self.document().size()
+            painter.drawRect(QRectF(0.0, 0.0, doc_size.width(), doc_size.height()))
             painter.restore()
         super().paint(painter, option, widget)
 
@@ -4833,6 +4881,12 @@ class ResizableRectItem(QGraphicsRectItem):
             self.setPen(pen)
             self.prepareGeometryChange()
             self.update()
+            # Live-update the Size spinner in the toolbar
+            win = self.scene().views()[0].window() if self.scene() and self.scene().views() else None
+            if win and hasattr(win, 'spin'):
+                win.spin.blockSignals(True)
+                win.spin.setValue(new_w)
+                win.spin.blockSignals(False)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -5078,6 +5132,25 @@ class EditorCanvas(QGraphicsView):
             self._freehand_path = QPainterPath()
             self._freehand_path.moveTo(self.start_point)
             self.current_item = FreehandItem(self._freehand_path)
+        elif self.current_tool == "Arrow":
+            self.current_item = ArrowItem(
+                QLineF(self.start_point, self.start_point), self)
+        elif self.current_tool == "Highlight":
+            self._hl_item = HighlightRectItem()
+            self._hl_item.setRect(QRectF(self.start_point, self.start_point))
+            self._hl_item._color = QColor(self.text_highlight_color)
+            self._hl_item.setFlags(
+                QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+            self.scene.addItem(self._hl_item)
+            self.current_item = self._hl_item
+            # keep drawing — mouseRelease will finalize
+            self.start_point = scene_pos
+            return
+        elif self.current_tool == "Bubble":
+            # Bubble is completed on mouseRelease — nothing to create yet
+            pass
         elif self.current_tool == "Marker":
             # Number after the highest existing marker so switching tools
             # and coming back continues the sequence correctly.
@@ -5141,6 +5214,9 @@ class EditorCanvas(QGraphicsView):
                           side if scene_pos.y() > self.start_point.y() else -side).normalized()
 
         if self.current_tool in ["Rectangle", "Circle"]: self.current_item.setRect(rect)
+        elif self.current_tool == "Highlight":
+            if getattr(self, '_hl_item', None):
+                self._hl_item.setRect(rect)
         elif self.current_tool == "Line":
             end_pos = scene_pos
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -5160,6 +5236,18 @@ class EditorCanvas(QGraphicsView):
                     self.current_item.setPath(self._freehand_path)
                     if hasattr(self.current_item, 'update_base_path'):
                         self.current_item.update_base_path()
+        elif self.current_tool == "Arrow":
+            if self.current_item:
+                end_pos = scene_pos
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    dx = end_pos.x() - self.start_point.x()
+                    dy = end_pos.y() - self.start_point.y()
+                    dist = math.hypot(dx, dy)
+                    snapped_angle = round(math.degrees(math.atan2(dy, dx)) / 45) * 45
+                    end_pos = QPointF(
+                        self.start_point.x() + dist * math.cos(math.radians(snapped_angle)),
+                        self.start_point.y() + dist * math.sin(math.radians(snapped_angle)))
+                self.current_item.setLine(QLineF(self.start_point, end_pos))
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -5172,12 +5260,57 @@ class EditorCanvas(QGraphicsView):
             self.resizing_item._width_drag_active = False
         
         if self.current_tool == "Text" and self.start_point:
-            txt, ok = QInputDialog.getMultiLineText(self, "Text", "Enter text:", "")
-            if ok and txt:
-                item = HighlightTextItem(txt)
-                item.highlight_color = QColor(self.text_highlight_color)
-                item.setPos(self.start_point); self.apply_props(item)
-                self.scene.addItem(item); self.is_dirty = True
+            _pos = QPointF(self.start_point)
+            _hl  = QColor(self.text_highlight_color)
+            _col = QColor(self.stroke_color)
+            _fsz = max(1, int(self.font_size))
+
+            def _do_text_dialog():
+                txt, ok = QInputDialog.getMultiLineText(self, "Text", "Enter text:", "")
+                if ok and txt:
+                    item = HighlightTextItem(txt)
+                    item.setPlainText(txt)
+                    item.highlight_color = _hl
+                    item.setDefaultTextColor(_col)
+                    item.setFont(QFont("Arial", _fsz))
+                    item.setFlags(
+                        QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                        QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                        QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+                    item.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+                    item.setPos(_pos)
+                    self.scene.addItem(item)
+                    self.is_dirty = True
+
+            QTimer.singleShot(0, _do_text_dialog)
+        elif self.current_tool == "Bubble" and self.start_point:
+            dlg = _BubbleInputDialog(self.stroke_color, self)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                txt, fg_col, bg_col = dlg.result_data()
+                if txt.strip():
+                    item = TextBubbleItem(txt, fg_col, bg_col)
+                    item.setPos(self.start_point)
+                    item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                                  QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                                  QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+                    self.scene.addItem(item)
+                    self.is_dirty = True
+        # Highlight: finalize — remove if too small (prevents zero-rect crash)
+        elif self.current_tool == "Highlight":
+            hl = getattr(self, '_hl_item', None)
+            if hl:
+                r = hl.rect()
+                if r.width() < 3 or r.height() < 3:
+                    self.scene.removeItem(hl)
+                else:
+                    self.is_dirty = True
+            self._hl_item = None
+        # Arrow: apply pen props after drawing
+        elif self.current_tool == "Arrow" and self.current_item:
+            pen = QPen(self.stroke_color, self.stroke_width)
+            self.current_item.setPen(pen)
+            self.is_dirty = True
         # Marker is fully handled in mousePressEvent — nothing to do on release
         elif self.current_tool == "Marker":
             self.start_point = None
@@ -5196,6 +5329,29 @@ class EditorCanvas(QGraphicsView):
             if ok and txt:
                 item.setPlainText(txt)
                 self.is_dirty = True
+        elif isinstance(item, HighlightRectItem):
+            dlg = HighlightEditDialog(item._color, self)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                new_color = dlg.result_color()
+                item._color = new_color
+                item.setPen(Qt.PenStyle.NoPen)
+                item.setBrush(QBrush(new_color))
+                item.update()
+                self.is_dirty = True
+        elif isinstance(item, TextBubbleItem):
+            dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                txt, fg_col, bg_col = dlg.result_data()
+                if txt.strip():
+                    item._text = txt
+                    item._fg_color = fg_col
+                    item._bg_color = bg_col
+                    item._auto_grow()
+                    item.prepareGeometryChange()
+                    item.update()
+                    self.is_dirty = True
         else:
             super().mouseDoubleClickEvent(event)
 
@@ -5211,6 +5367,46 @@ class EditorCanvas(QGraphicsView):
                 if ok and txt:
                     item.setPlainText(txt)
                     self.is_dirty = True
+        elif isinstance(item, HighlightRectItem):
+            menu = QMenu(self)
+            edit_act = menu.addAction("✏️ Edit Highlight")
+            del_act  = menu.addAction("🗑️ Delete")
+            action = menu.exec(event.globalPos())
+            if action == edit_act:
+                dlg = HighlightEditDialog(item._color, self)
+                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    new_color = dlg.result_color()
+                    item._color = new_color
+                    item.setPen(Qt.PenStyle.NoPen)
+                    item.setBrush(QBrush(new_color))
+                    item.update()
+                    self.is_dirty = True
+            elif action == del_act:
+                self.scene.removeItem(item)
+                self.is_dirty = True
+            return
+        elif isinstance(item, TextBubbleItem):
+            menu = QMenu(self)
+            edit_act = menu.addAction("✏️ Edit Bubble")
+            del_act  = menu.addAction("🗑️ Delete")
+            action = menu.exec(event.globalPos())
+            if action == edit_act:
+                dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
+                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    txt, fg_col, bg_col = dlg.result_data()
+                    if txt.strip():
+                        item._text = txt
+                        item._fg_color = fg_col
+                        item._bg_color = bg_col
+                        item.prepareGeometryChange()
+                        item.update()
+                        self.is_dirty = True
+            elif action == del_act:
+                self.scene.removeItem(item)
+                self.is_dirty = True
+            return
         else:
             super().contextMenuEvent(event)
         if item and item != self.bg_item:
@@ -5239,8 +5435,19 @@ class EditorCanvas(QGraphicsView):
     def get_handle_at(self, pos):
         """Returns (item, handle_name) if mouse is over a resize handle of a selected item."""
         for item in self.scene.selectedItems():
-   
-             if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, CropOverlayItem, ResizablePixmapItem, FreehandItem)):
+
+            # TextBubbleItem has its own BR resize handle and cone handle
+            if isinstance(item, TextBubbleItem):
+                local_pos = item.mapFromScene(pos)
+                # Cone (spike) handle
+                if item._over_cone_handle(local_pos):
+                    return item, 'CONE'
+                # Bottom-right resize handle
+                if item._over_resize_handle_br(local_pos):
+                    return item, 'BR'
+                continue
+
+            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, CropOverlayItem, ResizablePixmapItem, FreehandItem)):
                 # Używamy lokalnych współrzędnych, żeby obrót nie psuł wykrywania krawędzi
                 local_pos = item.mapFromScene(pos)
                 rect = item.rect()
@@ -5284,6 +5491,24 @@ class EditorCanvas(QGraphicsView):
     def handle_resize_logic(self, pos, proportional):
         import math
         item = self.resizing_item
+
+        # --- TextBubbleItem: cone drag or BR resize ---
+        if isinstance(item, TextBubbleItem):
+            local_pos = item.mapFromScene(pos)
+            if self.resize_handle == 'CONE':
+                item.prepareGeometryChange()
+                item._cone_rel = QPointF(local_pos.x() - item._w / 2,
+                                         local_pos.y() - item._h / 2)
+                item.update()
+            elif self.resize_handle == 'BR':
+                new_w = max(item.MIN_SIZE, local_pos.x())
+                new_h = max(item.MIN_SIZE, local_pos.y())
+                item.prepareGeometryChange()
+                item._w = new_w
+                item._h = new_h
+                item._auto_grow()
+                item.update()
+            return
 
         # --- _MarkerItem: uniform scale only (always equal W/H) ---
         if isinstance(item, _MarkerItem):
@@ -5373,6 +5598,12 @@ class EditorCanvas(QGraphicsView):
             item.setPen(pen)
             item.prepareGeometryChange()
             item.update()
+            # Live-update the Size spinner in the toolbar
+            win = self.window()
+            if hasattr(win, 'spin'):
+                win.spin.blockSignals(True)
+                win.spin.setValue(new_w)
+                win.spin.blockSignals(False)
             return
 
         # Zastosowanie wymiarów i NAPRAWA przesunięcia po obrocie
@@ -5483,7 +5714,8 @@ class ImageEditorWindow(QMainWindow):
             tbar.addSpacing(8)
 
         for n, i in [("Select", "🖱️"), ("Crop", "📐"), ("Rectangle", "⬜"), ("Circle", "⭕"),
-                     ("Line", "📏"), ("Freehand", "✏️"), ("Text", "T"), ("Marker", "📍"), ("Eraser", "🧹")]:
+                     ("Line", "📏"), ("Arrow", "➡️"), ("Highlight", "🟨"), ("Freehand", "✏️"),
+                     ("Bubble", "💬"), ("Text", "T"), ("Marker", "📍"), ("Eraser", "🧹")]:
             b = QPushButton(i); b.setCheckable(True)
             b.setFixedSize(40, 40)  # Większy stały rozmiar
             # Styl: usunięcie marginesów i wyśrodkowanie tekstu/emoji
@@ -5537,7 +5769,7 @@ class ImageEditorWindow(QMainWindow):
         
         # Row 2: Props
         pbar = QHBoxLayout()
-        self.btn_c = QPushButton("Color / Alpha")
+        self.btn_c = QPushButton("🎨Color / Alpha")
         self.btn_c.clicked.connect(self.pick_color)
         pbar.addWidget(self.btn_c)
         
@@ -5546,10 +5778,19 @@ class ImageEditorWindow(QMainWindow):
         pbar.addWidget(self.btn_hc)
         
         pbar.addWidget(QLabel("Size:"))
-        
-        self.spin = QSpinBox(); self.spin.setRange(1,200); self.spin.setValue(40)
-        self.spin.valueChanged.connect(self.update_live_props)
+
+        self.spin = QSpinBox(); self.spin.setRange(1, 200); self.spin.setValue(3)
+        self.spin.setToolTip("Font size for text tools / Stroke width for shape tools")
+        self.spin.valueChanged.connect(self._on_size_spin_changed)
         pbar.addWidget(self.spin)
+
+        # Hidden legacy stroke spinner — kept so existing update_live_props references don't break
+        self.lbl_stroke = QLabel()
+        self.lbl_stroke.hide()
+        self.spin_stroke = QSpinBox(); self.spin_stroke.setRange(1, 100); self.spin_stroke.setValue(3)
+        self.spin_stroke.hide()
+        self.spin_stroke.valueChanged.connect(self.update_live_props)
+
         self.fill = QCheckBox("Fill Shape"); self.fill.stateChanged.connect(self.update_live_props)
         pbar.addWidget(self.fill)
         pbar.addStretch()
@@ -5573,7 +5814,11 @@ class ImageEditorWindow(QMainWindow):
     def select_tool(self, name):
         self.canvas.current_tool = name
         for n, b in self.btns.items(): b.setChecked(n == name)
-        
+
+        # Size spinner is always visible — label changes based on tool context
+        # (stroke_tools use it as border width, text tools as font size)
+        pass  # lbl_stroke and spin_stroke are permanently hidden (unified into self.spin)
+
         # Zarządzanie widocznością i cyklem życia nakładki Crop
         if name == "Crop":
             self.btn_apply_crop.show()
@@ -5636,14 +5881,48 @@ class ImageEditorWindow(QMainWindow):
                 self.update_live_props()
 
     def update_live_props(self):
-        self.canvas.stroke_width = self.spin.value()
+        self.canvas.stroke_width = self.spin_stroke.value()
         self.canvas.font_size = self.spin.value()
         self.canvas.is_filled = self.fill.isChecked()
 
+    def _on_size_spin_changed(self, value):
+        """Called when the user manually changes the Size spinner.
+        Updates canvas properties AND live-updates any selected items."""
+        selected = self.canvas.scene.selectedItems()
+        text_tools = {"Text"}
+        is_text_tool = self.canvas.current_tool in text_tools
+
+        if selected:
+            for item in selected:
+                if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+                    # Live-update font size
+                    f = item.font()
+                    f.setPointSize(max(1, value))
+                    item.setFont(f)
+                    self.canvas.is_dirty = True
+                elif hasattr(item, 'pen') and hasattr(item, 'setPen'):
+                    # Live-update stroke width for shape/line/arrow items
+                    pen = item.pen()
+                    pen.setWidth(max(1, value))
+                    item.setPen(pen)
+                    if hasattr(item, 'prepareGeometryChange'):
+                        item.prepareGeometryChange()
+                    item.update()
+                    self.canvas.is_dirty = True
+
+        # Always sync canvas props for newly drawn items
+        self.canvas.stroke_width = value
+        self.spin_stroke.setValue(value)   # keep hidden legacy spinner in sync
+        self.canvas.font_size = value
+        self.canvas.is_filled = self.fill.isChecked()
+
     def _sync_spin_from_selection(self):
-        """Read font size from a selected text item and update the Size spinner."""
-        for item in self.canvas.scene.selectedItems():
+        """Read stroke width or font size from selected items and update the Size spinner."""
+        selected = self.canvas.scene.selectedItems()
+
+        for item in selected:
             if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+                # Text item — read font size
                 size = item.font().pointSize()
                 if size > 0:
                     self.spin.blockSignals(True)
@@ -5651,20 +5930,22 @@ class ImageEditorWindow(QMainWindow):
                     self.spin.blockSignals(False)
                     self.canvas.font_size = size
                 return
-        
-        # Jeśli użytkownik nie chce wypełnienia, ustawiamy kolor wypełnienia na przezroczysty
-        # ale jeśli CHCE, to bierzemy kolor wybrany w pick_color (który ma już w sobie Alpha)
+            elif hasattr(item, 'pen') and callable(item.pen):
+                # Shape / line / arrow — read pen width
+                width = item.pen().width()
+                if width > 0:
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(width)
+                    self.spin.blockSignals(False)
+                    self.canvas.stroke_width = width
+                    self.spin_stroke.setValue(width)
+                return
+
+        # No selection — just sync fill colour
         if not self.canvas.is_filled:
             self.canvas.fill_color = QColor(0, 0, 0, 0)
         else:
             self.canvas.fill_color = self.canvas.stroke_color
-
-        for item in self.canvas.scene.selectedItems():
-            self.canvas.apply_props(item)
-        self.canvas.is_dirty = True
-        for item in self.canvas.scene.selectedItems():
-            self.canvas.apply_props(item)
-            self.canvas.is_dirty = True
     def pick_highlight_color(self):
         dialog = QColorDialog(self.canvas.text_highlight_color, self)
         dialog.setWindowTitle("Pick Text Highlight Color & Alpha")
