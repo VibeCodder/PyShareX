@@ -5937,6 +5937,27 @@ class ImageEditorWindow(QMainWindow):
             return
 
         # ── Normal editor mode: crop the canvas as before ──────────────────────
+        dx = crop_rect.x()
+        dy = crop_rect.y()
+        
+        # Crop the background pixmap
+        cropped_pixmap = self.canvas.bg_pixmap.copy(crop_rect.toRect())
+        self.canvas.bg_pixmap = cropped_pixmap
+        self.canvas.bg_item.setPixmap(cropped_pixmap)
+        
+        # Shift all annotations so they stay in the same visual place relative to the background
+        for item in self.canvas.scene.items():
+            if item != self.canvas.bg_item and item != self.canvas.crop_item:
+                item.setPos(item.pos().x() - dx, item.pos().y() - dy)
+                
+        # Remove the crop overlay
+        self.canvas.scene.removeItem(self.canvas.crop_item)
+        self.canvas.crop_item = None
+        self.btn_apply_crop.hide()
+        
+        # Mark as dirty and return to Select tool
+        self.canvas.is_dirty = True
+        self.select_tool("Select")
 
     def pick_color(self):
         selected = self.canvas.scene.selectedItems()
@@ -6142,15 +6163,15 @@ class ImageEditorWindow(QMainWindow):
         self.close()
     
     def copy_to_clipboard(self):
-        self.canvas.scene.clearSelection()
-        rect = self.canvas.scene.sceneRect()
-        pixmap = QPixmap(int(rect.width()), int(rect.height()))
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        self.canvas.scene.render(painter)
-        painter.end()
-        QApplication.clipboard().setPixmap(pixmap)
-        QMessageBox.information(self, "Success", "Image copied to clipboard!")
+        try:
+            # Re-use your existing render_scene() logic which safely bounds
+            # the rendering to the actual image, ignoring the infinite canvas.
+            img = self.render_scene()
+            pixmap = QPixmap.fromImage(img)
+            QApplication.clipboard().setPixmap(pixmap)
+            QMessageBox.information(self, "Success", "Image copied to clipboard!")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to copy image: {e}")
 
 
     
