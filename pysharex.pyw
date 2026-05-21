@@ -1672,7 +1672,7 @@ class HighlightRectItem(QGraphicsRectItem):
 
     def __init__(self, rect=QRectF(), parent=None):
         super().__init__(rect, parent)
-        self.highlight_color = QColor(255, 255, 0, 100)  # Semi-transparent yellow
+        self._color = QColor(255, 255, 0, 100)  # Semi-transparent yellow
         self.setPen(QPen(Qt.PenStyle.NoPen))
 
     def boundingRect(self):
@@ -1686,7 +1686,7 @@ class HighlightRectItem(QGraphicsRectItem):
     def paint(self, painter, option, widget=None):
         painter.save()
         # Use fillRect instead of drawRect to safely support QRectF bounding boxes without crashing
-        painter.fillRect(self.rect(), QBrush(self.highlight_color))
+        painter.fillRect(self.rect(), QBrush(self._color))
         # Draw dashed selection border when selected
         if self.isSelected():
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
@@ -2500,11 +2500,17 @@ class _TextInputDialog(QDialog):
             c = dlg.selectedColor()
             if c.isValid():
                 self.highlight = c
+                self._update_btn_color()
 
     def _update_btn_color(self):
         c = self.color
         self.btn_col.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); color: white;")
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"color: {'black' if c.lightness() > 128 else 'white'}; border: 1px solid #888;")
+        hl = self.highlight
+        self.btn_hl.setStyleSheet(
+            f"background: rgba({hl.red()},{hl.green()},{hl.blue()},{hl.alphaF():.2f}); "
+            f"color: {'black' if hl.lightness() > 128 else 'white'}; border: 1px solid #888;")
 
     def result_data(self):
         return self.edit.toPlainText(), self.sz.value(), self.color, self.highlight
@@ -3322,33 +3328,8 @@ class EnhancedRegionSelector(QWidget):
             scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
             item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
             
-            if isinstance(item, HighlightTextItem):
-                self._toolbar.hide()
-                self.releaseKeyboard() 
-                
-                # Pre-fill dialog with existing text item data
-                dlg = _TextInputDialog(item.defaultTextColor(), None)
-                dlg.edit.setPlainText(item.toPlainText())
-                dlg.sz.setValue(item.font().pointSize())
-                if hasattr(item, 'highlight_color'):
-                    dlg.highlight = item.highlight_color
-                
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    txt, fsz, col, hl = dlg.result_data()
-                    if txt.strip():
-                        item.setPlainText(txt)
-                        item.setFont(QFont("Arial", fsz))
-                        item.setDefaultTextColor(col)
-                        item.highlight_color = hl
-                        item.update()
-                    else:
-                        self._canvas._scene.removeItem(item)
-                
-                self._toolbar.show()
-                self.activateWindow()
-                self.setFocus()
-                self.grabKeyboard()
+            if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+                self._edit_text(item)
 
             elif isinstance(item, HighlightRectItem):
                 self._edit_highlight(item)
@@ -3358,6 +3339,35 @@ class EnhancedRegionSelector(QWidget):
 
             elif isinstance(item, _MarkerItem):
                 self._edit_marker(item)
+
+    def _edit_text(self, item):
+        self._toolbar.hide()
+        self.releaseKeyboard() 
+        
+        # Pre-fill dialog with existing text item data
+        dlg = _TextInputDialog(item.defaultTextColor(), None)
+        dlg.edit.setPlainText(item.toPlainText())
+        dlg.sz.setValue(item.font().pointSize())
+        if hasattr(item, 'highlight_color'):
+            dlg.highlight = item.highlight_color
+            dlg._update_btn_color()
+        
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            txt, fsz, col, hl = dlg.result_data()
+            if txt.strip():
+                item.setPlainText(txt)
+                item.setFont(QFont("Arial", fsz))
+                item.setDefaultTextColor(col)
+                item.highlight_color = hl
+                item.update()
+            else:
+                self._canvas._scene.removeItem(item)
+        
+        self._toolbar.show()
+        self.activateWindow()
+        self.setFocus()
+        self.grabKeyboard()
 
     def _edit_bubble(self, item):
         self._toolbar.hide()
@@ -3417,7 +3427,15 @@ class EnhancedRegionSelector(QWidget):
         item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
         if item is not None:
             menu = QMenu(self)
-            if isinstance(item, TextBubbleItem):
+            if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+                edit_act = menu.addAction("✏️ Edit Text")
+                del_act  = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action == edit_act:
+                    self._edit_text(item)
+                elif action == del_act:
+                    self._canvas._scene.removeItem(item)
+            elif isinstance(item, TextBubbleItem):
                 edit_act = menu.addAction("✏️ Edit")
                 del_act  = menu.addAction("🗑️ Delete")
                 action = menu.exec(e.globalPos())
@@ -3434,7 +3452,7 @@ class EnhancedRegionSelector(QWidget):
                 elif action == del_act:
                     self._canvas._scene.removeItem(item)
             elif isinstance(item, HighlightRectItem):
-                edit_act = menu.addAction("✏️ Edit")
+                edit_act = menu.addAction("✏️ Edit Highlight")
                 del_act  = menu.addAction("🗑️ Delete")
                 action = menu.exec(e.globalPos())
                 if action == edit_act:
@@ -5034,6 +5052,31 @@ class ResizablePixmapItem(QGraphicsRectItem):
     def boundingRect(self):
         return super().boundingRect().adjusted(-5, -50, 5, 5)
 
+class ImageEditorTextDialog(QDialog):
+    def __init__(self, text="", font_size=40, parent=None):
+        super().__init__(parent, Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Edit Text")
+        lay = QVBoxLayout(self)
+        
+        lay.addWidget(QLabel("Text:"))
+        self.edit = QTextEdit()
+        self.edit.setPlainText(text)
+        self.edit.setMinimumHeight(100)
+        lay.addWidget(self.edit)
+        
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Font size:"))
+        self.spin_size = QSpinBox()
+        self.spin_size.setRange(1, 200)
+        self.spin_size.setValue(font_size)
+        row.addWidget(self.spin_size)
+        lay.addLayout(row)
+        
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
 class EditorCanvas(QGraphicsView):
     def __init__(self, pixmap, parent=None):
         super().__init__(parent)
@@ -5067,6 +5110,7 @@ class EditorCanvas(QGraphicsView):
         self.font_size = 40
         self.is_filled = False
         self.text_highlight_color = QColor(255, 255, 0, 255)
+        self.highlight_tool_color = QColor(255, 255, 0, 90)
         self._pan_start = None
         
         # Massive sceneRect allows infinite panning regardless of zoom
@@ -5138,7 +5182,7 @@ class EditorCanvas(QGraphicsView):
         elif self.current_tool == "Highlight":
             self._hl_item = HighlightRectItem()
             self._hl_item.setRect(QRectF(self.start_point, self.start_point))
-            self._hl_item._color = QColor(self.text_highlight_color)
+            self._hl_item._color = QColor(self.highlight_tool_color)
             self._hl_item.setFlags(
                 QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
                 QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
@@ -5266,21 +5310,30 @@ class EditorCanvas(QGraphicsView):
             _fsz = max(1, int(self.font_size))
 
             def _do_text_dialog():
-                txt, ok = QInputDialog.getMultiLineText(self, "Text", "Enter text:", "")
-                if ok and txt:
-                    item = HighlightTextItem(txt)
-                    item.setPlainText(txt)
-                    item.highlight_color = _hl
-                    item.setDefaultTextColor(_col)
-                    item.setFont(QFont("Arial", _fsz))
-                    item.setFlags(
-                        QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
-                        QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
-                        QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
-                    item.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-                    item.setPos(_pos)
-                    self.scene.addItem(item)
-                    self.is_dirty = True
+                dlg = ImageEditorTextDialog("", _fsz, self)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    txt = dlg.edit.toPlainText()
+                    new_fsz = dlg.spin_size.value()
+                    if txt.strip():
+                        self.font_size = new_fsz
+                        if hasattr(self.window(), 'spin'):
+                            self.window().spin.blockSignals(True)
+                            self.window().spin.setValue(new_fsz)
+                            self.window().spin.blockSignals(False)
+                            
+                        item = HighlightTextItem(txt)
+                        item.setPlainText(txt)
+                        item.highlight_color = _hl
+                        item.setDefaultTextColor(_col)
+                        item.setFont(QFont("Arial", new_fsz))
+                        item.setFlags(
+                            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+                        item.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+                        item.setPos(_pos)
+                        self.scene.addItem(item)
+                        self.is_dirty = True
 
             QTimer.singleShot(0, _do_text_dialog)
         elif self.current_tool == "Bubble" and self.start_point:
@@ -5325,17 +5378,30 @@ class EditorCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         item = self.scene.itemAt(scene_pos, self.transform())
         if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-            txt, ok = QInputDialog.getMultiLineText(self, "Edit Text", "Update text:", item.toPlainText())
-            if ok and txt:
-                item.setPlainText(txt)
-                self.is_dirty = True
+            current_fsz = item.font().pointSize()
+            dlg = ImageEditorTextDialog(item.toPlainText(), current_fsz, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                txt = dlg.edit.toPlainText()
+                new_fsz = dlg.spin_size.value()
+                if txt.strip():
+                    item.setPlainText(txt)
+                    item.setFont(QFont("Arial", new_fsz))
+                    self.font_size = new_fsz
+                    if hasattr(self.window(), 'spin'):
+                        self.window().spin.blockSignals(True)
+                        self.window().spin.setValue(new_fsz)
+                        self.window().spin.blockSignals(False)
+                    self.is_dirty = True
+                else:
+                    self.scene.removeItem(item)
+                    self.is_dirty = True
         elif isinstance(item, HighlightRectItem):
             dlg = HighlightEditDialog(item._color, self)
             dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 new_color = dlg.result_color()
                 item._color = new_color
-                item.setPen(Qt.PenStyle.NoPen)
+                item.setPen(QPen(Qt.PenStyle.NoPen))
                 item.setBrush(QBrush(new_color))
                 item.update()
                 self.is_dirty = True
@@ -5363,10 +5429,23 @@ class EditorCanvas(QGraphicsView):
             edit_action = menu.addAction("✏️ Edit Text")
             action = menu.exec(event.globalPos())
             if action == edit_action:
-                txt, ok = QInputDialog.getMultiLineText(self, "Edit Text", "Update text:", item.toPlainText())
-                if ok and txt:
-                    item.setPlainText(txt)
-                    self.is_dirty = True
+                current_fsz = item.font().pointSize()
+                dlg = ImageEditorTextDialog(item.toPlainText(), current_fsz, self)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    txt = dlg.edit.toPlainText()
+                    new_fsz = dlg.spin_size.value()
+                    if txt.strip():
+                        item.setPlainText(txt)
+                        item.setFont(QFont("Arial", new_fsz))
+                        self.font_size = new_fsz
+                        if hasattr(self.window(), 'spin'):
+                            self.window().spin.blockSignals(True)
+                            self.window().spin.setValue(new_fsz)
+                            self.window().spin.blockSignals(False)
+                        self.is_dirty = True
+                    else:
+                        self.scene.removeItem(item)
+                        self.is_dirty = True
         elif isinstance(item, HighlightRectItem):
             menu = QMenu(self)
             edit_act = menu.addAction("✏️ Edit Highlight")
@@ -5378,7 +5457,7 @@ class EditorCanvas(QGraphicsView):
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     new_color = dlg.result_color()
                     item._color = new_color
-                    item.setPen(Qt.PenStyle.NoPen)
+                    item.setPen(QPen(Qt.PenStyle.NoPen))
                     item.setBrush(QBrush(new_color))
                     item.update()
                     self.is_dirty = True
@@ -5407,28 +5486,6 @@ class EditorCanvas(QGraphicsView):
                 self.scene.removeItem(item)
                 self.is_dirty = True
             return
-        else:
-            super().contextMenuEvent(event)
-        if item and item != self.bg_item:
-            menu = QMenu(self)
-            
-            # Jeśli obiekt jest obrócony, pokaż opcję resetu
-            if abs(item.rotation()) > 0.1:
-                reset_rot = menu.addAction("🔄 Reset rotation")
-                reset_rot.triggered.connect(lambda: item.setRotation(0))
-                menu.addSeparator()
-
-            del_act = menu.addAction("Delete")
-            del_act.triggered.connect(lambda: self.scene.removeItem(item))
-            
-            # Pobieranie koloru dla menu (zachowanie Twojej logiki)
-            curr_col = QColor(Qt.GlobalColor.white)
-            if hasattr(item, 'pen'): curr_col = item.pen().color()
-            
-            color_act = menu.addAction("Change Color")
-            color_act.triggered.connect(lambda: self._change_item_color(item, curr_col))
-            
-            menu.exec(event.globalPos())
         else:
             super().contextMenuEvent(event)
 
@@ -5773,8 +5830,9 @@ class ImageEditorWindow(QMainWindow):
         self.btn_c.clicked.connect(self.pick_color)
         pbar.addWidget(self.btn_c)
         
-        self.btn_hc = QPushButton("Highlight")
+        self.btn_hc = QPushButton("Text Highlight")
         self.btn_hc.clicked.connect(self.pick_highlight_color)
+        self.btn_hc.hide()
         pbar.addWidget(self.btn_hc)
         
         pbar.addWidget(QLabel("Size:"))
@@ -5815,9 +5873,29 @@ class ImageEditorWindow(QMainWindow):
         self.canvas.current_tool = name
         for n, b in self.btns.items(): b.setChecked(n == name)
 
+        if name in ["Rectangle", "Circle"]:
+            self.fill.show()
+        elif name == "Select" and any(isinstance(i, (ResizableRectItem, ResizableEllipseItem)) for i in self.canvas.scene.selectedItems()):
+            self.fill.show()
+        else:
+            self.fill.hide()
+
+        # Show Text Highlight button only if Text tool is active or Text item is selected
+        if name == "Text":
+            self.btn_hc.show()
+        elif name == "Select" and any(isinstance(i, (HighlightTextItem, QGraphicsTextItem)) for i in self.canvas.scene.selectedItems()):
+            self.btn_hc.show()
+        else:
+            self.btn_hc.hide()
+
         # Size spinner is always visible — label changes based on tool context
         # (stroke_tools use it as border width, text tools as font size)
-        pass  # lbl_stroke and spin_stroke are permanently hidden (unified into self.spin)
+        self.spin.blockSignals(True)
+        if name == "Text":
+            self.spin.setValue(self.canvas.font_size)
+        else:
+            self.spin.setValue(self.canvas.stroke_width)
+        self.spin.blockSignals(False)
 
         # Zarządzanie widocznością i cyklem życia nakładki Crop
         if name == "Crop":
@@ -5861,29 +5939,76 @@ class ImageEditorWindow(QMainWindow):
         # ── Normal editor mode: crop the canvas as before ──────────────────────
 
     def pick_color(self):
-        # Tworzymy instancję okna zamiast metody statycznej
+        selected = self.canvas.scene.selectedItems()
+        
+        # Check if we should open HighlightEditDialog instead of generic color picker
+        is_highlight_selected = selected and isinstance(selected[0], HighlightRectItem)
+        if is_highlight_selected or (not selected and self.canvas.current_tool == "Highlight"):
+            initial_color = selected[0]._color if is_highlight_selected else self.canvas.highlight_tool_color
+            dlg = HighlightEditDialog(initial_color, self)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                new_color = dlg.result_color()
+                if is_highlight_selected:
+                    item = selected[0]
+                    item._color = new_color
+                    item.setPen(QPen(Qt.PenStyle.NoPen))
+                    item.setBrush(QBrush(new_color))
+                    item.update()
+                else:
+                    self.canvas.highlight_tool_color = new_color
+                self.canvas.is_dirty = True
+            return
+
         dialog = QColorDialog(self.canvas.stroke_color, self)
         dialog.setWindowTitle("Pick Color & Alpha")
-        
-        # Kluczowa linia: ShowAlphaChannel dodaje suwak, DontUseNativeDialog wyłącza stare okno Windowsa
         dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        
+
         if dialog.exec():
             c = dialog.selectedColor()
             if c.isValid():
                 self.canvas.stroke_color = c
                 self.canvas.fill_color = c
-                
-                # Odświeżamy podgląd na przycisku (obsługa przezroczystości w podglądzie)
+
+                # Update color preview button
                 rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
                 self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
                 self.update_live_props()
+
+                # Live-apply color to all currently selected items
+                for item in self.canvas.scene.selectedItems():
+                    if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+                        item.setDefaultTextColor(c)
+                        self.canvas.is_dirty = True
+                    elif isinstance(item, HighlightRectItem):
+                        pass # Highlight shape has its own dialog now
+                    else:
+                        if hasattr(item, 'setPen') and hasattr(item, 'pen'):
+                            pen = item.pen()
+                            pen.setColor(c)
+                            item.setPen(pen)
+                        if hasattr(item, 'setBrush') and self.canvas.is_filled and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+                            item.setBrush(QBrush(c))
+                        item.update()
+                        self.canvas.is_dirty = True
 
     def update_live_props(self):
         self.canvas.stroke_width = self.spin_stroke.value()
         self.canvas.font_size = self.spin.value()
         self.canvas.is_filled = self.fill.isChecked()
+        
+        if self.canvas.is_filled:
+            self.canvas.fill_color = QColor(self.canvas.stroke_color)
+        else:
+            self.canvas.fill_color = QColor(0, 0, 0, 0)
+            
+        for item in self.canvas.scene.selectedItems():
+            if hasattr(item, 'setBrush') and not isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+                brush = QBrush(self.canvas.fill_color if self.canvas.is_filled else Qt.GlobalColor.transparent)
+                item.setBrush(brush)
+                item.update()
+                self.canvas.is_dirty = True
 
     def _on_size_spin_changed(self, value):
         """Called when the user manually changes the Size spinner.
@@ -5919,6 +6044,26 @@ class ImageEditorWindow(QMainWindow):
     def _sync_spin_from_selection(self):
         """Read stroke width or font size from selected items and update the Size spinner."""
         selected = self.canvas.scene.selectedItems()
+
+        # Update Fill Checkbox visibility and state
+        if self.canvas.current_tool == "Select":
+            if selected and isinstance(selected[0], (ResizableRectItem, ResizableEllipseItem)):
+                self.fill.show()
+                brush = selected[0].brush()
+                is_filled = brush.style() != Qt.BrushStyle.NoBrush and brush.color().alpha() > 0
+                self.fill.blockSignals(True)
+                self.fill.setChecked(is_filled)
+                self.fill.blockSignals(False)
+                self.canvas.is_filled = is_filled
+                self.canvas.fill_color = brush.color() if is_filled else QColor(0, 0, 0, 0)
+            else:
+                self.fill.hide()
+
+            # Show Text Highlight button if Text item is selected
+            if selected and any(isinstance(i, (HighlightTextItem, QGraphicsTextItem)) for i in selected):
+                self.btn_hc.show()
+            else:
+                self.btn_hc.hide()
 
         for item in selected:
             if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
