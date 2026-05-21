@@ -5115,7 +5115,12 @@ class EditorCanvas(QGraphicsView):
         
         # Massive sceneRect allows infinite panning regardless of zoom
         bg_rect = QRectF(pixmap.rect())
-        self.scene.setSceneRect(bg_rect.center().x() - 50000, bg_rect.center().y() - 50000, 100000, 100000) # Domyślnie przeźroczysty
+        self.scene.setSceneRect(bg_rect.center().x() - 50000, bg_rect.center().y() - 50000, 100000, 100000)
+
+        # Pre-bake checkerboard tile into a QPixmap once — reused every paint call
+        self._checker_tile = self._make_checker_tile(10, QColor(65, 65, 65), QColor(96, 96, 96))
+        self._checker_cache: QPixmap | None = None   # full-size cache, rebuilt on image resize
+        self._checker_cache_size: tuple[int, int] = (-1, -1)
 
     def keyPressEvent(self, event):
         """Handle Delete key to remove selected items."""
@@ -5677,17 +5682,51 @@ class EditorCanvas(QGraphicsView):
                 self.scene.removeItem(item)
                 self.is_dirty = True
 
+    @staticmethod
+    def _make_checker_tile(tile: int, dark: QColor, light: QColor) -> QPixmap:
+        """Build a 2×2-tile QPixmap used as a brush — created once, never changed."""
+        pm = QPixmap(tile * 2, tile * 2)
+        pm.fill(dark)
+        p = QPainter(pm)
+        p.fillRect(0,    0,    tile, tile, light)
+        p.fillRect(tile, tile, tile, tile, light)
+        p.end()
+        return pm
+
+    def _get_checker_cache(self, w: int, h: int) -> QPixmap:
+        """Return a full-image-size checkerboard pixmap, rebuilt only when size changes."""
+        if (w, h) == self._checker_cache_size and self._checker_cache is not None:
+            return self._checker_cache
+        pm = QPixmap(w, h)
+        p = QPainter(pm)
+        p.drawTiledPixmap(0, 0, w, h, self._checker_tile)
+        p.end()
+        self._checker_cache = pm
+        self._checker_cache_size = (w, h)
+        return pm
+
     def drawBackground(self, painter, rect):
         super().drawBackground(painter, rect)
         # Base visual boundaries on the image, not the massive sceneRect
         bg_rect = self.bg_item.sceneBoundingRect() if hasattr(self, 'bg_item') and self.bg_item else self.scene.sceneRect()
+
+        # ── Checkerboard (transparent background indicator) ───────────────────
+        # drawTiledPixmap is a single GPU blit — zero per-tile Python overhead
+        w, h = int(bg_rect.width()), int(bg_rect.height())
+        if w > 0 and h > 0:
+            checker = self._get_checker_cache(w, h)
+            painter.drawPixmap(bg_rect.topLeft(), checker)
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Dark overlay outside the image
         path = QPainterPath()
         path.setFillRule(Qt.FillRule.OddEvenFill)
-        path.addRect(QRectF(-500000, -500000, 1000000, 1000000)) 
-        path.addRect(bg_rect)                             
-        painter.fillPath(path, QColor(0, 0, 0, 120)) 
-        
-        pen = QPen(QColor(137, 180, 250), 2, Qt.PenStyle.DashLine) 
+        path.addRect(QRectF(-500000, -500000, 1000000, 1000000))
+        path.addRect(bg_rect)
+        painter.fillPath(path, QColor(0, 0, 0, 120))
+
+        # Blue dashed border around the image
+        pen = QPen(QColor(137, 180, 250), 2, Qt.PenStyle.DashLine)
         painter.setPen(pen)
         painter.setBrush(Qt.GlobalColor.transparent)
         painter.drawRect(bg_rect)
@@ -5936,25 +5975,61 @@ class ImageEditorWindow(QMainWindow):
             self._finish_annotated_capture(crop_rect)
             return
 
-        # ── Normal editor mode: crop the canvas as before ──────────────────────
-        dx = crop_rect.x()
-        dy = crop_rect.y()
-        
-        # Crop the background pixmap
-        cropped_pixmap = self.canvas.bg_pixmap.copy(crop_rect.toRect())
-        self.canvas.bg_pixmap = cropped_pixmap
-        self.canvas.bg_item.setPixmap(cropped_pixmap)
-        
-        # Shift all annotations so they stay in the same visual place relative to the background
-        for item in self.canvas.scene.items():
-            if item != self.canvas.bg_item and item != self.canvas.crop_item:
-                item.setPos(item.pos().x() - dx, item.pos().y() - dy)
-                
+        # ── Normal editor mode: crop or expand the canvas ──────────────────────
+        bg_rect = self.canvas.bg_item.sceneBoundingRect()
+
+        # Detect if the crop rect extends beyond the current image (= expand canvas)
+        expand = not bg_rect.contains(crop_rect)
+
+        if expand:
+            # ── Expand Canvas mode ──────────────────────────────────────────────
+            # Union of current image and the crop rect gives the new canvas bounds
+            new_rect = bg_rect.united(crop_rect)
+
+            # Offset: how much the image origin shifts inside the new canvas
+            dx = bg_rect.x() - new_rect.x()
+            dy = bg_rect.y() - new_rect.y()
+
+            # Create new transparent pixmap (ARGB) and paint old image into it
+            new_w = int(new_rect.width())
+            new_h = int(new_rect.height())
+            new_pixmap = QPixmap(new_w, new_h)
+            new_pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(new_pixmap)
+            painter.drawPixmap(int(dx), int(dy), self.canvas.bg_pixmap)
+            painter.end()
+
+            self.canvas.bg_pixmap = new_pixmap
+            self.canvas.bg_item.setPixmap(new_pixmap)
+            self.canvas.bg_item.setPos(new_rect.topLeft())
+
+            # Shift all annotations to match the new origin
+            for item in self.canvas.scene.items():
+                if item != self.canvas.bg_item and item != self.canvas.crop_item:
+                    item.setPos(item.pos().x() + dx, item.pos().y() + dy)
+
+        else:
+            # ── Crop mode (rectangle fully inside image) ────────────────────────
+            dx = crop_rect.x()
+            dy = crop_rect.y()
+
+            cropped_pixmap = self.canvas.bg_pixmap.copy(
+                crop_rect.translated(-bg_rect.topLeft()).toRect()
+            )
+            self.canvas.bg_pixmap = cropped_pixmap
+            self.canvas.bg_item.setPixmap(cropped_pixmap)
+            self.canvas.bg_item.setPos(crop_rect.topLeft())
+
+            # Shift all annotations so they stay aligned with the background
+            for item in self.canvas.scene.items():
+                if item != self.canvas.bg_item and item != self.canvas.crop_item:
+                    item.setPos(item.pos().x() - dx, item.pos().y() - dy)
+
         # Remove the crop overlay
         self.canvas.scene.removeItem(self.canvas.crop_item)
         self.canvas.crop_item = None
         self.btn_apply_crop.hide()
-        
+
         # Mark as dirty and return to Select tool
         self.canvas.is_dirty = True
         self.select_tool("Select")
