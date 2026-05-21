@@ -2891,7 +2891,11 @@ class EnhancedRegionSelector(QWidget):
                 self._color_preview.setStyleSheet(
                     f"background:{c.name()}; border:1px solid white; border-radius:3px;")
                 if apply_to_item is not None:
-                    self._canvas._apply_props(apply_to_item, c, self._draw_width)
+                    # Preserve the item's current pen width instead of resetting to default
+                    current_width = (apply_to_item.pen().width()
+                                     if hasattr(apply_to_item, 'pen')
+                                     else self._draw_width)
+                    self._canvas._apply_props(apply_to_item, c, current_width)
                     if hasattr(apply_to_item, 'setDefaultTextColor'):
                         apply_to_item.setDefaultTextColor(c)
                     apply_to_item.update()
@@ -5006,9 +5010,9 @@ class EditorCanvas(QGraphicsView):
         self.stroke_color = QColor(255, 0, 0, 255)
         self.fill_color = QColor(255, 0, 0, 0)
         self.stroke_width = 3
-        self.font_size = 14
+        self.font_size = 40
         self.is_filled = False
-        self.text_highlight_color = QColor(255, 255, 0, 0)
+        self.text_highlight_color = QColor(255, 255, 0, 255)
         self._pan_start = None
         
         # Massive sceneRect allows infinite panning regardless of zoom
@@ -5163,11 +5167,15 @@ class EditorCanvas(QGraphicsView):
             self.update_cursor_by_handle(None)
             self._pan_start = None
             return
+        # Reset WIDTH drag state on release
+        if self.resizing_item and hasattr(self.resizing_item, '_width_drag_active'):
+            self.resizing_item._width_drag_active = False
         
         if self.current_tool == "Text" and self.start_point:
             txt, ok = QInputDialog.getMultiLineText(self, "Text", "Enter text:", "")
             if ok and txt:
-                item = HighlightTextItem(txt, self.text_highlight_color)
+                item = HighlightTextItem(txt)
+                item.highlight_color = QColor(self.text_highlight_color)
                 item.setPos(self.start_point); self.apply_props(item)
                 self.scene.addItem(item); self.is_dirty = True
         # Marker is fully handled in mousePressEvent — nothing to do on release
@@ -5237,6 +5245,13 @@ class EditorCanvas(QGraphicsView):
                 local_pos = item.mapFromScene(pos)
                 rect = item.rect()
                 m = 10 / self.transform().m11() # Scale-aware margin
+
+                # Width handle (yellow dot below bottom edge) for Rect and Ellipse — check FIRST
+                if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+                    wp = item._width_handle_pos()
+                    hit_radius = 14 / self.transform().m11()
+                    if math.hypot(local_pos.x() - wp.x(), local_pos.y() - wp.y()) <= hit_radius:
+                        return item, 'WIDTH'
                 
                 # Rotation handle — disabled for markers (they scale uniformly instead)
                 if not isinstance(item, (CropOverlayItem, _MarkerItem)):
@@ -5260,6 +5275,7 @@ class EditorCanvas(QGraphicsView):
     def update_cursor_by_handle(self, handle):
         if not handle: self.setCursor(Qt.CursorShape.ArrowCursor)
         elif handle == 'ROTATE': self.setCursor(Qt.CursorShape.PointingHandCursor)
+        elif handle == 'WIDTH': self.setCursor(Qt.CursorShape.SizeVerCursor)
         elif handle in ['TL', 'BR']: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
         elif handle in ['TR', 'BL']: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
         elif handle in ['L', 'R']: self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -5343,6 +5359,22 @@ class EditorCanvas(QGraphicsView):
         # if isinstance(item, CropOverlayItem):
         #     new_rect = new_rect.intersected(self.scene.sceneRect())
             
+        # Width handle drag — change pen width vertically
+        if self.resize_handle == 'WIDTH' and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+            local_pos = item.mapFromScene(pos)
+            if not getattr(item, '_width_drag_active', False):
+                item._width_drag_active = True
+                item._width_drag_start_pos = local_pos
+                item._width_drag_start_w = item.pen().width()
+            dy = local_pos.y() - item._width_drag_start_pos.y()
+            new_w = max(1, int(item._width_drag_start_w + dy * 0.3))
+            pen = item.pen()
+            pen.setWidth(new_w)
+            item.setPen(pen)
+            item.prepareGeometryChange()
+            item.update()
+            return
+
         # Zastosowanie wymiarów i NAPRAWA przesunięcia po obrocie
         item.setRect(new_rect)
         item.setTransformOriginPoint(new_rect.center())
@@ -5515,7 +5547,7 @@ class ImageEditorWindow(QMainWindow):
         
         pbar.addWidget(QLabel("Size:"))
         
-        self.spin = QSpinBox(); self.spin.setRange(1,100); self.spin.setValue(3)
+        self.spin = QSpinBox(); self.spin.setRange(1,200); self.spin.setValue(40)
         self.spin.valueChanged.connect(self.update_live_props)
         pbar.addWidget(self.spin)
         self.fill = QCheckBox("Fill Shape"); self.fill.stateChanged.connect(self.update_live_props)
@@ -5525,6 +5557,7 @@ class ImageEditorWindow(QMainWindow):
 
         self.canvas = EditorCanvas(pixmap)
         layout.addWidget(self.canvas)
+        self.canvas.scene.selectionChanged.connect(self._sync_spin_from_selection)
         self.showMaximized()
 
         # Fit image to fill the canvas view on startup (after window is fully rendered)
@@ -5606,6 +5639,18 @@ class ImageEditorWindow(QMainWindow):
         self.canvas.stroke_width = self.spin.value()
         self.canvas.font_size = self.spin.value()
         self.canvas.is_filled = self.fill.isChecked()
+
+    def _sync_spin_from_selection(self):
+        """Read font size from a selected text item and update the Size spinner."""
+        for item in self.canvas.scene.selectedItems():
+            if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+                size = item.font().pointSize()
+                if size > 0:
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(size)
+                    self.spin.blockSignals(False)
+                    self.canvas.font_size = size
+                return
         
         # Jeśli użytkownik nie chce wypełnienia, ustawiamy kolor wypełnienia na przezroczysty
         # ale jeśli CHCE, to bierzemy kolor wybrany w pick_color (który ma już w sobie Alpha)
@@ -5629,6 +5674,9 @@ class ImageEditorWindow(QMainWindow):
         if dialog.exec():
             c = dialog.selectedColor()
             if c.isValid():
+                # Ensure alpha defaults to fully opaque if user left it at 0
+                if c.alpha() == 0:
+                    c.setAlpha(255)
                 self.canvas.text_highlight_color = c
                 rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
                 self.btn_hc.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
