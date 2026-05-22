@@ -31,7 +31,7 @@ sudo apt install ffmpeg
 ```
 
 ----
-### Optional - OCR (requires tesseract in the system [or easyocr in pip]) <br>
+### Optional - OCR (requires tesseract in the system [or easyocr or paddleocr in pip]) <br>
 #### Windows:   
 https://github.com/UB-Mannheim/tesseract/wiki <br>
 
