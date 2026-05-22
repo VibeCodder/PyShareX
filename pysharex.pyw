@@ -72,12 +72,19 @@ except ImportError:
     EASYOCR_AVAILABLE = False
 
 try:
+    from paddleocr import PaddleOCR as _PaddleOCR
+    PADDLEOCR_AVAILABLE = True
+except ImportError:
+    PADDLEOCR_AVAILABLE = False
+
+try:
     import qrcode as _qrcode
     QRCODE_AVAILABLE = True
 except ImportError:
     QRCODE_AVAILABLE = False
 
-_easyocr_reader = None   # lazy singleton — first use initialises it
+_easyocr_reader   = None   # lazy singleton — first use initialises it
+_paddleocr_reader = None   # lazy singleton — first use initialises it
 
 
 
@@ -91,6 +98,16 @@ def _get_easyocr_reader():
         except Exception as e:
             print(f"EasyOCR init error: {e}")
     return _easyocr_reader
+
+
+def _get_paddleocr_reader():
+    global _paddleocr_reader
+    if _paddleocr_reader is None and PADDLEOCR_AVAILABLE:
+        try:
+            _paddleocr_reader = _PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+        except Exception as e:
+            print(f"PaddleOCR init error: {e}")
+    return _paddleocr_reader
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX   = platform.system() == "Linux"
@@ -729,7 +746,7 @@ class Config:
             "gif_duration":     5,
             "record_audio":     False,
             "selected_monitor": 0,
-            "ocr_engine": "easyocr",
+            "ocr_engine": "paddleocr",
         }
 
     def _load(self):
@@ -747,7 +764,15 @@ class Config:
                     for s in scs
                 ):
                     d["shortcuts"] = self.DEFAULT_SHORTCUTS.copy()
-                    # Persist the fix immediately so next launch is clean too
+                    try:
+                        with open(self.path, "w", encoding="utf-8") as fw:
+                            json.dump(d, fw, indent=2, ensure_ascii=False)
+                    except Exception:
+                        pass
+                # Auto-migrate: force paddleocr as default if not explicitly set to a known engine
+                valid_engines = {"paddleocr", "easyocr", "tesseract"}
+                if d.get("ocr_engine") not in valid_engines:
+                    d["ocr_engine"] = "paddleocr"
                     try:
                         with open(self.path, "w", encoding="utf-8") as fw:
                             json.dump(d, fw, indent=2, ensure_ascii=False)
@@ -1492,7 +1517,7 @@ class _OverlayCanvas(QGraphicsView):
                 local_pos = item.mapFromScene(scene_pos)
                 rect = item.rect()
                 m = 10.0
-                # Rotation handle — disabled for markers (they scale uniformly instead)
+                # Rotation handle — for all rect-like items except Markers
                 if not isinstance(item, _MarkerItem):
                     rot_pt = QPointF(rect.center().x(), rect.top() - 30)
                     if (abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
@@ -1561,6 +1586,7 @@ class _OverlayCanvas(QGraphicsView):
                 angle = round(angle / 45) * 45
             item.setTransformOriginPoint(item.rect().center())
             item.setRotation(angle)
+            item.update()
             return
         old_rect   = item.rect()
         local_pos  = item.mapFromScene(scene_pos)
@@ -1667,7 +1693,7 @@ class HighlightEditDialog(QDialog):
 
 
 class HighlightRectItem(QGraphicsRectItem):
-    """Semi-transparent yellow highlight rectangle."""
+    """Semi-transparent yellow highlight rectangle — with rotation handle."""
     HIGHLIGHT_COLOR = QColor(255, 255, 0, 90)
 
     def __init__(self, rect=QRectF(), parent=None):
@@ -1685,9 +1711,10 @@ class HighlightRectItem(QGraphicsRectItem):
 
     def paint(self, painter, option, widget=None):
         painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         # Use fillRect instead of drawRect to safely support QRectF bounding boxes without crashing
         painter.fillRect(self.rect(), QBrush(self._color))
-        # Draw dashed selection border when selected
+        # Draw dashed selection border + handles when selected
         if self.isSelected():
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
             sel_pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
@@ -1695,6 +1722,24 @@ class HighlightRectItem(QGraphicsRectItem):
             painter.setPen(sel_pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(self.rect())
+
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            r = self.rect()
+            # Corner & edge resize handles
+            handles = [r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight(),
+                       QPointF(r.center().x(), r.top()), QPointF(r.center().x(), r.bottom()),
+                       QPointF(r.left(), r.center().y()), QPointF(r.right(), r.center().y())]
+            for hp in handles:
+                painter.setBrush(QBrush(Qt.GlobalColor.white))
+                painter.setPen(QPen(QColor(60, 120, 255), 1.5))
+                painter.drawEllipse(hp, 5, 5)
+            # Rotation handle above top edge
+            rot_pt = QPointF(r.center().x(), r.top() - 30)
+            painter.setBrush(QBrush(QColor(180, 255, 180, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(rot_pt, 6, 6)
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DotLine))
+            painter.drawLine(QPointF(r.center().x(), r.top()), rot_pt)
         painter.restore()
 
     # Width handle support (same as ResizableRectItem)
@@ -3427,20 +3472,27 @@ class EnhancedRegionSelector(QWidget):
         item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
         if item is not None:
             menu = QMenu(self)
+            is_marker = isinstance(item, _MarkerItem)
             if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
                 edit_act = menu.addAction("✏️ Edit Text")
+                dup_act  = menu.addAction("⧉ Duplicate")
                 del_act  = menu.addAction("🗑️ Delete")
                 action = menu.exec(e.globalPos())
                 if action == edit_act:
                     self._edit_text(item)
+                elif action == dup_act:
+                    self._duplicate_item_beside(item)
                 elif action == del_act:
                     self._canvas._scene.removeItem(item)
             elif isinstance(item, TextBubbleItem):
                 edit_act = menu.addAction("✏️ Edit")
+                dup_act  = menu.addAction("⧉ Duplicate")
                 del_act  = menu.addAction("🗑️ Delete")
                 action = menu.exec(e.globalPos())
                 if action == edit_act:
                     self._edit_bubble(item)
+                elif action == dup_act:
+                    self._duplicate_item_beside(item)
                 elif action == del_act:
                     self._canvas._scene.removeItem(item)
             elif isinstance(item, _MarkerItem):
@@ -3453,17 +3505,35 @@ class EnhancedRegionSelector(QWidget):
                     self._canvas._scene.removeItem(item)
             elif isinstance(item, HighlightRectItem):
                 edit_act = menu.addAction("✏️ Edit Highlight")
+                dup_act  = menu.addAction("⧉ Duplicate")
                 del_act  = menu.addAction("🗑️ Delete")
                 action = menu.exec(e.globalPos())
                 if action == edit_act:
                     self._edit_highlight(item)
+                elif action == dup_act:
+                    self._duplicate_item_beside(item)
                 elif action == del_act:
                     self._canvas._scene.removeItem(item)
             else:
+                dup_act = menu.addAction("⧉ Duplicate")
                 del_act = menu.addAction("🗑️ Delete")
                 action = menu.exec(e.globalPos())
-                if action == del_act:
+                if action == dup_act:
+                    self._duplicate_item_beside(item)
+                elif action == del_act:
                     self._canvas._scene.removeItem(item)
+
+    def _duplicate_item_beside(self, item):
+        """Duplicate a single item and place it slightly offset beside the original."""
+        dup = self._clone_item(item)
+        if dup is None:
+            return
+        offset = QPointF(20, 20)
+        dup.setPos(item.scenePos() + offset)
+        self._canvas._scene.addItem(dup)
+        for it in self._canvas._scene.selectedItems():
+            it.setSelected(False)
+        dup.setSelected(True)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
@@ -3472,7 +3542,121 @@ class EnhancedRegionSelector(QWidget):
             self.close()
             self.cancelled.emit()
             return
+        if (e.key() == Qt.Key.Key_D and
+                e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self._duplicate_selected_at_cursor()
+            e.accept()
+            return
+        if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            selected = self._canvas._scene.selectedItems()
+            if selected:
+                for item in selected:
+                    self._canvas._scene.removeItem(item)
+                e.accept()
+                return
         super().keyPressEvent(e)
+
+    def _duplicate_selected_at_cursor(self):
+        """Duplicate selected annotation items centred exactly at the cursor position."""
+        selected = self._canvas._scene.selectedItems()
+        if not selected:
+            return
+        cursor_global = QCursor.pos()
+        # Convert global → local widget coords → scene coords
+        local = self.mapFromGlobal(cursor_global)
+        cursor_scene = self._canvas.mapToScene(self._canvas.mapFrom(self, local))
+
+        new_items = []
+        for item in selected:
+            # Never duplicate Numbered Markers
+            if isinstance(item, _MarkerItem):
+                continue
+            dup = self._clone_item(item)
+            if dup is None:
+                continue
+            # Use the visual rect centre (not boundingRect which has large margins)
+            # to position the duplicate exactly under the cursor.
+            try:
+                item_center_scene = item.mapToScene(item.rect().center())
+            except AttributeError:
+                try:
+                    ln = item.line()
+                    item_center_scene = item.mapToScene(
+                        QPointF((ln.x1() + ln.x2()) / 2, (ln.y1() + ln.y2()) / 2))
+                except AttributeError:
+                    item_center_scene = item.scenePos()
+            offset = item_center_scene - item.scenePos()
+            dup.setPos(cursor_scene - offset)
+            self._canvas._scene.addItem(dup)
+            new_items.append(dup)
+
+        # Select only the new duplicates
+        for item in self._canvas._scene.selectedItems():
+            item.setSelected(False)
+        for item in new_items:
+            item.setSelected(True)
+
+    def _clone_item(self, item):
+        """Return a deep copy of a supported annotation item."""
+        if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+            cls = type(item)
+            dup = cls()
+            dup.setRect(QRectF(item.rect()))
+            dup.setPen(QPen(item.pen()))
+            dup.setBrush(QBrush(item.brush()))
+            dup.setRotation(item.rotation())
+            dup.setTransformOriginPoint(item.transformOriginPoint())
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, HighlightRectItem):
+            dup = HighlightRectItem()
+            dup.setRect(QRectF(item.rect()))
+            dup._color = QColor(item._color)
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, FreehandItem):
+            dup = FreehandItem(QPainterPath(item.path()))
+            dup.setPen(QPen(item.pen()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, LineItem):
+            dup = LineItem(QLineF(item.line()), self._canvas)
+            dup.setPen(QPen(item.pen()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, ArrowItem):
+            dup = ArrowItem(QLineF(item.line()), self._canvas)
+            dup.setPen(QPen(item.pen()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, TextBubbleItem):
+            dup = TextBubbleItem(item._text, QColor(item._fg_color), QColor(item._bg_color))
+            dup._w = item._w
+            dup._h = item._h
+            dup._cone_rel = QPointF(item._cone_rel)
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, HighlightTextItem):
+            dup = HighlightTextItem(item.toPlainText())
+            dup.setFont(QFont(item.font()))
+            dup.setDefaultTextColor(QColor(item.defaultTextColor()))
+            dup.highlight_color = QColor(getattr(item, 'highlight_color', QColor(0, 0, 0, 0)))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, ResizablePixmapItem):
+            dup = ResizablePixmapItem(QPixmap(item.pixmap))
+            dup.setRect(QRectF(item.rect()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        return None
 
     def closeEvent(self, e):
         self._stop_esc_listener()
@@ -3967,11 +4151,38 @@ class CaptureEngine:
     def ocr_region(self, x, y, w, h) -> str:
         path = self.capture_region(x, y, w, h)
         if not path: return ""
-        engine = self.config.get("ocr_engine", "easyocr")
-        if engine == "easyocr":
+        engine = self.config.get("ocr_engine", "paddleocr")
+        if engine == "paddleocr":
+            return self._ocr_paddleocr(path)
+        elif engine == "easyocr":
             return self._ocr_easyocr(path)
         else:
             return self._ocr_tesseract(path)
+
+    def _ocr_paddleocr(self, image_path: str) -> str:
+        if not PADDLEOCR_AVAILABLE:
+            return ("PaddleOCR is not installed.\n"
+                    "Install with:  pip install paddlepaddle paddleocr\n"
+                    "Falling back — try EasyOCR or Tesseract in Settings.")
+        reader = _get_paddleocr_reader()
+        if reader is None:
+            return "PaddleOCR failed to initialize."
+        try:
+            results = reader.ocr(image_path, cls=True)
+            lines = []
+            for block in (results or []):
+                if block is None:
+                    continue
+                for line in block:
+                    if line and len(line) >= 2:
+                        text_info = line[1]
+                        if isinstance(text_info, (list, tuple)) and text_info:
+                            lines.append(str(text_info[0]))
+                        elif isinstance(text_info, str):
+                            lines.append(text_info)
+            return "\n".join(lines)
+        except Exception as e:
+            return f"PaddleOCR error: {e}"
 
     def _ocr_easyocr(self, image_path: str) -> str:
         if not EASYOCR_AVAILABLE:
@@ -5123,13 +5334,114 @@ class EditorCanvas(QGraphicsView):
         self._checker_cache_size: tuple[int, int] = (-1, -1)
 
     def keyPressEvent(self, event):
-        """Handle Delete key to remove selected items."""
+        """Handle Delete key to remove selected items, Ctrl+D to duplicate."""
         if event.key() == Qt.Key.Key_Delete:
             for item in self.scene.selectedItems():
                 if item != self.bg_item and item != self.crop_item:
                     self.scene.removeItem(item)
                     self.is_dirty = True
+        elif (event.key() == Qt.Key.Key_D and
+              event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self._duplicate_selected_at_cursor()
         super().keyPressEvent(event)
+
+    def _duplicate_selected_at_cursor(self):
+        """Duplicate selected items and place copies centred exactly at the cursor position."""
+        selected = [i for i in self.scene.selectedItems()
+                    if i not in (self.bg_item, self.crop_item)
+                    and not isinstance(i, _MarkerItem)]
+        if not selected:
+            return
+        cursor_scene = self.mapToScene(self.mapFromGlobal(QCursor.pos()))
+        new_items = []
+        for item in selected:
+            dup = self._clone_item(item)
+            if dup is None:
+                continue
+            # Use the visual rect centre (not boundingRect which has large margins)
+            # to position the duplicate exactly under the cursor.
+            try:
+                item_center_scene = item.mapToScene(item.rect().center())
+            except AttributeError:
+                # LineItem / ArrowItem use line(), not rect()
+                try:
+                    ln = item.line()
+                    item_center_scene = item.mapToScene(
+                        QPointF((ln.x1() + ln.x2()) / 2, (ln.y1() + ln.y2()) / 2))
+                except AttributeError:
+                    item_center_scene = item.scenePos()
+            offset = item_center_scene - item.scenePos()
+            dup.setPos(cursor_scene - offset)
+            self.scene.addItem(dup)
+            new_items.append(dup)
+        for item in self.scene.selectedItems():
+            item.setSelected(False)
+        for item in new_items:
+            item.setSelected(True)
+        if new_items:
+            self.is_dirty = True
+
+    def _clone_item(self, item):
+        """Return a copy of a supported annotation item."""
+        if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+            cls = type(item)
+            dup = cls()
+            dup.setRect(QRectF(item.rect()))
+            dup.setPen(QPen(item.pen()))
+            dup.setBrush(QBrush(item.brush()))
+            dup.setRotation(item.rotation())
+            dup.setTransformOriginPoint(item.transformOriginPoint())
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, HighlightRectItem):
+            dup = HighlightRectItem()
+            dup.setRect(QRectF(item.rect()))
+            dup._color = QColor(item._color)
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, FreehandItem):
+            dup = FreehandItem(QPainterPath(item.path()))
+            dup.setPen(QPen(item.pen()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, LineItem):
+            dup = LineItem(QLineF(item.line()), self)
+            dup.setPen(QPen(item.pen()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, ArrowItem):
+            dup = ArrowItem(QLineF(item.line()), self)
+            dup.setPen(QPen(item.pen()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, TextBubbleItem):
+            dup = TextBubbleItem(item._text, QColor(item._fg_color), QColor(item._bg_color))
+            dup._w = item._w
+            dup._h = item._h
+            dup._cone_rel = QPointF(item._cone_rel)
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+            dup = HighlightTextItem(item.toPlainText())
+            dup.setFont(QFont(item.font()))
+            dup.setDefaultTextColor(QColor(item.defaultTextColor()))
+            dup.highlight_color = QColor(getattr(item, 'highlight_color', QColor(0, 0, 0, 0)))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, ResizablePixmapItem):
+            dup = ResizablePixmapItem(QPixmap(item.pixmap))
+            dup.setRect(QRectF(item.rect()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        return None
 
     def wheelEvent(self, event):
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -5423,16 +5735,38 @@ class EditorCanvas(QGraphicsView):
                     item.prepareGeometryChange()
                     item.update()
                     self.is_dirty = True
+        elif isinstance(item, _MarkerItem):
+            dlg = _MarkerEditDialog(
+                QColor(item._bg_color),
+                QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
+                self)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                item._bg_color   = dlg.bg_color
+                item._text_color = dlg.text_color
+                item.update()
+                self.is_dirty = True
         else:
             super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         item = self.scene.itemAt(scene_pos, self.transform())
+        if item in (self.bg_item, self.crop_item) or item is None:
+            super().contextMenuEvent(event)
+            return
         if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
             menu = QMenu(self)
             edit_action = menu.addAction("✏️ Edit Text")
+            dup_action  = menu.addAction("⧉ Duplicate")
             action = menu.exec(event.globalPos())
+            if action == dup_action:
+                dup = self._clone_item(item)
+                if dup:
+                    dup.setPos(item.pos() + QPointF(20, 20))
+                    self.scene.addItem(dup)
+                    self.is_dirty = True
+                return
             if action == edit_action:
                 current_fsz = item.font().pointSize()
                 dlg = ImageEditorTextDialog(item.toPlainText(), current_fsz, self)
@@ -5454,8 +5788,16 @@ class EditorCanvas(QGraphicsView):
         elif isinstance(item, HighlightRectItem):
             menu = QMenu(self)
             edit_act = menu.addAction("✏️ Edit Highlight")
+            dup_act  = menu.addAction("⧉ Duplicate")
             del_act  = menu.addAction("🗑️ Delete")
             action = menu.exec(event.globalPos())
+            if action == dup_act:
+                dup = self._clone_item(item)
+                if dup:
+                    dup.setPos(item.pos() + QPointF(20, 20))
+                    self.scene.addItem(dup)
+                    self.is_dirty = True
+                return
             if action == edit_act:
                 dlg = HighlightEditDialog(item._color, self)
                 dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
@@ -5473,8 +5815,16 @@ class EditorCanvas(QGraphicsView):
         elif isinstance(item, TextBubbleItem):
             menu = QMenu(self)
             edit_act = menu.addAction("✏️ Edit Bubble")
+            dup_act  = menu.addAction("⧉ Duplicate")
             del_act  = menu.addAction("🗑️ Delete")
             action = menu.exec(event.globalPos())
+            if action == dup_act:
+                dup = self._clone_item(item)
+                if dup:
+                    dup.setPos(item.pos() + QPointF(20, 20))
+                    self.scene.addItem(dup)
+                    self.is_dirty = True
+                return
             if action == edit_act:
                 dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
                 dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
@@ -5491,8 +5841,35 @@ class EditorCanvas(QGraphicsView):
                 self.scene.removeItem(item)
                 self.is_dirty = True
             return
+        elif isinstance(item, _MarkerItem):
+            menu = QMenu(self)
+            edit_act = menu.addAction("✏️ Edit Marker")
+            del_act  = menu.addAction("🗑️ Delete")
+            action = menu.exec(event.globalPos())
+            if action == edit_act:
+                dlg = _MarkerEditDialog(
+                    QColor(item._bg_color),
+                    QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
+                    self)
+                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    item._bg_color   = dlg.bg_color
+                    item._text_color = dlg.text_color
+                    item.update()
+                    self.is_dirty = True
+            elif action == del_act:
+                self.scene.removeItem(item)
+                self.is_dirty = True
         else:
-            super().contextMenuEvent(event)
+            menu = QMenu(self)
+            dup_act = menu.addAction("⧉ Duplicate")
+            action = menu.exec(event.globalPos())
+            if action == dup_act:
+                dup = self._clone_item(item)
+                if dup:
+                    dup.setPos(item.pos() + QPointF(20, 20))
+                    self.scene.addItem(dup)
+                    self.is_dirty = True
 
     def get_handle_at(self, pos):
         """Returns (item, handle_name) if mouse is over a resize handle of a selected item."""
@@ -6489,8 +6866,10 @@ class OcrQrToolboxDialog(QDialog):
             if not path:
                 self._ocr_result_sig.emit("Failed to capture screen region.")
                 return
-            engine = self.main_window.config.get("ocr_engine", "easyocr")
-            if engine == "easyocr":
+            engine = self.main_window.config.get("ocr_engine", "paddleocr")
+            if engine == "paddleocr":
+                txt = self.main_window.engine._ocr_paddleocr(path)
+            elif engine == "easyocr":
                 txt = self.main_window.engine._ocr_easyocr(path)
             else:
                 txt = self.main_window.engine._ocr_tesseract(path)
@@ -6784,6 +7163,10 @@ class MainWindow(QMainWindow):
         lbl.setStyleSheet("color:#89b4fa;font-size:15px;font-weight:bold;")
         lay.addWidget(lbl)
 
+        sv = QPushButton("💾 Save Settings"); sv.setObjectName("cap_btn")
+        sv.setFixedHeight(36); sv.clicked.connect(self._save_settings)
+        lay.addWidget(sv)
+
         # Folder
         fg = QGroupBox("Screenshots folder"); fl = QHBoxLayout(fg)
         self._fld = QLineEdit(self.config.get("save_folder", ""))
@@ -6815,8 +7198,12 @@ class MainWindow(QMainWindow):
         mg = QGroupBox("Selected monitor  (for 'Capture selected monitor')")
         ml = QHBoxLayout(mg)
         self._mcb = QComboBox(); self._fill_monitors()
-        rfb = QPushButton("🔄"); rfb.setFixedWidth(34); rfb.clicked.connect(self._fill_monitors)
-        ml.addWidget(QLabel("Monitor:")); ml.addWidget(self._mcb, 1); ml.addWidget(rfb)
+        rfb = QPushButton("Refresh")
+        rfb.setFixedHeight(28)
+        rfb.setToolTip("Refresh monitor list")
+        rfb.clicked.connect(self._fill_monitors)
+        ml.addWidget(QLabel("Monitor:")); ml.addWidget(self._mcb, 1)
+        ml.addWidget(rfb, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(mg)
 
         # Recording
@@ -6834,18 +7221,34 @@ class MainWindow(QMainWindow):
         ocr_l = QVBoxLayout(ocr_g)
         from PyQt6.QtWidgets import QRadioButton, QButtonGroup
         self._ocr_grp = QButtonGroup(ocr_g)
+        self._ocr_paddleocr_rb = QRadioButton(
+            "PaddleOCR  (pip install paddlepaddle paddleocr)  — recommended, best accuracy")
         self._ocr_easyocr_rb = QRadioButton(
             "EasyOCR  (pip install easyocr)  — no external dependencies")
         self._ocr_tesseract_rb = QRadioButton(
             "Tesseract  (sudo apt install tesseract-ocr / Windows installer)")
-        engine = self.config.get("ocr_engine", "easyocr")
-        self._ocr_easyocr_rb.setChecked(engine == "easyocr")
-        self._ocr_tesseract_rb.setChecked(engine == "tesseract")
-        self._ocr_grp.addButton(self._ocr_easyocr_rb, 0)
-        self._ocr_grp.addButton(self._ocr_tesseract_rb, 1)
+        # Add buttons to group FIRST, then set checked state.
+        # In PyQt6 an exclusive QButtonGroup may silently override setChecked
+        # calls made before the button is part of the group.
+        self._ocr_grp.addButton(self._ocr_paddleocr_rb, 0)
+        self._ocr_grp.addButton(self._ocr_easyocr_rb, 1)
+        self._ocr_grp.addButton(self._ocr_tesseract_rb, 2)
+        ocr_l.addWidget(self._ocr_paddleocr_rb)
         ocr_l.addWidget(self._ocr_easyocr_rb)
         ocr_l.addWidget(self._ocr_tesseract_rb)
-        # Status indicator
+        # Apply saved value AFTER buttons are in the group
+        engine = self.config.get("ocr_engine", "paddleocr")
+        if engine == "easyocr":
+            self._ocr_easyocr_rb.setChecked(True)
+        elif engine == "tesseract":
+            self._ocr_tesseract_rb.setChecked(True)
+        else:
+            self._ocr_paddleocr_rb.setChecked(True)
+        # Status indicators
+        paddle_status = "✅ PaddleOCR installed" if PADDLEOCR_AVAILABLE else "⚠️  PaddleOCR not installed — run: pip install paddlepaddle paddleocr"
+        paddle_status_lbl = QLabel(paddle_status)
+        paddle_status_lbl.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
+        ocr_l.addWidget(paddle_status_lbl)
         easyocr_status = "✅ EasyOCR installed" if EASYOCR_AVAILABLE else "⚠️  EasyOCR not installed — run: pip install easyocr"
         ocr_status_lbl = QLabel(easyocr_status)
         ocr_status_lbl.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
@@ -6882,9 +7285,7 @@ class MainWindow(QMainWindow):
             self._nc[k] = cb; nl.addWidget(cb)
         lay.addWidget(ng)
 
-        sv = QPushButton("💾 Save Settings"); sv.setObjectName("cap_btn")
-        sv.setFixedHeight(36); sv.clicked.connect(self._save_settings)
-        lay.addWidget(sv); lay.addStretch()
+        lay.addStretch()
         return sa
 
     def _mk_history(self):
@@ -7126,18 +7527,32 @@ class MainWindow(QMainWindow):
         if f: self._fld.setText(f)
 
     def _save_settings(self):
-        self.config.set("save_folder",      self._fld.text())
-        self.config.set("image_format",     self._fmt.currentText())
-        self.config.set("jpeg_quality",     self._jpg.value())
-        self.config.set("delay",            self._dly.value())
-        self.config.set("show_cursor",      self._cur.isChecked())
-        self.config.set("gif_fps",          self._gfps.value())
-        self.config.set("record_audio",     self._aud.isChecked())
-        self.config.set("selected_monitor", self._mcb.currentData() or 0)
-        self.config.set("ocr_engine",
-                        "easyocr" if self._ocr_easyocr_rb.isChecked() else "tesseract")
-        self.config.set("after_capture",    {k: cb.isChecked() for k, cb in self._ac.items()})
-        self.config.set("notifications",    {k: cb.isChecked() for k, cb in self._nc.items()})
+        # Update settings in memory directly to avoid locking the JSON file
+        # by performing multiple disk writes in a single millisecond.
+        self.config.data["save_folder"]      = self._fld.text()
+        self.config.data["image_format"]     = self._fmt.currentText()
+        self.config.data["jpeg_quality"]     = self._jpg.value()
+        self.config.data["delay"]            = self._dly.value()
+        self.config.data["show_cursor"]      = self._cur.isChecked()
+        self.config.data["gif_fps"]          = self._gfps.value()
+        self.config.data["record_audio"]     = self._aud.isChecked()
+        self.config.data["selected_monitor"] = self._mcb.currentData() or 0
+        
+        # Safely determine the active OCR engine using QButtonGroup ID
+        engine_id = self._ocr_grp.checkedId()
+        if engine_id == 1:
+            ocr_engine = "easyocr"
+        elif engine_id == 2:
+            ocr_engine = "tesseract"
+        else:
+            ocr_engine = "paddleocr"
+            
+        self.config.data["ocr_engine"]       = ocr_engine
+        self.config.data["after_capture"]    = {k: cb.isChecked() for k, cb in self._ac.items()}
+        self.config.data["notifications"]    = {k: cb.isChecked() for k, cb in self._nc.items()}
+        
+        # Perform a single, safe disk write operation
+        self.config.save()
         self._status("✅ Settings saved")
 
     # ════════════════════════════════════════
@@ -7306,8 +7721,10 @@ class MainWindow(QMainWindow):
         # 1. Automatyczne rozpoznawanie tekstu (OCR)
         if after.get("ocr_recognize"):
             def do_auto_ocr():
-                engine = self.config.get("ocr_engine", "easyocr")
-                if engine == "easyocr":
+                engine = self.config.get("ocr_engine", "paddleocr")
+                if engine == "paddleocr":
+                    txt = self.engine._ocr_paddleocr(path)
+                elif engine == "easyocr":
                     txt = self.engine._ocr_easyocr(path)
                 else:
                     txt = self.engine._ocr_tesseract(path)
@@ -7711,8 +8128,10 @@ class MainWindow(QMainWindow):
                 return
 
             # Mając już w 100% poprawny plik na dysku, wykonujemy na nim OCR
-            engine = self.config.get("ocr_engine", "easyocr")
-            if engine == "easyocr":
+            engine = self.config.get("ocr_engine", "paddleocr")
+            if engine == "paddleocr":
+                txt = self.engine._ocr_paddleocr(path)
+            elif engine == "easyocr":
                 txt = self.engine._ocr_easyocr(path)
             else:
                 txt = self.engine._ocr_tesseract(path)

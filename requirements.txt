@@ -1,10 +1,12 @@
-PyQt6
-Pillow
-mss
-pynput
+PyQt6>
+Pillow>
+mss>
+pynput>
 pyautogui
 opencv-python
 numpy
 screeninfo
 easyocr
 qrcode[pil]
+paddleocr
+paddlepaddle
