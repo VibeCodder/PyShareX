@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PyshareX - Cross-platform screen capture and recording tool
-Inspired by ShareX, built with Python and PySide6
+Inspired by ShareX, built with Python and PyQt6
 """
 
 import sys
@@ -20,7 +20,7 @@ from pathlib import Path
 from datetime import datetime
 
 import urllib.request # Potrzebne do otwierania z sieci
-from PySide6.QtWidgets import (
+from PyQt6.QtWidgets import (
     QAbstractSpinBox, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
     QSystemTrayIcon, QMenu, QFileDialog, QDialog, QLineEdit,
@@ -28,14 +28,14 @@ from PySide6.QtWidgets import (
     QMessageBox, QListWidget, QListWidgetItem,
     QKeySequenceEdit, QDialogButtonBox, QSpinBox, QTabWidget,
     QTextEdit, QSizePolicy, QStackedWidget, QColorDialog, QInputDialog,
-    QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsRectItem,
+    QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsRectItem, 
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem
 )
-from PySide6.QtCore import (
-    QPointF, Qt, QThread, Signal, QTimer, QSize, QRect, QPoint,
+from PyQt6.QtCore import (
+    QPointF, Qt, QThread, pyqtSignal, QTimer, QSize, QRect, QPoint,
     QStandardPaths, QElapsedTimer, QLineF, QRectF, QSizeF
 )
-from PySide6.QtGui import (
+from PyQt6.QtGui import (
     QIcon, QKeySequence, QAction, QMouseEvent, QPixmap, QPainter, QColor,
     QFont, QPen, QBrush, QCursor, QPainterPath, QImage, QPainterPathStroker,
     QFontMetricsF
@@ -399,8 +399,8 @@ def get_monitors():
     return monitors
 
 class FFmpegConverterThread(QThread):
-    log_signal = Signal(str)
-    finished_signal = Signal(int)
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(int)
 
     def __init__(self, cmd):
         super().__init__()
@@ -444,8 +444,8 @@ class FFmpegConverterThread(QThread):
         if self.process:
             self.process.terminate()
 
-from PySide6.QtWidgets import (QGridLayout, QFormLayout, QProgressBar)
-from PySide6.QtWidgets import QSlider
+from PyQt6.QtWidgets import (QGridLayout, QFormLayout, QProgressBar)
+from PyQt6.QtWidgets import QSlider
 
 class VideoConverterDialog(QDialog):
     def __init__(self, parent=None):
@@ -967,8 +967,8 @@ def _show_toast(title, msg, pixmap, filepath):
 
 def physical_to_logical_rect(phys_x, phys_y, phys_w, phys_h) -> QRect:
     import mss
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtCore import QRect
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QRect
     
     # Sortujemy ekrany tak samo jak w RegionSelector, by indeksy się zgadzały
     qt_screens = sorted(QApplication.screens(), key=lambda s: (s.geometry().x(), s.geometry().y()))
@@ -1061,8 +1061,8 @@ class RecordingBorder(QWidget):
 # ─────────────────────────────────────────────
 
 class RecordingBar(QWidget):
-    stop_clicked  = Signal()
-    abort_clicked = Signal()
+    stop_clicked  = pyqtSignal()
+    abort_clicked = pyqtSignal()
 
     def __init__(self):
         super().__init__(None,
@@ -1139,8 +1139,8 @@ class RecordingBar(QWidget):
 # ─────────────────────────────────────────────
 
 class RegionSelector(QWidget):
-    region_selected = Signal(int, int, int, int)
-    cancelled       = Signal()
+    region_selected = pyqtSignal(int, int, int, int)
+    cancelled       = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -1197,19 +1197,19 @@ class RegionSelector(QWidget):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self.start_pos = self.end_pos = e.position().toPoint()
+            self.start_pos = self.end_pos = e.pos()
             self.global_start = self.global_end = e.globalPosition().toPoint()
             self.drawing = True
 
     def mouseMoveEvent(self, e):
         if self.drawing:
-            self.end_pos = e.position().toPoint()
+            self.end_pos = e.pos()
             self.global_end = e.globalPosition().toPoint()
             self.update()
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self.drawing:
-            self.end_pos = e.position().toPoint()
+            self.end_pos = e.pos()
             self.global_end = e.globalPosition().toPoint()
             self.drawing = False
             self.close()
@@ -1351,10 +1351,10 @@ class _OverlayCanvas(QGraphicsView):
         WA_TransparentForMouseEvents is set.
         """
         # Map the event position from parent-widget coords → viewport coords
-        vp_pos  = self.mapFrom(self.parent(), qevent.position().toPoint())
+        vp_pos  = self.mapFrom(self.parent(), qevent.pos())
         scene_p = self.mapToScene(vp_pos)
 
-        from PySide6.QtCore import QEvent
+        from PyQt6.QtCore import QEvent
         etype = qevent.type()
 
         fake = QMouseEvent(
@@ -1978,7 +1978,7 @@ class TextBubbleItem(QGraphicsItem):
         if not self._text:
             return
         pad = self.PADDING * 2
-        from PySide6.QtGui import QFontMetrics
+        from PyQt6.QtGui import QFontMetrics
         fm = QFontMetrics(QFont("Arial", self.MIN_SIZE // 5 or 8))
         text_w = max(1, int(self._w) - pad)
         needed_h = fm.boundingRect(
@@ -2028,8 +2028,8 @@ class TextBubbleItem(QGraphicsItem):
 
     # ------------------------------------------------------------------
     def paint(self, painter, option, widget=None):
-        from PySide6.QtWidgets import QStyle
-        from PySide6.QtGui import QFontMetrics
+        from PyQt6.QtWidgets import QStyle
+        from PyQt6.QtGui import QFontMetrics
         option.state &= ~QStyle.StateFlag.State_Selected
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -2617,8 +2617,8 @@ class EnhancedRegionSelector(QWidget):
     - All annotation items are fully selectable, movable and resizable
       (uses the same QGraphicsScene infrastructure as the Image Editor).
     """
-    region_selected = Signal(int, int, int, int)
-    cancelled       = Signal()
+    region_selected = pyqtSignal(int, int, int, int)
+    cancelled       = pyqtSignal()
 
     TOOL_DETECT    = "detect"
     TOOL_SELECT    = "select"
@@ -2953,36 +2953,6 @@ class EnhancedRegionSelector(QWidget):
         if tool_id == self.TOOL_DETECT:
             self._update_detection_at_cursor()
 
-    def _exec_dialog(self, dlg) -> int:
-        """Run a modal dialog while the overlay is active.
-        Switches to SELECT tool before opening so any stray mouse events that
-        land on the overlay after the dialog closes are harmless (select does
-        not create new annotations). The previous tool is restored afterwards."""
-        prev_tool = self._current_tool
-        # Switch to SELECT so stray clicks don't spawn duplicate annotations
-        self._select_tool(self.TOOL_SELECT)
-        self._toolbar.hide()
-        self.releaseKeyboard()
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        QApplication.processEvents()
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
-        result = dlg.exec()
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        # Restore the tool that was active before the dialog
-        self._select_tool(prev_tool)
-        self._toolbar.show()
-        self.activateWindow()
-        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
-        self.grabKeyboard()
-        return result
-
-    
-
     def _pick_color(self):
         """Open a context-aware edit dialog for the selected item, or a plain
         colour picker if no item is selected / the item has no dedicated dialog."""
@@ -3009,8 +2979,9 @@ class EnhancedRegionSelector(QWidget):
         """Open the dedicated edit dialog for *item*.
         Returns True if a dedicated dialog was shown, False otherwise."""
         if isinstance(item, HighlightRectItem):
-            dlg = HighlightEditDialog(item._color, self)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            dlg = HighlightEditDialog(item._color)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
                 new_color = dlg.result_color()
                 item._color = new_color
                 border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
@@ -3020,8 +2991,9 @@ class EnhancedRegionSelector(QWidget):
             return True
 
         if isinstance(item, TextBubbleItem):
-            dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
                 text, fg, bg = dlg.result_data()
                 item._text     = text
                 item._fg_color = fg
@@ -3032,9 +3004,9 @@ class EnhancedRegionSelector(QWidget):
         if isinstance(item, _MarkerItem):
             dlg = _MarkerEditDialog(
                 QColor(item._bg_color),
-                QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
-                self)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))))
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
                 item._bg_color   = dlg.bg_color
                 item._text_color = dlg.text_color
                 item.update()
@@ -3045,10 +3017,11 @@ class EnhancedRegionSelector(QWidget):
     def _open_generic_color_picker(self, apply_to_item=None):
         """Show a plain QColorDialog and apply result to the drawing colour
         and optionally to *apply_to_item*."""
-        dlg = QColorDialog(self._draw_color, self)
+        dlg = QColorDialog(self._draw_color, None)
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
         dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if self._exec_dialog(dlg):
+        if dlg.exec():
             c = dlg.selectedColor()
             if c.isValid():
                 self._draw_color = c
@@ -3213,7 +3186,7 @@ class EnhancedRegionSelector(QWidget):
         gpos = e.globalPosition().toPoint()
         if self._toolbar_contains(gpos):
             return
-        lpos = e.position().toPoint()
+        lpos = e.pos()
 
         # ── Inline capture-selection mode ─────────────────────────────────────
         if self._current_tool == "_capture_select":
@@ -3248,8 +3221,11 @@ class EnhancedRegionSelector(QWidget):
             self._canvas.add_marker(scene_pos, self._draw_color)
 
         elif self._current_tool == self.TOOL_TEXT:
-            dlg = _TextInputDialog(QColor(self._draw_color), self)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            self._toolbar.hide()
+            self.releaseKeyboard() # Allow keyboard input for the dialog
+            dlg = _TextInputDialog(QColor(self._draw_color), None)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
                 txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
                 if txt.strip():
                     item = self._canvas.add_text(scene_pos, txt, fsz, col, hl)
@@ -3258,17 +3234,26 @@ class EnhancedRegionSelector(QWidget):
                     item.outline_enabled   = ol_on
                     item.outline_width     = ol_w
                     item.outline_color     = ol_col
+            self._toolbar.show()
+            self.activateWindow(); self.setFocus()
+            self.grabKeyboard() # Re-lock keyboard interactions to the overlay
 
         elif self._current_tool == self.TOOL_BUBBLE:
-            dlg = _BubbleInputDialog(QColor(self._draw_color), self)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            self._toolbar.hide()
+            self.releaseKeyboard()
+            dlg = _BubbleInputDialog(QColor(self._draw_color), None)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
                     self._canvas.add_bubble(scene_pos, txt, fg_col, bg_col)
+            self._toolbar.show()
+            self.activateWindow(); self.setFocus()
+            self.grabKeyboard()
 
     def mouseMoveEvent(self, e):
         gpos = e.globalPosition().toPoint()
-        lpos = e.position().toPoint()
+        lpos = e.pos()
 
         # Dynamically move the toolbar to the monitor where the cursor currently is
         cursor_screen = QApplication.screenAt(gpos)
@@ -3387,7 +3372,7 @@ class EnhancedRegionSelector(QWidget):
         for item in self._canvas._scene.selectedItems():
             if hasattr(item, '_width_drag_active'):
                 item._width_drag_active = False
-        lpos = e.position().toPoint()
+        lpos = e.pos()
 
         # ── Inline capture-selection mode — finalize rect ─────────────────────
         if self._current_tool == "_capture_select":
@@ -3436,7 +3421,7 @@ class EnhancedRegionSelector(QWidget):
             return
         # Allow editing text if we are in SELECT mode
         if self._current_tool == self.TOOL_SELECT:
-            lpos = e.position().toPoint()
+            lpos = e.pos()
             scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
             item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
             
@@ -3453,8 +3438,11 @@ class EnhancedRegionSelector(QWidget):
                 self._edit_marker(item)
 
     def _edit_text(self, item):
+        self._toolbar.hide()
+        self.releaseKeyboard()
+
         # Pre-fill dialog with existing text item data
-        dlg = _TextInputDialog(item.defaultTextColor(), self)
+        dlg = _TextInputDialog(item.defaultTextColor(), None)
         dlg.edit.setPlainText(item.toPlainText())
         dlg.sz.setValue(item.font().pointSize())
         if hasattr(item, 'highlight_color'):
@@ -3466,7 +3454,8 @@ class EnhancedRegionSelector(QWidget):
         dlg.outline_color = QColor(getattr(item, 'outline_color', QColor(0, 0, 0)))
         dlg._update_btn_color()
 
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
             if txt.strip():
                 item.setPlainText(txt)
@@ -3482,12 +3471,20 @@ class EnhancedRegionSelector(QWidget):
             else:
                 self._canvas._scene.removeItem(item)
 
+        self._toolbar.show()
+        self.activateWindow()
+        self.setFocus()
+        self.grabKeyboard()
+
     def _edit_bubble(self, item):
-        dlg = _BubbleInputDialog(item._fg_color, self)
+        self._toolbar.hide()
+        self.releaseKeyboard()
+        dlg = _BubbleInputDialog(item._fg_color, None)
         dlg.edit.setPlainText(item._text)
         dlg.bg_color = item._bg_color
         dlg._update_btn_styles()
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             txt, fg_col, bg_col = dlg.result_data()
             if txt.strip():
                 item._text = txt
@@ -3495,29 +3492,44 @@ class EnhancedRegionSelector(QWidget):
                 item._bg_color = bg_col
                 item.prepareGeometryChange()
                 item.update()
+        self._toolbar.show()
+        self.activateWindow(); self.setFocus()
+        self.grabKeyboard()
 
     def _edit_marker(self, item):
+        self._toolbar.hide()
+        self.releaseKeyboard()
         dlg = _MarkerEditDialog(item._bg_color,
                                 getattr(item, '_text_color', QColor(Qt.GlobalColor.white)),
-                                self)
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                                None)
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             bg, fg = dlg.result_data()
             item._bg_color = bg
             item._text_color = fg
             item.update()
+        self._toolbar.show()
+        self.activateWindow(); self.setFocus()
+        self.grabKeyboard()
 
     def _edit_highlight(self, item):
-        dlg = HighlightEditDialog(item._color, self)
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+        self._toolbar.hide()
+        self.releaseKeyboard()
+        dlg = HighlightEditDialog(item._color)
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             new_color = dlg.result_color()
             item._color = new_color
             border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
             item.setPen(QPen(border, 1.5))
             item.setBrush(QBrush(new_color))
             item.update()
+        self._toolbar.show()
+        self.activateWindow(); self.setFocus()
+        self.grabKeyboard()
 
     def contextMenuEvent(self, e):
-        lpos = e.position().toPoint()
+        lpos = e.pos()
         scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
         item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
         if item is not None:
@@ -3870,7 +3882,7 @@ class EnhancedRegionSelector(QWidget):
         composited = base_img
         if base_img and ann_pixmap and has_annotations:
             try:
-                from PySide6.QtCore import QBuffer, QIODevice
+                from PyQt6.QtCore import QBuffer, QIODevice
                 qbuf = QBuffer()
                 qbuf.open(QIODevice.OpenModeFlag.WriteOnly)
                 ann_pixmap.save(qbuf, "PNG")
@@ -4292,9 +4304,9 @@ class CaptureEngine:
 # ─────────────────────────────────────────────
 
 class RecordingThread(QThread):
-    finished     = Signal(str)
-    error        = Signal(str)
-    region_ready = Signal(int, int, int, int)
+    finished     = pyqtSignal(str)
+    error        = pyqtSignal(str)
+    region_ready = pyqtSignal(int, int, int, int)
 
     def __init__(self, region, output_path, fps=30, audio=False,
                  gif_mode=False, gif_fps=10, gif_duration=5):
@@ -4821,11 +4833,11 @@ import urllib.request
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-from PySide6.QtWidgets import QInputDialog, QGraphicsScene, QGraphicsView, QGraphicsItem, \
+from PyQt6.QtWidgets import QInputDialog, QGraphicsScene, QGraphicsView, QGraphicsItem, \
     QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, \
     QGraphicsTextItem
 
-from PySide6.QtWidgets import QColorDialog, QSpinBox, QCheckBox
+from PyQt6.QtWidgets import QColorDialog, QSpinBox, QCheckBox
 
 
 class CropOverlayItem(QGraphicsRectItem):
@@ -4953,7 +4965,7 @@ class FreehandItem(QGraphicsPathItem):
         sx = rect.width() / base_rect.width()
         sy = rect.height() / base_rect.height()
         
-        from PySide6.QtGui import QTransform
+        from PyQt6.QtGui import QTransform
         transform = QTransform()
         transform.translate(rect.x(), rect.y())
         transform.scale(sx, sy)
@@ -4970,7 +4982,7 @@ class FreehandItem(QGraphicsPathItem):
         return self._rect.adjusted(-5, -50, 5, 5)
 
     def paint(self, painter, option, widget=None):
-        from PySide6.QtWidgets import QStyle
+        from PyQt6.QtWidgets import QStyle
         option.state &= ~QStyle.StateFlag.State_Selected
         painter.setPen(self.pen())
         painter.drawPath(self.path())
@@ -5088,7 +5100,7 @@ class HighlightTextItem(QGraphicsTextItem):
         return super().boundingRect().adjusted(-extra, -extra, extra, extra)
 
     def paint(self, painter, option, widget=None):
-        from PySide6.QtCore import QRectF
+        from PyQt6.QtCore import QRectF
         doc_size = self.document().size()
         pad = getattr(self, 'highlight_padding', 0)
 
@@ -5161,7 +5173,7 @@ class ResizableRectItem(QGraphicsRectItem):
         return QPointF(r.center().x(), r.bottom() + 12)
 
     def paint(self, painter, option, widget=None):
-        from PySide6.QtWidgets import QStyle
+        from PyQt6.QtWidgets import QStyle
         option.state &= ~QStyle.StateFlag.State_Selected
         super().paint(painter, option, widget)
         if self.isSelected():
@@ -5259,7 +5271,7 @@ class ResizableEllipseItem(QGraphicsEllipseItem):
         return QPointF(r.center().x(), r.bottom() + 12)
 
     def paint(self, painter, option, widget=None):
-        from PySide6.QtWidgets import QStyle
+        from PyQt6.QtWidgets import QStyle
         option.state &= ~QStyle.StateFlag.State_Selected
         super().paint(painter, option, widget)
         if self.isSelected():
@@ -5569,11 +5581,11 @@ class EditorCanvas(QGraphicsView):
 
     def mousePressEvent(self, event):
         self.setFocus() # Ensure canvas has focus for keyboard events
-        scene_pos = self.mapToScene(event.position().toPoint())
-
+        scene_pos = self.mapToScene(event.pos())
+        
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            self._pan_start = event.position().toPoint()
+            self._pan_start = event.pos()
             return
 
         if self.current_tool == "Eraser":
@@ -5657,13 +5669,13 @@ class EditorCanvas(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.MiddleButton and getattr(self, '_pan_start', None) is not None:
-            delta = event.position().toPoint() - self._pan_start
+            delta = event.pos() - self._pan_start
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
-            self._pan_start = event.position().toPoint()
+            self._pan_start = event.pos()
             return
 
-        scene_pos = self.mapToScene(event.position().toPoint())
+        scene_pos = self.mapToScene(event.pos())
         
         if self.current_tool in ["Select", "Crop"] and not self.resizing_item:
             _, handle = self.get_handle_at(scene_pos)
@@ -6745,8 +6757,8 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.is_dirty = True
 
     def import_image(self):
-        from PySide6.QtWidgets import QFileDialog
-        from PySide6.QtGui import QPixmap
+        from PyQt6.QtWidgets import QFileDialog
+        from PyQt6.QtGui import QPixmap
         
         # Używa wbudowanej zmiennej z folderem Screenshotów jako ścieżki startowej
         path, _ = QFileDialog.getOpenFileName(self, "Import Image", self.default_dir, "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
@@ -6858,8 +6870,8 @@ class ImageEditorWindow(QMainWindow):
 class OcrQrToolboxDialog(QDialog):
     """Combined OCR text recognition + QR code generator/scanner toolbox."""
 
-    _ocr_result_sig = Signal(str)
-    _qr_result_sig  = Signal(str)
+    _ocr_result_sig = pyqtSignal(str)
+    _qr_result_sig  = pyqtSignal(str)
 
     def __init__(self, main_window, parent=None):
         super().__init__(parent)
@@ -7137,9 +7149,9 @@ class OcrQrToolboxDialog(QDialog):
 # ─────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    status_sig  = Signal(str)
-    _notify_sig = Signal(str, object)   # filepath — must run on main thread
-    _ocr_done_sig = Signal(str, str) # <--- DODANA LINIA (tekst, tytul)
+    status_sig  = pyqtSignal(str)
+    _notify_sig = pyqtSignal(str, object)   # filepath — must run on main thread
+    _ocr_done_sig = pyqtSignal(str, str) # <--- DODANA LINIA (tekst, tytul)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -7376,7 +7388,7 @@ class MainWindow(QMainWindow):
         # OCR engine
         ocr_g = QGroupBox("OCR Engine")
         ocr_l = QVBoxLayout(ocr_g)
-        from PySide6.QtWidgets import QRadioButton, QButtonGroup
+        from PyQt6.QtWidgets import QRadioButton, QButtonGroup
         self._ocr_grp = QButtonGroup(ocr_g)
         self._ocr_paddleocr_rb = QRadioButton(
             "PaddleOCR  (pip install paddlepaddle paddleocr)  — recommended, best accuracy")
@@ -7385,7 +7397,7 @@ class MainWindow(QMainWindow):
         self._ocr_tesseract_rb = QRadioButton(
             "Tesseract  (sudo apt install tesseract-ocr / Windows installer)")
         # Add buttons to group FIRST, then set checked state.
-        # In PySide6 an exclusive QButtonGroup may silently override setChecked
+        # In PyQt6 an exclusive QButtonGroup may silently override setChecked
         # calls made before the button is part of the group.
         self._ocr_grp.addButton(self._ocr_paddleocr_rb, 0)
         self._ocr_grp.addButton(self._ocr_easyocr_rb, 1)
