@@ -2957,7 +2957,10 @@ class EnhancedRegionSelector(QWidget):
         """Run a dialog on top of the overlay on Linux/X11.
         BypassWindowManagerHint makes the overlay intercept all mouse events,
         so we temporarily make it transparent for mouse input while the dialog
-        is open, then restore normal behaviour afterwards."""
+        is open, then restore normal behaviour afterwards.
+        After the dialog closes we keep the overlay transparent for a short
+        grace period so the click that dismissed the dialog is not picked up
+        by mousePressEvent and accidentally creates a duplicate annotation."""
         self._toolbar.hide()
         self.releaseKeyboard()
         # Let mouse events pass through the overlay to the dialog
@@ -2969,14 +2972,20 @@ class EnhancedRegionSelector(QWidget):
         dlg.raise_()
         dlg.activateWindow()
         result = dlg.exec()
-        # Restore normal mouse handling
+        # Keep overlay transparent briefly so the button-release / stray click
+        # that closed the dialog is fully consumed before we re-enable input.
+        QApplication.processEvents()
+        QTimer.singleShot(200, self._restore_after_dialog)
+        return result
+
+    def _restore_after_dialog(self):
+        """Re-enable mouse input on the overlay after the dialog grace period."""
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self._toolbar.show()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
         self.grabKeyboard()
-        return result
 
     def _pick_color(self):
         """Open a context-aware edit dialog for the selected item, or a plain
