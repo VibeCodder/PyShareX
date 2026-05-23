@@ -16,7 +16,7 @@ Run
 python3 install.py
 ```
 
-If something won't work you can optionlally use this command:
+If something won't work you can optionally use this command:
 ```
 sudo apt update && sudo apt install libxcb-cursor0
 ```
