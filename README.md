@@ -8,7 +8,7 @@ PyShareX is an open-source ShareX alternative written in Python for Linux and Wi
 It provides instant screenshot uploads, screenshot editor, video converter, text and QR recognition, clipboard automation and a fast productivity workflow.  
 Built with the help of Claude AI and Gemini.
 
-----
+
 ## For Linux:
 
 Run 
@@ -21,7 +21,6 @@ Use this command:
 sudo apt update && sudo apt install libxcb-cursor0
 ```
 
-----
 ## For Windows:
 
 Before usage please install everything from `requirements.txt` using this cmd:
@@ -30,7 +29,7 @@ pip install -r requirements.txt
 ```
 You should also run the app by pythonw.exe <br>
 In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
-<br><br>
+
 ----
 For the icon to be visible in the app, the .ico file must be inside "icons" folder and the "icons" folder must be in the same folder with .pyw script.
 
