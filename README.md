@@ -9,7 +9,7 @@ It provides instant screenshot uploads, screenshot editor, video converter, text
 Built with the help of Claude AI and Gemini.
 
 ----
-- For Linux:
+## For Linux:
 
 Run 
 ```
@@ -22,7 +22,7 @@ sudo apt update && sudo apt install libxcb-cursor0
 ```
 
 ----
-- For Windows:
+## For Windows:
 
 Before usage please install everything from `requirements.txt` using this cmd:
 ```
