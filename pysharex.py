@@ -2953,6 +2953,31 @@ class EnhancedRegionSelector(QWidget):
         if tool_id == self.TOOL_DETECT:
             self._update_detection_at_cursor()
 
+    def _exec_dialog(self, dlg) -> int:
+        """Run a dialog on top of the overlay on Linux/X11.
+        BypassWindowManagerHint makes the overlay intercept all mouse events,
+        so we temporarily make it transparent for mouse input while the dialog
+        is open, then restore normal behaviour afterwards."""
+        self._toolbar.hide()
+        self.releaseKeyboard()
+        # Let mouse events pass through the overlay to the dialog
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        QApplication.processEvents()
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        result = dlg.exec()
+        # Restore normal mouse handling
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self._toolbar.show()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        self.grabKeyboard()
+        return result
+
     def _pick_color(self):
         """Open a context-aware edit dialog for the selected item, or a plain
         colour picker if no item is selected / the item has no dedicated dialog."""
@@ -2980,8 +3005,7 @@ class EnhancedRegionSelector(QWidget):
         Returns True if a dedicated dialog was shown, False otherwise."""
         if isinstance(item, HighlightRectItem):
             dlg = HighlightEditDialog(item._color, self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 new_color = dlg.result_color()
                 item._color = new_color
                 border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
@@ -2992,8 +3016,7 @@ class EnhancedRegionSelector(QWidget):
 
         if isinstance(item, TextBubbleItem):
             dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 text, fg, bg = dlg.result_data()
                 item._text     = text
                 item._fg_color = fg
@@ -3006,8 +3029,7 @@ class EnhancedRegionSelector(QWidget):
                 QColor(item._bg_color),
                 QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
                 self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 item._bg_color   = dlg.bg_color
                 item._text_color = dlg.text_color
                 item.update()
@@ -3019,10 +3041,9 @@ class EnhancedRegionSelector(QWidget):
         """Show a plain QColorDialog and apply result to the drawing colour
         and optionally to *apply_to_item*."""
         dlg = QColorDialog(self._draw_color, self)
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
         dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
+        if self._exec_dialog(dlg):
             c = dlg.selectedColor()
             if c.isValid():
                 self._draw_color = c
@@ -3222,11 +3243,8 @@ class EnhancedRegionSelector(QWidget):
             self._canvas.add_marker(scene_pos, self._draw_color)
 
         elif self._current_tool == self.TOOL_TEXT:
-            self._toolbar.hide()
-            self.releaseKeyboard() # Allow keyboard input for the dialog
             dlg = _TextInputDialog(QColor(self._draw_color), self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
                 if txt.strip():
                     item = self._canvas.add_text(scene_pos, txt, fsz, col, hl)
@@ -3235,22 +3253,13 @@ class EnhancedRegionSelector(QWidget):
                     item.outline_enabled   = ol_on
                     item.outline_width     = ol_w
                     item.outline_color     = ol_col
-            self._toolbar.show()
-            self.activateWindow(); self.setFocus()
-            self.grabKeyboard() # Re-lock keyboard interactions to the overlay
 
         elif self._current_tool == self.TOOL_BUBBLE:
-            self._toolbar.hide()
-            self.releaseKeyboard()
             dlg = _BubbleInputDialog(QColor(self._draw_color), self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
                     self._canvas.add_bubble(scene_pos, txt, fg_col, bg_col)
-            self._toolbar.show()
-            self.activateWindow(); self.setFocus()
-            self.grabKeyboard()
 
     def mouseMoveEvent(self, e):
         gpos = e.globalPosition().toPoint()
@@ -3439,9 +3448,6 @@ class EnhancedRegionSelector(QWidget):
                 self._edit_marker(item)
 
     def _edit_text(self, item):
-        self._toolbar.hide()
-        self.releaseKeyboard()
-
         # Pre-fill dialog with existing text item data
         dlg = _TextInputDialog(item.defaultTextColor(), self)
         dlg.edit.setPlainText(item.toPlainText())
@@ -3455,8 +3461,7 @@ class EnhancedRegionSelector(QWidget):
         dlg.outline_color = QColor(getattr(item, 'outline_color', QColor(0, 0, 0)))
         dlg._update_btn_color()
 
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
             if txt.strip():
                 item.setPlainText(txt)
@@ -3472,20 +3477,12 @@ class EnhancedRegionSelector(QWidget):
             else:
                 self._canvas._scene.removeItem(item)
 
-        self._toolbar.show()
-        self.activateWindow()
-        self.setFocus()
-        self.grabKeyboard()
-
     def _edit_bubble(self, item):
-        self._toolbar.hide()
-        self.releaseKeyboard()
         dlg = _BubbleInputDialog(item._fg_color, self)
         dlg.edit.setPlainText(item._text)
         dlg.bg_color = item._bg_color
         dlg._update_btn_styles()
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             txt, fg_col, bg_col = dlg.result_data()
             if txt.strip():
                 item._text = txt
@@ -3493,41 +3490,26 @@ class EnhancedRegionSelector(QWidget):
                 item._bg_color = bg_col
                 item.prepareGeometryChange()
                 item.update()
-        self._toolbar.show()
-        self.activateWindow(); self.setFocus()
-        self.grabKeyboard()
 
     def _edit_marker(self, item):
-        self._toolbar.hide()
-        self.releaseKeyboard()
         dlg = _MarkerEditDialog(item._bg_color,
                                 getattr(item, '_text_color', QColor(Qt.GlobalColor.white)),
                                 self)
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             bg, fg = dlg.result_data()
             item._bg_color = bg
             item._text_color = fg
             item.update()
-        self._toolbar.show()
-        self.activateWindow(); self.setFocus()
-        self.grabKeyboard()
 
     def _edit_highlight(self, item):
-        self._toolbar.hide()
-        self.releaseKeyboard()
         dlg = HighlightEditDialog(item._color, self)
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             new_color = dlg.result_color()
             item._color = new_color
             border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
             item.setPen(QPen(border, 1.5))
             item.setBrush(QBrush(new_color))
             item.update()
-        self._toolbar.show()
-        self.activateWindow(); self.setFocus()
-        self.grabKeyboard()
 
     def contextMenuEvent(self, e):
         lpos = e.position().toPoint()
