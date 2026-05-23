@@ -1197,19 +1197,19 @@ class RegionSelector(QWidget):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self.start_pos = self.end_pos = e.pos()
+            self.start_pos = self.end_pos = e.position().toPoint()
             self.global_start = self.global_end = e.globalPosition().toPoint()
             self.drawing = True
 
     def mouseMoveEvent(self, e):
         if self.drawing:
-            self.end_pos = e.pos()
+            self.end_pos = e.position().toPoint()
             self.global_end = e.globalPosition().toPoint()
             self.update()
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self.drawing:
-            self.end_pos = e.pos()
+            self.end_pos = e.position().toPoint()
             self.global_end = e.globalPosition().toPoint()
             self.drawing = False
             self.close()
@@ -1351,7 +1351,7 @@ class _OverlayCanvas(QGraphicsView):
         WA_TransparentForMouseEvents is set.
         """
         # Map the event position from parent-widget coords → viewport coords
-        vp_pos  = self.mapFrom(self.parent(), qevent.pos())
+        vp_pos  = self.mapFrom(self.parent(), qevent.position().toPoint())
         scene_p = self.mapToScene(vp_pos)
 
         from PySide6.QtCore import QEvent
@@ -3187,7 +3187,7 @@ class EnhancedRegionSelector(QWidget):
         gpos = e.globalPosition().toPoint()
         if self._toolbar_contains(gpos):
             return
-        lpos = e.pos()
+        lpos = e.position().toPoint()
 
         # ── Inline capture-selection mode ─────────────────────────────────────
         if self._current_tool == "_capture_select":
@@ -3254,7 +3254,7 @@ class EnhancedRegionSelector(QWidget):
 
     def mouseMoveEvent(self, e):
         gpos = e.globalPosition().toPoint()
-        lpos = e.pos()
+        lpos = e.position().toPoint()
 
         # Dynamically move the toolbar to the monitor where the cursor currently is
         cursor_screen = QApplication.screenAt(gpos)
@@ -3373,7 +3373,7 @@ class EnhancedRegionSelector(QWidget):
         for item in self._canvas._scene.selectedItems():
             if hasattr(item, '_width_drag_active'):
                 item._width_drag_active = False
-        lpos = e.pos()
+        lpos = e.position().toPoint()
 
         # ── Inline capture-selection mode — finalize rect ─────────────────────
         if self._current_tool == "_capture_select":
@@ -3422,7 +3422,7 @@ class EnhancedRegionSelector(QWidget):
             return
         # Allow editing text if we are in SELECT mode
         if self._current_tool == self.TOOL_SELECT:
-            lpos = e.pos()
+            lpos = e.position().toPoint()
             scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
             item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
             
@@ -3530,7 +3530,7 @@ class EnhancedRegionSelector(QWidget):
         self.grabKeyboard()
 
     def contextMenuEvent(self, e):
-        lpos = e.pos()
+        lpos = e.position().toPoint()
         scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
         item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
         if item is not None:
@@ -5582,11 +5582,11 @@ class EditorCanvas(QGraphicsView):
 
     def mousePressEvent(self, event):
         self.setFocus() # Ensure canvas has focus for keyboard events
-        scene_pos = self.mapToScene(event.pos())
-        
+        scene_pos = self.mapToScene(event.position().toPoint())
+
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            self._pan_start = event.pos()
+            self._pan_start = event.position().toPoint()
             return
 
         if self.current_tool == "Eraser":
@@ -5670,13 +5670,13 @@ class EditorCanvas(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.MiddleButton and getattr(self, '_pan_start', None) is not None:
-            delta = event.pos() - self._pan_start
+            delta = event.position().toPoint() - self._pan_start
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
-            self._pan_start = event.pos()
+            self._pan_start = event.position().toPoint()
             return
 
-        scene_pos = self.mapToScene(event.pos())
+        scene_pos = self.mapToScene(event.position().toPoint())
         
         if self.current_tool in ["Select", "Crop"] and not self.resizing_item:
             _, handle = self.get_handle_at(scene_pos)
