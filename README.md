@@ -5,7 +5,7 @@
 # PyShareX — Open-Source ShareX Alternative Made in Python
 
 PyShareX is an open-source ShareX alternative written in Python for Linux and Windows.  
-It provides instant screenshot uploads, custom uploaders, clipboard automation and a fast productivity workflow.  
+It provides instant screenshot uploads, screenshot editor, video converter, text and QR recognition, clipboard automation and a fast productivity workflow.  
 Built with the help of Claude AI and Gemini.
 
 ----
