@@ -1613,11 +1613,10 @@ class _OverlayCanvas(QGraphicsView):
         return None, None
 
     def handle_resize(self, item, handle, scene_pos: QPointF, proportional=False):
-        """Resize/rotate item — same logic as EditorCanvas.handle_resize_logic."""
-        # Width handle — drag vertically to change pen width (same logic as LineItem)
+        """Resize/rotate item — full unified logic."""
+        # Width handle — drag vertically to change pen width
         if handle == 'WIDTH' and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
             local_pos = item.mapFromScene(scene_pos)
-            # Initialise drag baseline on first call (reset when mouse is released)
             if not getattr(item, '_width_drag_active', False):
                 item._width_drag_active = True
                 item._width_drag_start_pos = local_pos
@@ -1630,17 +1629,18 @@ class _OverlayCanvas(QGraphicsView):
             item.prepareGeometryChange()
             item.update()
             return
-        # ArrowItem / LineItem: move endpoint handles (TL=p1, BR=p2) or width
+
+        # ArrowItem / LineItem
         if isinstance(item, (ArrowItem, LineItem)):
             line = item.line()
             local_pos = item.mapFromScene(scene_pos)
             if handle == 'TL':
-                line.setP1(local_pos)
                 item.prepareGeometryChange()
+                line.setP1(local_pos)
                 item.setLine(line)
             elif handle == 'BR':
-                line.setP2(local_pos)
                 item.prepareGeometryChange()
+                line.setP2(local_pos)
                 item.setLine(line)
             elif handle == 'WIDTH':
                 if not getattr(item, '_width_drag_active', False):
@@ -1655,7 +1655,84 @@ class _OverlayCanvas(QGraphicsView):
                 item.prepareGeometryChange()
             item.update()
             return
-        # _MarkerItem uses uniform scale — Ctrl always forces equal W/H
+
+        # TextBubbleItem
+        if isinstance(item, TextBubbleItem):
+            local_pos = item.mapFromScene(scene_pos)
+            if handle == 'BR':
+                new_w = max(item.MIN_SIZE, local_pos.x())
+                new_h = max(item.MIN_SIZE, local_pos.y())
+                item.prepareGeometryChange()
+                item._w = new_w
+                item._h = new_h
+                item._auto_grow()
+                item.update()
+            return
+
+        # _MarkerItem: uniform scale
+        if isinstance(item, _MarkerItem):
+            local_pos = item.mapFromScene(scene_pos)
+            dist = math.hypot(local_pos.x(), local_pos.y())
+            dist = max(dist, item.RADIUS * 0.2)
+            item.prepareGeometryChange()
+            item._scale = dist / item.RADIUS
+            item.update()
+            return
+
+        # --- ROTATION ---
+        if handle == 'ROTATE':
+            item.update() 
+            center_scene = item.mapToScene(item.rect().center())
+            diff = scene_pos - center_scene
+            angle = math.degrees(math.atan2(diff.y(), diff.x())) + 90
+            if proportional:
+                angle = round(angle / 45) * 45
+            item.setTransformOriginPoint(item.rect().center())
+            item.setRotation(angle)
+            item.update()
+            return
+
+        # --- STANDARD SCALING (Rect, Ellipse, Pixmap, Freehand) ---
+        if hasattr(item, 'rect'):
+            old_rect = item.rect()
+            local_pos = item.mapFromScene(scene_pos)
+            
+            fixed_local = QPointF()
+            if 'L' in handle: fixed_local.setX(old_rect.right())
+            elif 'R' in handle: fixed_local.setX(old_rect.left())
+            else: fixed_local.setX(old_rect.center().x())
+
+            if 'T' in handle: fixed_local.setY(old_rect.bottom())
+            elif 'B' in handle: fixed_local.setY(old_rect.top())
+            else: fixed_local.setY(old_rect.center().y())
+            
+            old_scene_fixed = item.mapToScene(fixed_local)
+
+            left, top, right, bottom = old_rect.left(), old_rect.top(), old_rect.right(), old_rect.bottom()
+            
+            if 'L' in handle: left = local_pos.x()
+            if 'R' in handle: right = local_pos.x()
+            if 'T' in handle: top = local_pos.y()
+            if 'B' in handle: bottom = local_pos.y()
+            
+            new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+            
+            if proportional:
+                side = max(new_rect.width(), new_rect.height())
+                if 'L' in handle: left = right - side
+                else: right = left + side
+                if 'T' in handle: top = bottom - side
+                else: bottom = top + side
+                new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+
+            item.prepareGeometryChange()
+            item.setRect(new_rect)
+            item.setTransformOriginPoint(new_rect.center())
+            
+            new_scene_fixed = item.mapToScene(fixed_local)
+            delta = old_scene_fixed - new_scene_fixed
+            item.setPos(item.pos() + delta)
+            item.update()
 
     # ------------------------------------------------------------------
     def _apply_props(self, item, color: QColor, width: int):
@@ -3154,7 +3231,8 @@ class EnhancedRegionSelector(QWidget):
         # Restore mouse events only AFTER dialog closes (exec is blocking)
         result = dlg.exec()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        # Canvas MUST remain transparent so the parent overlay can route mouse events properly
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         # Raise the overlay back after the dialog closes
         self.raise_()
         self._canvas.raise_()
@@ -3517,8 +3595,7 @@ class EnhancedRegionSelector(QWidget):
             if getattr(self, '_resizing_item', None):
                 self._resizing_item = None
                 self._resize_handle = None
-                # MUST forward the release event so items (Line, Arrow) drop their internal mouse grab
-                self._canvas.send_mouse_to_scene(e)
+                # Do NOT forward the release event if we manually intercepted the drag in mouseMove
                 return
             self._canvas.send_mouse_to_scene(e)
             return
