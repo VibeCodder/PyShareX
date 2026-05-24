@@ -130,7 +130,11 @@ def _show_color_dialog(initial_color: QColor, parent=None,
     """Show a QColorDialog that stays above fullscreen overlays on Linux.
     Returns the selected QColor, or None if cancelled.
     If force_opaque=True, alpha is forced to 255 regardless of user selection."""
-    dlg = QColorDialog(initial_color, parent)
+    color_to_show = QColor(initial_color)
+    if force_opaque:
+        color_to_show.setAlpha(255)
+
+    dlg = QColorDialog(color_to_show, parent)
     dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, alpha)
     dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
     if IS_LINUX:
@@ -3002,7 +3006,8 @@ class EnhancedRegionSelector(QWidget):
         dlg.activateWindow()
         result = dlg.exec()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        # Canvas MUST remain transparent so the parent overlay can route mouse events properly
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         # Clear any stale resize/draw state before restoring the previous tool
         self._resizing_item    = None
         self._resize_handle    = None
@@ -3130,7 +3135,8 @@ class EnhancedRegionSelector(QWidget):
         self.lower()
         QApplication.processEvents()
 
-        dlg = QFileDialog(None, "Import Image", "",
+        # Parent MUST be 'self' so it inherits the overlay's z-index and bypasses modality block
+        dlg = QFileDialog(self, "Import Image", "",
                           "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
         dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
         dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
@@ -3511,6 +3517,8 @@ class EnhancedRegionSelector(QWidget):
             if getattr(self, '_resizing_item', None):
                 self._resizing_item = None
                 self._resize_handle = None
+                # MUST forward the release event so items (Line, Arrow) drop their internal mouse grab
+                self._canvas.send_mouse_to_scene(e)
                 return
             self._canvas.send_mouse_to_scene(e)
             return
@@ -6813,7 +6821,11 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.is_dirty = True
             return
 
-        dialog = QColorDialog(self.canvas.stroke_color, self)
+        init_col = QColor(self.canvas.stroke_color)
+        if self.canvas.current_tool != "Highlight":
+            init_col.setAlpha(255)
+        
+        dialog = QColorDialog(init_col, self)
         dialog.setWindowTitle("Pick Color & Alpha")
         dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
