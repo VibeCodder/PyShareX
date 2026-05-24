@@ -5971,7 +5971,7 @@ class EditorCanvas(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
-        scene_pos = self.mapToScene(event.pos())
+        scene_pos = self.mapToScene(event.position().toPoint())
         item = self.scene.itemAt(scene_pos, self.transform())
         if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
             win = self.window()
@@ -6016,7 +6016,7 @@ class EditorCanvas(QGraphicsView):
             super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
-        scene_pos = self.mapToScene(event.pos())
+        scene_pos = self.mapToScene(event.pos())  # QContextMenuEvent uses .pos(), not .position()
         item = self.scene.itemAt(scene_pos, self.transform())
         if item in (self.bg_item, self.crop_item) or item is None:
             super().contextMenuEvent(event)
