@@ -1626,54 +1626,32 @@ class _OverlayCanvas(QGraphicsView):
             item.prepareGeometryChange()
             item.update()
             return
-        # _MarkerItem uses uniform scale — Ctrl always forces equal W/H
-        if isinstance(item, _MarkerItem):
+        # ArrowItem / LineItem: move endpoint handles (TL=p1, BR=p2) or width
+        if isinstance(item, (ArrowItem, LineItem)):
+            line = item.line()
             local_pos = item.mapFromScene(scene_pos)
-            old_r = item.RADIUS * item._scale
-            if proportional or handle in ('TL', 'TR', 'BL', 'BR'):
-                # equal W/H: use the larger of dx/dy from centre
-                dist = max(abs(local_pos.x()), abs(local_pos.y()))
-            else:
-                dist = math.hypot(local_pos.x(), local_pos.y())
-            dist = max(dist, item.RADIUS * 0.2)   # minimum size guard
-            item.prepareGeometryChange()
-            item._scale = dist / item.RADIUS
+            if handle == 'TL':
+                line.setP1(local_pos)
+                item.prepareGeometryChange()
+                item.setLine(line)
+            elif handle == 'BR':
+                line.setP2(local_pos)
+                item.prepareGeometryChange()
+                item.setLine(line)
+            elif handle == 'WIDTH':
+                if not getattr(item, '_width_drag_active', False):
+                    item._width_drag_active = True
+                    item._width_drag_start_pos = local_pos
+                    item._width_drag_start_w   = item.pen().width()
+                dy = local_pos.y() - item._width_drag_start_pos.y()
+                new_w = max(1, int(item._width_drag_start_w + dy * 0.3))
+                pen = item.pen()
+                pen.setWidth(new_w)
+                item.setPen(pen)
+                item.prepareGeometryChange()
             item.update()
             return
-        if handle == 'ROTATE':
-            center = item.mapToScene(item.rect().center())
-            diff  = scene_pos - center
-            angle = math.degrees(math.atan2(diff.y(), diff.x())) + 90
-            if proportional:
-                angle = round(angle / 45) * 45
-            item.setTransformOriginPoint(item.rect().center())
-            item.setRotation(angle)
-            item.update()
-            return
-        old_rect   = item.rect()
-        local_pos  = item.mapFromScene(scene_pos)
-        fixed      = QPointF(
-            old_rect.right()  if 'L' in handle else
-            old_rect.left()   if 'R' in handle else old_rect.center().x(),
-            old_rect.bottom() if 'T' in handle else
-            old_rect.top()    if 'B' in handle else old_rect.center().y())
-        old_fixed_scene = item.mapToScene(fixed)
-        l = local_pos.x() if 'L' in handle else old_rect.left()
-        r = local_pos.x() if 'R' in handle else old_rect.right()
-        t = local_pos.y() if 'T' in handle else old_rect.top()
-        b = local_pos.y() if 'B' in handle else old_rect.bottom()
-        new_rect = QRectF(QPointF(l, t), QPointF(r, b)).normalized()
-        if proportional:
-            side = max(new_rect.width(), new_rect.height())
-            l = (r - side) if 'L' in handle else l
-            r = (l + side) if 'R' in handle else r
-            t = (b - side) if 'T' in handle else t
-            b = (t + side) if 'B' in handle else b
-            new_rect = QRectF(QPointF(l, t), QPointF(r, b)).normalized()
-        item.setRect(new_rect)
-        item.setTransformOriginPoint(new_rect.center())
-        new_fixed_scene = item.mapToScene(fixed)
-        item.setPos(item.pos() + old_fixed_scene - new_fixed_scene)
+        # _MarkerItem uses uniform scale — Ctrl always forces equal W/H
 
     # ------------------------------------------------------------------
     def _apply_props(self, item, color: QColor, width: int):
@@ -2964,6 +2942,9 @@ class EnhancedRegionSelector(QWidget):
 
         # Reset drawing state when switching tools to avoid stale start position
         self._draw_start_scene = None
+        # Clear any stale resize state (e.g. after handle drag on Line/Arrow)
+        self._resizing_item  = None
+        self._resize_handle  = None
         if self._preview_item is not None:
             try:
                 self._canvas._scene.removeItem(self._preview_item)
@@ -3000,7 +2981,11 @@ class EnhancedRegionSelector(QWidget):
         not create new annotations). The previous tool is restored afterwards."""
         prev_tool = self._current_tool
         # Switch to SELECT so stray clicks don't spawn duplicate annotations
-        self._select_tool(self.TOOL_SELECT)
+        self._current_tool = self.TOOL_SELECT
+        for tid, btn in self._tool_btns.items():
+            if btn.isCheckable():
+                btn.setChecked(tid == self.TOOL_SELECT)
+        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self._toolbar.hide()
         self.releaseKeyboard()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -3018,8 +3003,25 @@ class EnhancedRegionSelector(QWidget):
         result = dlg.exec()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        # Clear any stale resize/draw state before restoring the previous tool
+        self._resizing_item    = None
+        self._resize_handle    = None
+        self._draw_start_scene = None
+        self._preview_item     = None
         # Restore the tool that was active before the dialog
-        self._select_tool(prev_tool)
+        # Use direct assignment to avoid re-triggering IMAGE/COLOR side effects
+        if prev_tool not in (self.TOOL_IMAGE, self.TOOL_COLOR):
+            self._current_tool = prev_tool
+            for tid, btn in self._tool_btns.items():
+                if btn.isCheckable():
+                    btn.setChecked(tid == prev_tool)
+            cross = (self.TOOL_DETECT, self.TOOL_RECT, self.TOOL_CIRCLE,
+                     self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
+                     self.TOOL_FREEHAND)
+            cur = Qt.CursorShape.CrossCursor if prev_tool in cross else Qt.CursorShape.ArrowCursor
+            self.setCursor(QCursor(cur))
+        else:
+            self._current_tool = self.TOOL_SELECT
         self._toolbar.show()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
@@ -3089,15 +3091,21 @@ class EnhancedRegionSelector(QWidget):
 
     def _open_generic_color_picker(self, apply_to_item=None):
         """Show a plain QColorDialog and apply result to the drawing colour
-        and optionally to *apply_to_item*."""
-        dlg = QColorDialog(self._draw_color, self)
+        and optionally to *apply_to_item*.
+        For all tools except Highlight the dialog opens with alpha=255 by default."""
+        is_highlight = isinstance(apply_to_item, HighlightRectItem)
+        # Build initial color: for non-Highlight tools always show alpha=255 in the picker
+        init_color = QColor(self._draw_color)
+        if not is_highlight:
+            init_color.setAlpha(255)
+        dlg = QColorDialog(init_color, self)
         dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
         if self._exec_dialog(dlg):
             c = dlg.selectedColor()
             if c.isValid():
                 # Force alpha=255 for all annotation tools (Highlight manages its own alpha)
-                if not isinstance(apply_to_item, HighlightRectItem):
+                if not is_highlight:
                     c.setAlpha(255)
                 self._draw_color = c
                 self._color_preview.setStyleSheet(
@@ -3115,24 +3123,35 @@ class EnhancedRegionSelector(QWidget):
     def _import_image(self):
         self._toolbar.hide()
         self.releaseKeyboard()
+        # Make the entire overlay pass-through so the file dialog gets mouse events
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        # Briefly lower the overlay so the dialog can paint on top
+        self.lower()
         QApplication.processEvents()
 
         dlg = QFileDialog(None, "Import Image", "",
                           "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
         dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
         dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        flags = Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint
+        flags = (Qt.WindowType.Window |
+                 Qt.WindowType.WindowStaysOnTopHint |
+                 Qt.WindowType.Dialog)
         if IS_LINUX:
             flags |= Qt.WindowType.X11BypassWindowManagerHint
         dlg.setWindowFlags(flags)
-        dlg.show(); dlg.raise_(); dlg.activateWindow()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        QApplication.processEvents()
 
         # Restore mouse events only AFTER dialog closes (exec is blocking)
         result = dlg.exec()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        # Raise the overlay back after the dialog closes
+        self.raise_()
+        self._canvas.raise_()
 
         if result == QFileDialog.DialogCode.Accepted:
             files = dlg.selectedFiles()
