@@ -1548,39 +1548,64 @@ class _OverlayCanvas(QGraphicsView):
     def get_handle_at(self, scene_pos: QPointF):
         """Return (item, handle_name) if pos is over a resize handle."""
         for item in self._scene.selectedItems():
-            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem,
-                                  ResizablePixmapItem, FreehandItem,
-                                  TextBubbleItem)):
-                local_pos = item.mapFromScene(scene_pos)
-                rect = item.rect()
-                m = 10.0
-                # Rotation handle — for all rect-like items except Markers
-                if not isinstance(item, _MarkerItem):
-                    rot_pt = QPointF(rect.center().x(), rect.top() - 30)
-                    if (abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
-                            abs(local_pos.y() - rot_pt.y()) < m * 1.5):
-                        return item, 'ROTATE'
-                # Width handle (yellow dot below bottom edge) for Rect and Ellipse
-                if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
-                    wp = item._width_handle_pos()
-                    if math.hypot(local_pos.x() - wp.x(), local_pos.y() - wp.y()) <= 14:
-                        return item, 'WIDTH'
-                L = abs(local_pos.x() - rect.left())  < m
-                R = abs(local_pos.x() - rect.right()) < m
-                T = abs(local_pos.y() - rect.top())   < m
-                B = abs(local_pos.y() - rect.bottom())< m
-                # TextBubbleItem: only bottom-right corner (BR) for scaling
-                if isinstance(item, TextBubbleItem):
-                    if R and B: return item, 'BR'
-                else:
-                    if L and T: return item, 'TL'
-                    if R and T: return item, 'TR'
-                    if L and B: return item, 'BL'
-                    if R and B: return item, 'BR'
-                    if L: return item, 'L'
-                    if R: return item, 'R'
-                    if T: return item, 'T'
-                    if B: return item, 'B'
+            # Include all annotation item types that support handles
+            if not isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem,
+                                     ResizablePixmapItem, FreehandItem,
+                                     TextBubbleItem, ArrowItem, LineItem,
+                                     _MarkerItem)):
+                continue
+            local_pos = item.mapFromScene(scene_pos)
+            rect = item.rect()
+            m = 12.0  # slightly larger hit zone for easier interaction
+
+            # _MarkerItem: only scale handle (left edge of bounding rect)
+            if isinstance(item, _MarkerItem):
+                r = item.RADIUS * item._scale
+                if math.hypot(local_pos.x() + r, local_pos.y()) <= item.HANDLE_RADIUS + 6:
+                    return item, 'TL'  # reuse TL to trigger uniform scale
+                continue
+
+            # ArrowItem / LineItem: end-point handles
+            if isinstance(item, (ArrowItem, LineItem)):
+                line = item.line()
+                p1 = line.p1()
+                p2 = line.p2()
+                if math.hypot(local_pos.x() - p1.x(), local_pos.y() - p1.y()) <= m:
+                    return item, 'TL'  # p1 — mapped to TL resize logic
+                if math.hypot(local_pos.x() - p2.x(), local_pos.y() - p2.y()) <= m:
+                    return item, 'BR'  # p2 — mapped to BR resize logic
+                continue
+
+            # Rotation handle — above top edge (all rect/ellipse/pixmap/freehand items)
+            rot_pt = QPointF(rect.center().x(), rect.top() - 30)
+            if (abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
+                    abs(local_pos.y() - rot_pt.y()) < m * 1.5):
+                return item, 'ROTATE'
+
+            # Width handle (yellow dot below bottom edge) for Rect and Ellipse
+            if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+                wp = item._width_handle_pos()
+                if math.hypot(local_pos.x() - wp.x(), local_pos.y() - wp.y()) <= 14:
+                    return item, 'WIDTH'
+
+            # Corner & edge resize handles
+            L = abs(local_pos.x() - rect.left())  < m
+            R = abs(local_pos.x() - rect.right()) < m
+            T = abs(local_pos.y() - rect.top())   < m
+            B = abs(local_pos.y() - rect.bottom()) < m
+
+            # TextBubbleItem: only bottom-right corner (BR) for scaling
+            if isinstance(item, TextBubbleItem):
+                if R and B: return item, 'BR'
+            else:
+                if L and T: return item, 'TL'
+                if R and T: return item, 'TR'
+                if L and B: return item, 'BL'
+                if R and B: return item, 'BR'
+                if L: return item, 'L'
+                if R: return item, 'R'
+                if T: return item, 'T'
+                if B: return item, 'B'
         return None, None
 
     def handle_resize(self, item, handle, scene_pos: QPointF, proportional=False):
@@ -2937,6 +2962,15 @@ class EnhancedRegionSelector(QWidget):
         if tool_id == self.TOOL_COLOR:
             self._pick_color(); return
 
+        # Reset drawing state when switching tools to avoid stale start position
+        self._draw_start_scene = None
+        if self._preview_item is not None:
+            try:
+                self._canvas._scene.removeItem(self._preview_item)
+            except Exception:
+                pass
+            self._preview_item = None
+
         self._current_tool = tool_id
         for tid, btn in self._tool_btns.items():
             if btn.isCheckable():
@@ -3095,10 +3129,12 @@ class EnhancedRegionSelector(QWidget):
         dlg.setWindowFlags(flags)
         dlg.show(); dlg.raise_(); dlg.activateWindow()
 
+        # Restore mouse events only AFTER dialog closes (exec is blocking)
+        result = dlg.exec()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
 
-        if dlg.exec() == QFileDialog.DialogCode.Accepted:
+        if result == QFileDialog.DialogCode.Accepted:
             files = dlg.selectedFiles()
             if files:
                 pix = QPixmap(files[0])
