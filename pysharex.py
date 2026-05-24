@@ -1798,6 +1798,7 @@ class HighlightRectItem(QGraphicsRectItem):
 
     def _open_edit_dialog(self, event=None):
         dlg = HighlightEditDialog(self._color)
+        _set_dialog_on_top(dlg)
         # Show near the item
         if event:
             dlg.move(event.screenPos())
@@ -3522,7 +3523,7 @@ class EnhancedRegionSelector(QWidget):
             item.update()
 
     def contextMenuEvent(self, e):
-        lpos = e.position().toPoint()
+        lpos = e.pos()
         scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
         item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
         if item is not None:
