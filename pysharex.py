@@ -1788,7 +1788,7 @@ class HighlightRectItem(QGraphicsRectItem):
         menu = QMenu()
         edit_act = menu.addAction("✏️ Edit")
         del_act  = menu.addAction("🗑️ Delete")
-        action = menu.exec(event.screenPos().toPoint())
+        action = menu.exec(event.screenPos())
         if action == edit_act:
             self._open_edit_dialog(event)
         elif action == del_act:
@@ -1800,7 +1800,7 @@ class HighlightRectItem(QGraphicsRectItem):
         dlg = HighlightEditDialog(self._color)
         # Show near the item
         if event:
-            dlg.move(event.screenPos().toPoint())
+            dlg.move(event.screenPos())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_color = dlg.result_color()
             self._color = new_color
