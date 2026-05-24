@@ -16,10 +16,19 @@ Run
 python3 install.py
 ```
 
-If something won't work you can optionally use this command:
+If something won't work you can optionally use these commands:
+
 ```
-sudo apt update && sudo apt install libxcb-cursor0
+sudo apt update
+sudo apt install libxcb-cursor0
 ```
+
+```
+sudo apt install libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-util1
+```
+
+
+
 
 ## For Windows:
 
