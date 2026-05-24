@@ -124,6 +124,27 @@ def _set_dialog_on_top(dlg):
     dlg.raise_()
     dlg.activateWindow()
 
+
+def _show_color_dialog(initial_color: QColor, parent=None,
+                       alpha: bool = True) -> QColor | None:
+    """Show a QColorDialog that stays above fullscreen overlays on Linux.
+    Returns the selected QColor, or None if cancelled."""
+    dlg = QColorDialog(initial_color, parent)
+    dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, alpha)
+    dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+    if IS_LINUX:
+        dlg.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.X11BypassWindowManagerHint
+        )
+    dlg.raise_()
+    dlg.activateWindow()
+    if dlg.exec():
+        c = dlg.selectedColor()
+        return c if c.isValid() else None
+    return None
+
 # ── Hide console window on Windows ──────────────────────────────────────────
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
 
@@ -1679,15 +1700,11 @@ class HighlightEditDialog(QDialog):
         self._update_btn()
 
     def _pick_color(self):
-        dlg = QColorDialog(self.color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                c.setAlpha(self.color.alpha())
-                self.color = c
-                self._update_btn()
+        c = _show_color_dialog(self.color, self, alpha=False)
+        if c is not None:
+            c.setAlpha(self.color.alpha())
+            self.color = c
+            self._update_btn()
 
     def _on_opacity_changed(self, val):
         self.color.setAlpha(val)
@@ -2181,24 +2198,16 @@ class _BubbleInputDialog(QDialog):
         self._update_btn_styles()
 
     def _pick_fg(self):
-        dlg = QColorDialog(self.fg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.fg_color = c
-                self._update_btn_styles()
+        c = _show_color_dialog(self.fg_color, self)
+        if c is not None:
+            self.fg_color = c
+            self._update_btn_styles()
 
     def _pick_bg(self):
-        dlg = QColorDialog(self.bg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.bg_color = c
-                self._update_btn_styles()
+        c = _show_color_dialog(self.bg_color, self)
+        if c is not None:
+            self.bg_color = c
+            self._update_btn_styles()
 
     def _update_btn_styles(self):
         c = self.fg_color
@@ -2247,24 +2256,16 @@ class _BubbleEditDialog(QDialog):
         self._update_btn_styles()
 
     def _pick_fg(self):
-        dlg = QColorDialog(self.fg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.fg_color = c
-                self._update_btn_styles()
+        c = _show_color_dialog(self.fg_color, self)
+        if c is not None:
+            self.fg_color = c
+            self._update_btn_styles()
 
     def _pick_bg(self):
-        dlg = QColorDialog(self.bg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.bg_color = c
-                self._update_btn_styles()
+        c = _show_color_dialog(self.bg_color, self)
+        if c is not None:
+            self.bg_color = c
+            self._update_btn_styles()
 
     def _update_btn_styles(self):
         c = self.fg_color
@@ -2303,24 +2304,16 @@ class _MarkerEditDialog(QDialog):
         self._update_styles()
 
     def _pick_bg(self):
-        dlg = QColorDialog(self.bg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.bg_color = c
-                self._update_styles()
+        c = _show_color_dialog(self.bg_color, self)
+        if c is not None:
+            self.bg_color = c
+            self._update_styles()
 
     def _pick_txt(self):
-        dlg = QColorDialog(self.text_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.text_color = c
-                self._update_styles()
+        c = _show_color_dialog(self.text_color, self)
+        if c is not None:
+            self.text_color = c
+            self._update_styles()
 
     def _update_styles(self):
         c = self.bg_color
@@ -2569,34 +2562,22 @@ class _TextInputDialog(QDialog):
         self._update_btn_color()
 
     def _pick_col(self):
-        dlg = QColorDialog(self.color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.color = c
-                self._update_btn_color()
+        c = _show_color_dialog(self.color, self)
+        if c is not None:
+            self.color = c
+            self._update_btn_color()
 
     def _pick_hl(self):
-        dlg = QColorDialog(self.highlight, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.highlight = c
-                self._update_btn_color()
+        c = _show_color_dialog(self.highlight, self)
+        if c is not None:
+            self.highlight = c
+            self._update_btn_color()
 
     def _pick_ol_color(self):
-        dlg = QColorDialog(self.outline_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.outline_color = c
-                self._update_btn_color()
+        c = _show_color_dialog(self.outline_color, self)
+        if c is not None:
+            self.outline_color = c
+            self._update_btn_color()
 
     def _update_btn_color(self):
         c = self.color
