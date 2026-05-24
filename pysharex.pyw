@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu, QFileDialog, QDialog, QLineEdit,
     QComboBox, QCheckBox, QGroupBox, QScrollArea, QFrame,
     QMessageBox, QListWidget, QListWidgetItem,
-    QKeySequenceEdit, QDialogButtonBox, QSpinBox, QTabWidget,
+    QDialogButtonBox, QSpinBox, QTabWidget,
     QTextEdit, QSizePolicy, QStackedWidget, QColorDialog, QInputDialog,
     QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsRectItem,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem
@@ -40,6 +40,7 @@ from PySide6.QtGui import (
     QFont, QPen, QBrush, QCursor, QPainterPath, QImage, QPainterPathStroker,
     QFontMetricsF
 )
+from PySide6.QtGui import QShortcut
 
 try:
     from PIL import Image
@@ -1197,19 +1198,19 @@ class RegionSelector(QWidget):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self.start_pos = self.end_pos = e.pos()
+            self.start_pos = self.end_pos = e.position().toPoint()
             self.global_start = self.global_end = e.globalPosition().toPoint()
             self.drawing = True
 
     def mouseMoveEvent(self, e):
         if self.drawing:
-            self.end_pos = e.pos()
+            self.end_pos = e.position().toPoint()
             self.global_end = e.globalPosition().toPoint()
             self.update()
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self.drawing:
-            self.end_pos = e.pos()
+            self.end_pos = e.position().toPoint()
             self.global_end = e.globalPosition().toPoint()
             self.drawing = False
             self.close()
@@ -1351,7 +1352,7 @@ class _OverlayCanvas(QGraphicsView):
         WA_TransparentForMouseEvents is set.
         """
         # Map the event position from parent-widget coords → viewport coords
-        vp_pos  = self.mapFrom(self.parent(), qevent.pos())
+        vp_pos  = self.mapFrom(self.parent(), qevent.position().toPoint())
         scene_p = self.mapToScene(vp_pos)
 
         from PySide6.QtCore import QEvent
@@ -2619,6 +2620,7 @@ class EnhancedRegionSelector(QWidget):
     """
     region_selected = Signal(int, int, int, int)
     cancelled       = Signal()
+    _esc_sig        = Signal()  # emitted from pynput thread, handled on main thread
 
     TOOL_DETECT    = "detect"
     TOOL_SELECT    = "select"
@@ -2710,6 +2712,7 @@ class EnhancedRegionSelector(QWidget):
         # is truly active at the OS level (e.g. when triggered via global hotkey
         # the window isn't active yet at __init__ time, so ESC wouldn't fire
         # until the user clicked, which finally made Qt the active window).
+        self._esc_sig.connect(self._esc_pressed)
         QTimer.singleShot(150, self._activate_and_grab)
         QTimer.singleShot(80, self._update_detection_at_cursor)
 
@@ -2726,11 +2729,17 @@ class EnhancedRegionSelector(QWidget):
     def _start_esc_listener(self):
         if not PYNPUT_AVAILABLE:
             return
+        # Connect only once
+        try:
+            self._esc_sig.disconnect()
+        except Exception:
+            pass
+        self._esc_sig.connect(self._esc_pressed)
         from pynput import keyboard as _kb
         def on_press(key):
             try:
                 if key == _kb.Key.esc:
-                    QTimer.singleShot(0, self._esc_pressed)
+                    self._esc_sig.emit()  # thread-safe signal, no QTimer needed
                     return False  # stop listener
             except Exception:
                 pass
@@ -2953,6 +2962,36 @@ class EnhancedRegionSelector(QWidget):
         if tool_id == self.TOOL_DETECT:
             self._update_detection_at_cursor()
 
+    def _exec_dialog(self, dlg) -> int:
+        """Run a modal dialog while the overlay is active.
+        Switches to SELECT tool before opening so any stray mouse events that
+        land on the overlay after the dialog closes are harmless (select does
+        not create new annotations). The previous tool is restored afterwards."""
+        prev_tool = self._current_tool
+        # Switch to SELECT so stray clicks don't spawn duplicate annotations
+        self._select_tool(self.TOOL_SELECT)
+        self._toolbar.hide()
+        self.releaseKeyboard()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        QApplication.processEvents()
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        result = dlg.exec()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        # Restore the tool that was active before the dialog
+        self._select_tool(prev_tool)
+        self._toolbar.show()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        self.grabKeyboard()
+        return result
+
+    
+
     def _pick_color(self):
         """Open a context-aware edit dialog for the selected item, or a plain
         colour picker if no item is selected / the item has no dedicated dialog."""
@@ -2979,9 +3018,8 @@ class EnhancedRegionSelector(QWidget):
         """Open the dedicated edit dialog for *item*.
         Returns True if a dedicated dialog was shown, False otherwise."""
         if isinstance(item, HighlightRectItem):
-            dlg = HighlightEditDialog(item._color)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+            dlg = HighlightEditDialog(item._color, self)
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 new_color = dlg.result_color()
                 item._color = new_color
                 border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
@@ -2991,9 +3029,8 @@ class EnhancedRegionSelector(QWidget):
             return True
 
         if isinstance(item, TextBubbleItem):
-            dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+            dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 text, fg, bg = dlg.result_data()
                 item._text     = text
                 item._fg_color = fg
@@ -3004,9 +3041,9 @@ class EnhancedRegionSelector(QWidget):
         if isinstance(item, _MarkerItem):
             dlg = _MarkerEditDialog(
                 QColor(item._bg_color),
-                QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))))
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+                QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
+                self)
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 item._bg_color   = dlg.bg_color
                 item._text_color = dlg.text_color
                 item.update()
@@ -3017,11 +3054,10 @@ class EnhancedRegionSelector(QWidget):
     def _open_generic_color_picker(self, apply_to_item=None):
         """Show a plain QColorDialog and apply result to the drawing colour
         and optionally to *apply_to_item*."""
-        dlg = QColorDialog(self._draw_color, None)
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        dlg = QColorDialog(self._draw_color, self)
         dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
+        if self._exec_dialog(dlg):
             c = dlg.selectedColor()
             if c.isValid():
                 self._draw_color = c
@@ -3186,7 +3222,7 @@ class EnhancedRegionSelector(QWidget):
         gpos = e.globalPosition().toPoint()
         if self._toolbar_contains(gpos):
             return
-        lpos = e.pos()
+        lpos = e.position().toPoint()
 
         # ── Inline capture-selection mode ─────────────────────────────────────
         if self._current_tool == "_capture_select":
@@ -3221,11 +3257,8 @@ class EnhancedRegionSelector(QWidget):
             self._canvas.add_marker(scene_pos, self._draw_color)
 
         elif self._current_tool == self.TOOL_TEXT:
-            self._toolbar.hide()
-            self.releaseKeyboard() # Allow keyboard input for the dialog
-            dlg = _TextInputDialog(QColor(self._draw_color), None)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+            dlg = _TextInputDialog(QColor(self._draw_color), self)
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
                 if txt.strip():
                     item = self._canvas.add_text(scene_pos, txt, fsz, col, hl)
@@ -3234,26 +3267,17 @@ class EnhancedRegionSelector(QWidget):
                     item.outline_enabled   = ol_on
                     item.outline_width     = ol_w
                     item.outline_color     = ol_col
-            self._toolbar.show()
-            self.activateWindow(); self.setFocus()
-            self.grabKeyboard() # Re-lock keyboard interactions to the overlay
 
         elif self._current_tool == self.TOOL_BUBBLE:
-            self._toolbar.hide()
-            self.releaseKeyboard()
-            dlg = _BubbleInputDialog(QColor(self._draw_color), None)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
+            dlg = _BubbleInputDialog(QColor(self._draw_color), self)
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
                     self._canvas.add_bubble(scene_pos, txt, fg_col, bg_col)
-            self._toolbar.show()
-            self.activateWindow(); self.setFocus()
-            self.grabKeyboard()
 
     def mouseMoveEvent(self, e):
         gpos = e.globalPosition().toPoint()
-        lpos = e.pos()
+        lpos = e.position().toPoint()
 
         # Dynamically move the toolbar to the monitor where the cursor currently is
         cursor_screen = QApplication.screenAt(gpos)
@@ -3372,7 +3396,7 @@ class EnhancedRegionSelector(QWidget):
         for item in self._canvas._scene.selectedItems():
             if hasattr(item, '_width_drag_active'):
                 item._width_drag_active = False
-        lpos = e.pos()
+        lpos = e.position().toPoint()
 
         # ── Inline capture-selection mode — finalize rect ─────────────────────
         if self._current_tool == "_capture_select":
@@ -3421,7 +3445,7 @@ class EnhancedRegionSelector(QWidget):
             return
         # Allow editing text if we are in SELECT mode
         if self._current_tool == self.TOOL_SELECT:
-            lpos = e.pos()
+            lpos = e.position().toPoint()
             scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
             item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
             
@@ -3438,11 +3462,8 @@ class EnhancedRegionSelector(QWidget):
                 self._edit_marker(item)
 
     def _edit_text(self, item):
-        self._toolbar.hide()
-        self.releaseKeyboard()
-
         # Pre-fill dialog with existing text item data
-        dlg = _TextInputDialog(item.defaultTextColor(), None)
+        dlg = _TextInputDialog(item.defaultTextColor(), self)
         dlg.edit.setPlainText(item.toPlainText())
         dlg.sz.setValue(item.font().pointSize())
         if hasattr(item, 'highlight_color'):
@@ -3454,8 +3475,7 @@ class EnhancedRegionSelector(QWidget):
         dlg.outline_color = QColor(getattr(item, 'outline_color', QColor(0, 0, 0)))
         dlg._update_btn_color()
 
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
             if txt.strip():
                 item.setPlainText(txt)
@@ -3471,20 +3491,12 @@ class EnhancedRegionSelector(QWidget):
             else:
                 self._canvas._scene.removeItem(item)
 
-        self._toolbar.show()
-        self.activateWindow()
-        self.setFocus()
-        self.grabKeyboard()
-
     def _edit_bubble(self, item):
-        self._toolbar.hide()
-        self.releaseKeyboard()
-        dlg = _BubbleInputDialog(item._fg_color, None)
+        dlg = _BubbleInputDialog(item._fg_color, self)
         dlg.edit.setPlainText(item._text)
         dlg.bg_color = item._bg_color
         dlg._update_btn_styles()
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             txt, fg_col, bg_col = dlg.result_data()
             if txt.strip():
                 item._text = txt
@@ -3492,44 +3504,29 @@ class EnhancedRegionSelector(QWidget):
                 item._bg_color = bg_col
                 item.prepareGeometryChange()
                 item.update()
-        self._toolbar.show()
-        self.activateWindow(); self.setFocus()
-        self.grabKeyboard()
 
     def _edit_marker(self, item):
-        self._toolbar.hide()
-        self.releaseKeyboard()
         dlg = _MarkerEditDialog(item._bg_color,
                                 getattr(item, '_text_color', QColor(Qt.GlobalColor.white)),
-                                None)
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+                                self)
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             bg, fg = dlg.result_data()
             item._bg_color = bg
             item._text_color = fg
             item.update()
-        self._toolbar.show()
-        self.activateWindow(); self.setFocus()
-        self.grabKeyboard()
 
     def _edit_highlight(self, item):
-        self._toolbar.hide()
-        self.releaseKeyboard()
-        dlg = HighlightEditDialog(item._color)
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        dlg = HighlightEditDialog(item._color, self)
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             new_color = dlg.result_color()
             item._color = new_color
             border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
             item.setPen(QPen(border, 1.5))
             item.setBrush(QBrush(new_color))
             item.update()
-        self._toolbar.show()
-        self.activateWindow(); self.setFocus()
-        self.grabKeyboard()
 
     def contextMenuEvent(self, e):
-        lpos = e.pos()
+        lpos = e.position().toPoint()
         scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
         item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
         if item is not None:
@@ -4608,9 +4605,9 @@ class ShortcutEditDialog(QDialog):
         self.ne.setPlaceholderText("Leave blank to use action name")
         lay.addWidget(self.ne)
 
-        # Shortcut
-        lay.addWidget(QLabel("Keyboard shortcut:"))
-        self.ke = QKeySequenceEdit(QKeySequence(data.get("shortcut", "")))
+        # Shortcut — custom widget using pynput for reliable cross-platform detection
+        lay.addWidget(QLabel("Keyboard shortcut (click Capture, press keys, click Stop):"))
+        self.ke = _HotkeyEdit(data.get("shortcut", ""))
         lay.addWidget(self.ke)
 
         # Enabled
@@ -4636,11 +4633,163 @@ class ShortcutEditDialog(QDialog):
         custom_name = self.ne.text().strip()
         self.data["action"]   = action_key
         self.data["name"]     = custom_name if custom_name else default_name
-        self.data["shortcut"] = self.ke.keySequence().toString()
+        self.data["shortcut"] = self.ke.shortcut()
         self.data["enabled"]  = self.en.isChecked()
         self.accept()
 
     def get_data(self): return self.data
+
+
+class _HotkeyEdit(QWidget):
+    """Key-combination recorder that uses pynput for reliable cross-platform
+    detection — including Print Screen which Qt never forwards on Windows."""
+
+    _combo_ready = Signal(str)  # emitted from pynput thread, connected to main thread
+
+    # pynput Key → string used by _qt2pk
+    _SPECIAL = {
+        "print_screen": "Print Screen",
+        "f1":  "F1",  "f2":  "F2",  "f3":  "F3",  "f4":  "F4",
+        "f5":  "F5",  "f6":  "F6",  "f7":  "F7",  "f8":  "F8",
+        "f9":  "F9",  "f10": "F10", "f11": "F11", "f12": "F12",
+        "insert": "Insert", "delete": "Delete", "home": "Home",
+        "end": "End", "page_up": "PgUp", "page_down": "PgDown",
+        "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+        "space": "Space", "tab": "Tab", "enter": "Return",
+        "backspace": "Backspace", "escape": "Escape",
+        "num_lock": "Num Lock", "scroll_lock": "Scroll Lock",
+        "pause": "Pause", "caps_lock": "Caps Lock",
+    }
+    _MOD_NAMES = {"ctrl_l", "ctrl_r", "alt_l", "alt_r", "alt_gr",
+                  "shift_l", "shift_r", "cmd", "cmd_l", "cmd_r"}
+
+    def __init__(self, initial: str = "", parent=None):
+        super().__init__(parent)
+        self._shortcut = initial
+        self._listener = None
+        self._held_mods: set = set()
+        self._combo_ready.connect(self._accept_combo)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self._display = QLineEdit(initial)
+        self._display.setReadOnly(True)
+        self._display.setPlaceholderText("Press Capture, then press your key combination")
+        lay.addWidget(self._display)
+
+        self._btn = QPushButton("Capture")
+        self._btn.setCheckable(True)
+        self._btn.setFixedWidth(80)
+        self._btn.clicked.connect(self._toggle)
+        lay.addWidget(self._btn)
+
+    def _toggle(self, checked: bool):
+        if checked:
+            self._start_capture()
+        else:
+            self._stop_capture()
+
+    def _start_capture(self):
+        if not PYNPUT_AVAILABLE:
+            self._display.setPlaceholderText("pynput not installed — type shortcut manually")
+            self._display.setReadOnly(False)
+            self._btn.setChecked(False)
+            return
+        self._held_mods.clear()
+        self._display.setText("… press keys …")
+        self._btn.setText("Stop")
+        from pynput import keyboard as kb
+
+        def on_press(key):
+            name = self._pynput_key_name(key)
+            if name in self._MOD_NAMES:
+                self._held_mods.add(name)
+                return
+            # Non-modifier pressed — emit signal (thread-safe) and stop
+            combo = self._build_combo(key)
+            self._combo_ready.emit(combo)
+            return False  # stop listener
+
+        def on_release(key):
+            name = self._pynput_key_name(key)
+            self._held_mods.discard(name)
+
+        self._listener = kb.Listener(on_press=on_press, on_release=on_release)
+        self._listener.start()
+
+    def _stop_capture(self):
+        if self._listener:
+            try: self._listener.stop()
+            except Exception: pass
+            self._listener = None
+        self._btn.setText("Capture")
+        self._btn.setChecked(False)
+        self._display.setText(self._shortcut)
+
+    def _accept_combo(self, combo: str):
+        self._shortcut = combo
+        self._stop_capture()
+
+    @staticmethod
+    def _pynput_key_name(key) -> str:
+        try:
+            return key.name  # pynput Key enum
+        except AttributeError:
+            return ""
+
+    def _build_combo(self, key) -> str:
+        parts = []
+        # Modifiers held at the time the main key was pressed
+        if any(m in self._held_mods for m in ("ctrl_l", "ctrl_r")):
+            parts.append("Ctrl")
+        if any(m in self._held_mods for m in ("alt_l", "alt_r", "alt_gr")):
+            parts.append("Alt")
+        if any(m in self._held_mods for m in ("shift_l", "shift_r")):
+            parts.append("Shift")
+        if any(m in self._held_mods for m in ("cmd", "cmd_l", "cmd_r")):
+            parts.append("Meta")
+        # The actual key
+        name = self._pynput_key_name(key)
+        if name in self._SPECIAL:
+            parts.append(self._SPECIAL[name])
+        else:
+            key_char = None
+            try:
+                # key.char contains the character, but with modifiers like Ctrl
+                # it becomes a control character (e.g. Ctrl+P → '\x10').
+                # Use the virtual key code to get the plain letter instead.
+                vk = getattr(key, 'vk', None)
+                if vk is not None and 65 <= vk <= 90:
+                    # VK 65-90 = A-Z
+                    key_char = chr(vk)
+                elif vk is not None and 48 <= vk <= 57:
+                    # VK 48-57 = 0-9
+                    key_char = chr(vk)
+                else:
+                    char = key.char
+                    if char and char.isprintable() and ord(char) >= 32:
+                        key_char = char.upper()
+            except AttributeError:
+                pass
+            if key_char:
+                parts.append(key_char.upper())
+            elif name:
+                parts.append(name.upper())
+            else:
+                parts.append(str(key))
+        return "+".join(parts)
+
+    def shortcut(self) -> str:
+        return self._shortcut
+
+    def set_shortcut(self, s: str):
+        self._shortcut = s
+        self._display.setText(s)
+
+    def closeEvent(self, e):
+        self._stop_capture()
+        super().closeEvent(e)
 
 
 class OcrResultDialog(QDialog):
@@ -5581,11 +5730,11 @@ class EditorCanvas(QGraphicsView):
 
     def mousePressEvent(self, event):
         self.setFocus() # Ensure canvas has focus for keyboard events
-        scene_pos = self.mapToScene(event.pos())
-        
+        scene_pos = self.mapToScene(event.position().toPoint())
+
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            self._pan_start = event.pos()
+            self._pan_start = event.position().toPoint()
             return
 
         if self.current_tool == "Eraser":
@@ -5669,13 +5818,13 @@ class EditorCanvas(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.MiddleButton and getattr(self, '_pan_start', None) is not None:
-            delta = event.pos() - self._pan_start
+            delta = event.position().toPoint() - self._pan_start
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
-            self._pan_start = event.pos()
+            self._pan_start = event.position().toPoint()
             return
 
-        scene_pos = self.mapToScene(event.pos())
+        scene_pos = self.mapToScene(event.position().toPoint())
         
         if self.current_tool in ["Select", "Crop"] and not self.resizing_item:
             _, handle = self.get_handle_at(scene_pos)
@@ -6391,6 +6540,21 @@ class ImageEditorWindow(QMainWindow):
         
         self.select_tool("Select")
 
+        # Register keyboard shortcuts explicitly for PySide6 compatibility.
+        # In PySide6 QShortcut the third constructor argument is NOT a callback —
+        # use .activated.connect() instead.
+        def _sc(key, fn):
+            s = QShortcut(QKeySequence(key), self)
+            s.activated.connect(fn)
+            return s
+        _sc("Ctrl+Z",       self.canvas_undo)
+        _sc("Ctrl+Y",       self.canvas_redo)
+        _sc("Ctrl+Shift+Z", self.canvas_redo)
+        _sc("Ctrl+S",       self.save_default)
+        _sc("Delete",       self._delete_selected)
+        _sc("Ctrl+D",       self._duplicate_selected)
+        _sc("Ctrl+A",       self._select_all)
+
     def select_tool(self, name):
         self.canvas.current_tool = name
         for n, b in self.btns.items(): b.setChecked(n == name)
@@ -6777,6 +6941,34 @@ class ImageEditorWindow(QMainWindow):
                 self.select_tool("Select")
     
     
+    def _delete_selected(self):
+        """Delete selected items (keyboard shortcut helper)."""
+        for item in self.canvas.scene.selectedItems():
+            if item not in (self.canvas.bg_item, getattr(self.canvas, 'crop_item', None)):
+                self.canvas.scene.removeItem(item)
+                self.canvas.is_dirty = True
+
+    def _duplicate_selected(self):
+        """Duplicate selected items (keyboard shortcut helper)."""
+        if hasattr(self.canvas, '_duplicate_selected_at_cursor'):
+            self.canvas._duplicate_selected_at_cursor()
+
+    def _select_all(self):
+        """Select all non-background items (keyboard shortcut helper)."""
+        for item in self.canvas.scene.items():
+            if item not in (self.canvas.bg_item, getattr(self.canvas, 'crop_item', None)):
+                item.setSelected(True)
+
+    def canvas_undo(self):
+        """Undo last action (keyboard shortcut helper)."""
+        if hasattr(self.canvas, 'undo'):
+            self.canvas.undo()
+
+    def canvas_redo(self):
+        """Redo last undone action (keyboard shortcut helper)."""
+        if hasattr(self.canvas, 'redo'):
+            self.canvas.redo()
+
     def save_default(self):
         img = self.render_scene()
         self.save_callback(img)
@@ -7149,9 +7341,10 @@ class OcrQrToolboxDialog(QDialog):
 # ─────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    status_sig  = Signal(str)
-    _notify_sig = Signal(str, object)   # filepath — must run on main thread
-    _ocr_done_sig = Signal(str, str) # <--- DODANA LINIA (tekst, tytul)
+    status_sig    = Signal(str)
+    _notify_sig   = Signal(str, object)  # filepath — must run on main thread
+    _ocr_done_sig = Signal(str, str)     # (tekst, tytul)
+    _hotkey_sig   = Signal(str)          # method_name — dispatched from pynput thread
 
     def __init__(self, config: Config):
         super().__init__()
@@ -7168,7 +7361,8 @@ class MainWindow(QMainWindow):
         self._abort      = False
         self._gif_aborted = False
         self._hkl        = None
-        self._ocr_done_sig.connect(self._show_ocr) # <--- DODANA LINIA
+        self._ocr_done_sig.connect(self._show_ocr)
+        self._hotkey_sig.connect(self._dispatch_hotkey)
         self.last_rec_pixmap = None  # Tu będziemy trzymać miniaturkę
         self.setWindowTitle("PyshareX")
         self.setMinimumSize(780, 540)
@@ -7514,6 +7708,11 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
 
+        def _sc(key, fn):
+            s = QShortcut(QKeySequence(key), self)
+            s.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            s.activated.connect(fn)
+
         cm = mb.addMenu("Capture")
         for name, sc, fn in [
             ("Capture region",         "Ctrl+Alt+Print Screen", self.act_region),
@@ -7523,8 +7722,9 @@ class MainWindow(QMainWindow):
             ("Scrolling capture",      "Shift+Print Screen",    self.act_scrolling),
         ]:
             a = QAction(name, self)
-            if sc: a.setShortcut(QKeySequence(sc))
             a.triggered.connect(fn); cm.addAction(a)
+            if sc:
+                _sc(sc, fn)
         cm.addSeparator()
         a = QAction("Recognize text", self)
         a.triggered.connect(self.act_ocr_text); cm.addAction(a)
@@ -7542,8 +7742,8 @@ class MainWindow(QMainWindow):
 
         tm = mb.addMenu("Tools")
         a = QAction("OCR/QR Toolbox", self)
-        a.setShortcut(QKeySequence("Ctrl+Alt+Q"))
         a.triggered.connect(self.act_ocr_qr_toolbox); tm.addAction(a)
+        _sc("Ctrl+Alt+Q", self.act_ocr_qr_toolbox)
         tm.addSeparator()
         tm.addAction("Video Converter").triggered.connect(self.act_video_converter)
         tm.addAction("Image Editor").triggered.connect(self.open_image_editor)
@@ -7806,26 +8006,44 @@ class MainWindow(QMainWindow):
     }
 
     def _hotkeys_start(self):
-        if not PYNPUT_AVAILABLE: return
+        if not PYNPUT_AVAILABLE:
+            print("[Hotkeys] pynput not available — global hotkeys disabled")
+            return
         combos = {}
         for sc in self.config.get("shortcuts", []):
-            if not sc.get("enabled", True): continue
+            if not sc.get("enabled", True):
+                continue
             mn = self._ACTION_MAP.get(sc.get("action", ""))
             pk = self._qt2pk(sc.get("shortcut", ""))
             if mn and pk:
                 def make(m):
                     def h():
-                        fn = getattr(self, m, None)
-                        if fn: QTimer.singleShot(0, fn)
+                        # pynput fires callbacks from its own thread.
+                        # In PySide6 (unlike PyQt6) QTimer.singleShot is not
+                        # thread-safe from non-Qt threads — use a queued signal
+                        # via _hotkey_sig which is connected in __init__.
+                        self._hotkey_sig.emit(m)
                     return h
                 combos[pk] = make(mn)
-        if not combos: return
+            else:
+                print(f"[Hotkeys] skipped: action={sc.get('action')!r} -> mn={mn!r}, shortcut={sc.get('shortcut')!r} -> pk={pk!r}")
+        if not combos:
+            print("[Hotkeys] no valid combos found — check shortcuts config")
+            return
+        print(f"[Hotkeys] registering {len(combos)} hotkeys: {list(combos.keys())}")
         try:
             from pynput import keyboard as kb
             self._hkl = kb.GlobalHotKeys(combos)
             self._hkl.start()
+            print("[Hotkeys] GlobalHotKeys started OK")
         except Exception as e:
-            print(f"Hotkey error: {e}")
+            print(f"[Hotkeys] error starting GlobalHotKeys: {e}")
+
+    def _dispatch_hotkey(self, method_name: str):
+        """Called on the main Qt thread via queued signal — safe to touch Qt objects."""
+        fn = getattr(self, method_name, None)
+        if fn:
+            fn()
 
     def _hotkeys_stop(self):
         if self._hkl:
@@ -7837,18 +8055,54 @@ class MainWindow(QMainWindow):
         self._hotkeys_stop(); self._hotkeys_start()
 
     def _qt2pk(self, qs: str) -> str:
-        M = {"Ctrl":"<ctrl>","Alt":"<alt>","Shift":"<shift>","Meta":"<cmd>",
-             "Print Screen":"<print_screen>","PrintScreen":"<print_screen>",
-             "Return":"<enter>","Delete":"<delete>","Insert":"<insert>",
-             "Home":"<home>","End":"<end>","PgUp":"<page_up>","PgDown":"<page_down>"}
+        # Single-token map (after multi-word substitution below)
+        M = {
+            "Ctrl":         "<ctrl>",
+            "Alt":          "<alt>",
+            "Shift":        "<shift>",
+            "Meta":         "<cmd>",
+            "PrintScreen":  "<print_screen>",
+            "Return":       "<enter>",
+            "Enter":        "<enter>",
+            "Delete":       "<delete>",
+            "Backspace":    "<backspace>",
+            "Insert":       "<insert>",
+            "Home":         "<home>",
+            "End":          "<end>",
+            "PgUp":         "<page_up>",
+            "PgDown":       "<page_down>",
+            "Up":           "<up>",
+            "Down":         "<down>",
+            "Left":         "<left>",
+            "Right":        "<right>",
+            "Space":        "<space>",
+            "Tab":          "<tab>",
+            "Escape":       "<esc>",
+            "Esc":          "<esc>",
+            "Plus":         "+",
+        }
+        # Replace multi-word key names BEFORE splitting on "+"
+        qs = qs.replace("Print Screen", "PrintScreen")
+        qs = qs.replace("Page Up",      "PgUp")
+        qs = qs.replace("Page Down",    "PgDown")
+        qs = qs.replace("Num Lock",     "num_lock")
+        qs = qs.replace("Caps Lock",    "caps_lock")
+        qs = qs.replace("Scroll Lock",  "scroll_lock")
+
         parts = qs.replace("++", "+Plus").split("+")
         res = []
         for p in parts:
             p = p.strip()
-            if p in M: res.append(M[p])
-            elif len(p) == 1: res.append(p.lower())
-            elif p.startswith("F") and p[1:].isdigit(): res.append(f"<f{p[1:]}>")
-            elif p: res.append(p.lower())
+            if not p:
+                continue
+            if p in M:
+                res.append(M[p])
+            elif len(p) == 1:
+                res.append(p.lower())
+            elif p.startswith("F") and p[1:].isdigit():
+                res.append(f"<f{p[1:]}>")
+            else:
+                res.append(p.lower())
         return "+".join(res)
     
     
