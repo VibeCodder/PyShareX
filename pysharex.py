@@ -3402,6 +3402,11 @@ class EnhancedRegionSelector(QWidget):
             if item and handle:
                 self._resizing_item = item
                 self._resize_handle = handle
+                # Send a synthetic press at the item's position so the scene
+                # registers it as the current mouse grabber — this ensures the
+                # paired synthetic release in mouseReleaseEvent will correctly
+                # clear the grabber rather than leaving it in a stale state.
+                self._canvas.send_mouse_to_scene(e)
                 return
             self._canvas.send_mouse_to_scene(e)
             return
@@ -3593,9 +3598,20 @@ class EnhancedRegionSelector(QWidget):
         # ── SELECT mode ───────────────────────────────────────────────────────
         if self._current_tool == self.TOOL_SELECT:
             if getattr(self, '_resizing_item', None):
+                item = self._resizing_item
                 self._resizing_item = None
                 self._resize_handle = None
-                # Do NOT forward the release event if we manually intercepted the drag in mouseMove
+                # Clear any width-drag state on the item
+                if hasattr(item, '_width_drag_active'):
+                    item._width_drag_active = False
+                # Clear active_handle on Line/Arrow items (safety)
+                if hasattr(item, 'active_handle'):
+                    item.active_handle = None
+                # CRITICAL: send a synthetic release to the QGraphicsScene so it
+                # clears its internal mouse-grabber state. Without this, the scene
+                # keeps routing all future send_mouse_to_scene calls to the old
+                # grabbed item, making every subsequently placed object uneditable.
+                self._canvas.send_mouse_to_scene(e)
                 return
             self._canvas.send_mouse_to_scene(e)
             return
