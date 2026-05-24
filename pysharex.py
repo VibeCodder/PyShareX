@@ -126,9 +126,10 @@ def _set_dialog_on_top(dlg):
 
 
 def _show_color_dialog(initial_color: QColor, parent=None,
-                       alpha: bool = True) -> QColor | None:
+                       alpha: bool = True, force_opaque: bool = False) -> QColor | None:
     """Show a QColorDialog that stays above fullscreen overlays on Linux.
-    Returns the selected QColor, or None if cancelled."""
+    Returns the selected QColor, or None if cancelled.
+    If force_opaque=True, alpha is forced to 255 regardless of user selection."""
     dlg = QColorDialog(initial_color, parent)
     dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, alpha)
     dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
@@ -142,7 +143,10 @@ def _show_color_dialog(initial_color: QColor, parent=None,
     dlg.activateWindow()
     if dlg.exec():
         c = dlg.selectedColor()
-        return c if c.isValid() else None
+        if c.isValid():
+            if force_opaque:
+                c.setAlpha(255)
+            return c
     return None
 
 # ── Hide console window on Windows ──────────────────────────────────────────
@@ -2199,13 +2203,13 @@ class _BubbleInputDialog(QDialog):
         self._update_btn_styles()
 
     def _pick_fg(self):
-        c = _show_color_dialog(self.fg_color, self)
+        c = _show_color_dialog(self.fg_color, self, force_opaque=True)
         if c is not None:
             self.fg_color = c
             self._update_btn_styles()
 
     def _pick_bg(self):
-        c = _show_color_dialog(self.bg_color, self)
+        c = _show_color_dialog(self.bg_color, self, force_opaque=True)
         if c is not None:
             self.bg_color = c
             self._update_btn_styles()
@@ -2257,13 +2261,13 @@ class _BubbleEditDialog(QDialog):
         self._update_btn_styles()
 
     def _pick_fg(self):
-        c = _show_color_dialog(self.fg_color, self)
+        c = _show_color_dialog(self.fg_color, self, force_opaque=True)
         if c is not None:
             self.fg_color = c
             self._update_btn_styles()
 
     def _pick_bg(self):
-        c = _show_color_dialog(self.bg_color, self)
+        c = _show_color_dialog(self.bg_color, self, force_opaque=True)
         if c is not None:
             self.bg_color = c
             self._update_btn_styles()
@@ -2305,13 +2309,13 @@ class _MarkerEditDialog(QDialog):
         self._update_styles()
 
     def _pick_bg(self):
-        c = _show_color_dialog(self.bg_color, self)
+        c = _show_color_dialog(self.bg_color, self, force_opaque=True)
         if c is not None:
             self.bg_color = c
             self._update_styles()
 
     def _pick_txt(self):
-        c = _show_color_dialog(self.text_color, self)
+        c = _show_color_dialog(self.text_color, self, force_opaque=True)
         if c is not None:
             self.text_color = c
             self._update_styles()
@@ -2563,19 +2567,20 @@ class _TextInputDialog(QDialog):
         self._update_btn_color()
 
     def _pick_col(self):
-        c = _show_color_dialog(self.color, self)
+        c = _show_color_dialog(self.color, self, force_opaque=True)
         if c is not None:
             self.color = c
             self._update_btn_color()
 
     def _pick_hl(self):
+        # Highlight color keeps alpha (intentionally semi-transparent)
         c = _show_color_dialog(self.highlight, self)
         if c is not None:
             self.highlight = c
             self._update_btn_color()
 
     def _pick_ol_color(self):
-        c = _show_color_dialog(self.outline_color, self)
+        c = _show_color_dialog(self.outline_color, self, force_opaque=True)
         if c is not None:
             self.outline_color = c
             self._update_btn_color()
@@ -3057,6 +3062,9 @@ class EnhancedRegionSelector(QWidget):
         if self._exec_dialog(dlg):
             c = dlg.selectedColor()
             if c.isValid():
+                # Force alpha=255 for all annotation tools (Highlight manages its own alpha)
+                if not isinstance(apply_to_item, HighlightRectItem):
+                    c.setAlpha(255)
                 self._draw_color = c
                 self._color_preview.setStyleSheet(
                     f"background:{c.name()}; border:1px solid white; border-radius:3px;")
@@ -3072,21 +3080,38 @@ class EnhancedRegionSelector(QWidget):
 
     def _import_image(self):
         self._toolbar.hide()
-        self.releaseKeyboard() # Allow navigating folders via keyboard
-        path, _ = QFileDialog.getOpenFileName(
-            None, "Import Image", "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
-        if path:
-            pix = QPixmap(path)
-            if not pix.isNull():
-                center = QPointF(self._geo.width() / 2 - pix.width()  / 2,
-                                 self._geo.height()/ 2 - pix.height() / 2)
-                self._canvas.add_pixmap(center, pix)
-                # Switch to SELECT so the user can move/resize it immediately
-                self._select_tool(self.TOOL_SELECT)
+        self.releaseKeyboard()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        QApplication.processEvents()
+
+        dlg = QFileDialog(None, "Import Image", "",
+                          "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        flags = Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint
+        if IS_LINUX:
+            flags |= Qt.WindowType.X11BypassWindowManagerHint
+        dlg.setWindowFlags(flags)
+        dlg.show(); dlg.raise_(); dlg.activateWindow()
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+
+        if dlg.exec() == QFileDialog.DialogCode.Accepted:
+            files = dlg.selectedFiles()
+            if files:
+                pix = QPixmap(files[0])
+                if not pix.isNull():
+                    center = QPointF(self._geo.width() / 2 - pix.width()  / 2,
+                                     self._geo.height()/ 2 - pix.height() / 2)
+                    self._canvas.add_pixmap(center, pix)
+
+        # Always switch to SELECT after image import so user can move/resize it
+        self._select_tool(self.TOOL_SELECT)
         self._toolbar.show()
         self.activateWindow(); self.setFocus()
-        self.grabKeyboard() # Re-lock keyboard
+        self.grabKeyboard()
 
     def _capture_with_annotations(self):
         """
@@ -3264,6 +3289,8 @@ class EnhancedRegionSelector(QWidget):
                     item.outline_enabled   = ol_on
                     item.outline_width     = ol_w
                     item.outline_color     = ol_col
+            # After placing text, switch to SELECT so user can immediately move it
+            self._select_tool(self.TOOL_SELECT)
 
         elif self._current_tool == self.TOOL_BUBBLE:
             dlg = _BubbleInputDialog(QColor(self._draw_color), self)
@@ -3271,6 +3298,8 @@ class EnhancedRegionSelector(QWidget):
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
                     self._canvas.add_bubble(scene_pos, txt, fg_col, bg_col)
+            # After placing bubble, switch to SELECT so other tools work normally
+            self._select_tool(self.TOOL_SELECT)
 
     def mouseMoveEvent(self, e):
         gpos = e.globalPosition().toPoint()
