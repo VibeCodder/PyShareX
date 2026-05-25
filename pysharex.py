@@ -5570,21 +5570,19 @@ class FreehandItem(QGraphicsPathItem):
         if self.isSelected():
             painter.save()
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            # Dashed bounding-box (same as ResizableRectItem)
-            pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
-            painter.setPen(pen)
+            # Dashed bounding box
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.GlobalColor.transparent)
             painter.drawRect(self._rect)
-            # Corner & edge resize handles
+            # Corner & edge resize handles (identical to ResizableRectItem)
             r = self._rect
-            handles = [
+            for hp in [
                 r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight(),
                 QPointF(r.center().x(), r.top()),
                 QPointF(r.center().x(), r.bottom()),
                 QPointF(r.left(),  r.center().y()),
                 QPointF(r.right(), r.center().y()),
-            ]
-            for hp in handles:
+            ]:
                 painter.setBrush(QBrush(Qt.GlobalColor.white))
                 painter.setPen(QPen(QColor(60, 120, 255), 1.5))
                 painter.drawEllipse(hp, 5, 5)
