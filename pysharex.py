@@ -1976,19 +1976,20 @@ class ArrowItem(QGraphicsLineItem):
         p1, p2 = self.line().p1(), self.line().p2()
         dist = 22 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
 
+        # Ensure we ACCEPT the event to grab the mouse state correctly
         if (p - p1).manhattanLength() < dist:
             self.active_handle = 'p1'
-            event.ignore()
+            event.accept()
         elif (p - p2).manhattanLength() < dist:
             self.active_handle = 'p2'
-            event.ignore()
+            event.accept()
         else:
             mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
             if (p - mid).manhattanLength() < dist:
                 self.active_handle = 'width'
                 self._width_drag_start_pos = p
-                self._width_drag_start_w   = self.pen().width()
-                event.ignore()
+                self._width_drag_start_w = self.pen().width()
+                event.accept()
             else:
                 self.active_handle = None
                 super().mousePressEvent(event)
@@ -1998,7 +1999,8 @@ class ArrowItem(QGraphicsLineItem):
             self.prepareGeometryChange()
             line = self.line()
             new_pos = event.pos()
-            
+
+            # 45-degree angle snapping constraint
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 anchor = line.p2() if self.active_handle == 'p1' else line.p1()
                 dx, dy = new_pos.x() - anchor.x(), new_pos.y() - anchor.y()
@@ -2006,29 +2008,29 @@ class ArrowItem(QGraphicsLineItem):
                 d = math.hypot(dx, dy)
                 new_pos = QPointF(anchor.x() + d * math.cos(math.radians(snapped_angle)),
                                   anchor.y() + d * math.sin(math.radians(snapped_angle)))
-            
-            if self.active_handle == 'p1': 
+
+            if self.active_handle == 'p1':
                 line.setP1(new_pos)
-            else: 
+            else:
                 line.setP2(new_pos)
-                
+
             self.setLine(line)
             event.accept()
-            
+
         elif getattr(self, 'active_handle', None) == 'width':
             line = self.line()
             if line.length() > 0:
                 start_pos = getattr(self, '_width_drag_start_pos', event.pos())
-                start_w   = getattr(self, '_width_drag_start_w', self.pen().width())
+                start_w = getattr(self, '_width_drag_start_w', self.pen().width())
                 dy = event.pos().y() - start_pos.y()
                 new_w = max(1, int(start_w + dy * 0.3))
-                
+
                 pen = self.pen()
                 pen.setWidth(new_w)
                 self.setPen(pen)
                 self.prepareGeometryChange()
                 self.update()
-                
+
                 if hasattr(self, 'canvas') and self.canvas:
                     win = self.canvas.window() if hasattr(self.canvas, 'window') else None
                     if win and hasattr(win, 'spin'):
@@ -2040,9 +2042,10 @@ class ArrowItem(QGraphicsLineItem):
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # Always fully release the state flag on mouse up
         if getattr(self, 'active_handle', None):
             self.active_handle = None
-            event.ignore()
+            event.accept()
         else:
             super().mouseReleaseEvent(event)
 
@@ -5373,17 +5376,36 @@ class LineItem(QGraphicsLineItem):
             painter.setPen(QPen(QColor(60, 60, 60), 1.5))
             painter.drawEllipse(mid, s/2, s/2)
 
-    def mouseReleaseEvent(self, event):
-        if getattr(self, 'active_handle', None):
-            self.active_handle = None
-            event.ignore()
+    def mousePressEvent(self, event):
+        p = event.pos()
+        p1, p2 = self.line().p1(), self.line().p2()
+        dist = 22 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
+
+        # Ensure we ACCEPT the event to grab the mouse state correctly
+        if (p - p1).manhattanLength() < dist:
+            self.active_handle = 'p1'
+            event.accept()
+        elif (p - p2).manhattanLength() < dist:
+            self.active_handle = 'p2'
+            event.accept()
         else:
-            super().mouseReleaseEvent(event)
+            mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+            if (p - mid).manhattanLength() < dist:
+                self.active_handle = 'width'
+                self._width_drag_start_pos = p
+                self._width_drag_start_w = self.pen().width()
+                event.accept()
+            else:
+                self.active_handle = None
+                super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
         if getattr(self, 'active_handle', None) in ('p1', 'p2'):
             self.prepareGeometryChange()
             line = self.line()
             new_pos = event.pos()
-            
+
+            # 45-degree angle snapping constraint
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 anchor = line.p2() if self.active_handle == 'p1' else line.p1()
                 dx, dy = new_pos.x() - anchor.x(), new_pos.y() - anchor.y()
@@ -5391,29 +5413,29 @@ class LineItem(QGraphicsLineItem):
                 d = math.hypot(dx, dy)
                 new_pos = QPointF(anchor.x() + d * math.cos(math.radians(snapped_angle)),
                                   anchor.y() + d * math.sin(math.radians(snapped_angle)))
-            
-            if self.active_handle == 'p1': 
+
+            if self.active_handle == 'p1':
                 line.setP1(new_pos)
-            else: 
+            else:
                 line.setP2(new_pos)
-                
+
             self.setLine(line)
             event.accept()
-            
+
         elif getattr(self, 'active_handle', None) == 'width':
             line = self.line()
             if line.length() > 0:
                 start_pos = getattr(self, '_width_drag_start_pos', event.pos())
-                start_w   = getattr(self, '_width_drag_start_w', self.pen().width())
+                start_w = getattr(self, '_width_drag_start_w', self.pen().width())
                 dy = event.pos().y() - start_pos.y()
                 new_w = max(1, int(start_w + dy * 0.3))
-                
+
                 pen = self.pen()
                 pen.setWidth(new_w)
                 self.setPen(pen)
                 self.prepareGeometryChange()
                 self.update()
-                
+
                 if hasattr(self, 'canvas') and self.canvas:
                     win = self.canvas.window() if hasattr(self.canvas, 'window') else None
                     if win and hasattr(win, 'spin'):
@@ -5425,6 +5447,7 @@ class LineItem(QGraphicsLineItem):
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # Always fully release the state flag on mouse up
         if getattr(self, 'active_handle', None):
             self.active_handle = None
             event.accept()
