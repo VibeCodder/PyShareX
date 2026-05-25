@@ -5566,12 +5566,36 @@ class FreehandItem(QGraphicsPathItem):
         option.state &= ~QStyle.StateFlag.State_Selected
         painter.setPen(self.pen())
         painter.drawPath(self.path())
-        
+
         if self.isSelected():
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # Dashed bounding-box (same as ResizableRectItem)
             pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.GlobalColor.transparent)
             painter.drawRect(self._rect)
+            # Corner & edge resize handles
+            r = self._rect
+            handles = [
+                r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight(),
+                QPointF(r.center().x(), r.top()),
+                QPointF(r.center().x(), r.bottom()),
+                QPointF(r.left(),  r.center().y()),
+                QPointF(r.right(), r.center().y()),
+            ]
+            for hp in handles:
+                painter.setBrush(QBrush(Qt.GlobalColor.white))
+                painter.setPen(QPen(QColor(60, 120, 255), 1.5))
+                painter.drawEllipse(hp, 5, 5)
+            # Rotation handle above top edge (identical to ResizableRectItem)
+            rot_pt = QPointF(r.center().x(), r.top() - 30)
+            painter.setBrush(QBrush(QColor(180, 255, 180, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(rot_pt, 6, 6)
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DotLine))
+            painter.drawLine(QPointF(r.center().x(), r.top()), rot_pt)
+            painter.restore()
 
 
 class LineItem(QGraphicsLineItem):
