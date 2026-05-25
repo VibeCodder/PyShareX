@@ -114,6 +114,45 @@ def _get_paddleocr_reader():
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX   = platform.system() == "Linux"
 
+def _set_dialog_on_top(dlg):
+    """Set dialog window flags so it appears above fullscreen overlays on all platforms.
+    On Linux, X11BypassWindowManagerHint is required to float above fullscreen windows."""
+    flags = Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint
+    if IS_LINUX:
+        flags |= Qt.WindowType.X11BypassWindowManagerHint
+    dlg.setWindowFlags(flags)
+    dlg.raise_()
+    dlg.activateWindow()
+
+
+def _show_color_dialog(initial_color: QColor, parent=None,
+                       alpha: bool = True, force_opaque: bool = False) -> QColor | None:
+    """Show a QColorDialog that stays above fullscreen overlays on Linux.
+    Returns the selected QColor, or None if cancelled.
+    If force_opaque=True, alpha is forced to 255 regardless of user selection."""
+    color_to_show = QColor(initial_color)
+    if force_opaque:
+        color_to_show.setAlpha(255)
+
+    dlg = QColorDialog(color_to_show, parent)
+    dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, alpha)
+    dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+    if IS_LINUX:
+        dlg.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.X11BypassWindowManagerHint
+        )
+    dlg.raise_()
+    dlg.activateWindow()
+    if dlg.exec():
+        c = dlg.selectedColor()
+        if c.isValid():
+            if force_opaque:
+                c.setAlpha(255)
+            return c
+    return None
+
 # ── Hide console window on Windows ──────────────────────────────────────────
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
 
@@ -1513,47 +1552,65 @@ class _OverlayCanvas(QGraphicsView):
     def get_handle_at(self, scene_pos: QPointF):
         """Return (item, handle_name) if pos is over a resize handle."""
         for item in self._scene.selectedItems():
-            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem,
-                                  ResizablePixmapItem, FreehandItem,
-                                  TextBubbleItem)):
-                local_pos = item.mapFromScene(scene_pos)
-                rect = item.rect()
-                m = 10.0
-                # Rotation handle — for all rect-like items except Markers
-                if not isinstance(item, _MarkerItem):
-                    rot_pt = QPointF(rect.center().x(), rect.top() - 30)
-                    if (abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
-                            abs(local_pos.y() - rot_pt.y()) < m * 1.5):
-                        return item, 'ROTATE'
-                # Width handle (yellow dot below bottom edge) for Rect and Ellipse
-                if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
-                    wp = item._width_handle_pos()
-                    if math.hypot(local_pos.x() - wp.x(), local_pos.y() - wp.y()) <= 14:
-                        return item, 'WIDTH'
-                L = abs(local_pos.x() - rect.left())  < m
-                R = abs(local_pos.x() - rect.right()) < m
-                T = abs(local_pos.y() - rect.top())   < m
-                B = abs(local_pos.y() - rect.bottom())< m
-                # TextBubbleItem: only bottom-right corner (BR) for scaling
-                if isinstance(item, TextBubbleItem):
-                    if R and B: return item, 'BR'
-                else:
-                    if L and T: return item, 'TL'
-                    if R and T: return item, 'TR'
-                    if L and B: return item, 'BL'
-                    if R and B: return item, 'BR'
-                    if L: return item, 'L'
-                    if R: return item, 'R'
-                    if T: return item, 'T'
-                    if B: return item, 'B'
+            # Include all annotation item types that support handles
+            # Allow native event handling for Line and Arrow items to avoid conflicts
+            if isinstance(item, (ArrowItem, LineItem)):
+                continue
+
+            # Include all other annotation item types that support bounding-box handles
+            if not isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem,
+                                    ResizablePixmapItem, FreehandItem,
+                                    TextBubbleItem,
+                                    _MarkerItem)):
+                continue
+            local_pos = item.mapFromScene(scene_pos)
+            rect = item.rect()
+            m = 12.0  # slightly larger hit zone for easier interaction
+
+            # _MarkerItem: only scale handle (left edge of bounding rect)
+            if isinstance(item, _MarkerItem):
+                r = item.RADIUS * item._scale
+                if math.hypot(local_pos.x() + r, local_pos.y()) <= item.HANDLE_RADIUS + 6:
+                    return item, 'TL'  # reuse TL to trigger uniform scale
+                continue
+
+            # Rotation handle — above top edge (all rect/ellipse/pixmap/freehand items)
+            rot_pt = QPointF(rect.center().x(), rect.top() - 30)
+            if (abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
+                    abs(local_pos.y() - rot_pt.y()) < m * 1.5):
+                return item, 'ROTATE'
+
+            # Width handle (yellow dot below bottom edge) for Rect and Ellipse
+            if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+                wp = item._width_handle_pos()
+                if math.hypot(local_pos.x() - wp.x(), local_pos.y() - wp.y()) <= 14:
+                    return item, 'WIDTH'
+
+            # Corner & edge resize handles
+            L = abs(local_pos.x() - rect.left())  < m
+            R = abs(local_pos.x() - rect.right()) < m
+            T = abs(local_pos.y() - rect.top())   < m
+            B = abs(local_pos.y() - rect.bottom()) < m
+
+            # TextBubbleItem: only bottom-right corner (BR) for scaling
+            if isinstance(item, TextBubbleItem):
+                if R and B: return item, 'BR'
+            else:
+                if L and T: return item, 'TL'
+                if R and T: return item, 'TR'
+                if L and B: return item, 'BL'
+                if R and B: return item, 'BR'
+                if L: return item, 'L'
+                if R: return item, 'R'
+                if T: return item, 'T'
+                if B: return item, 'B'
         return None, None
 
     def handle_resize(self, item, handle, scene_pos: QPointF, proportional=False):
-        """Resize/rotate item — same logic as EditorCanvas.handle_resize_logic."""
-        # Width handle — drag vertically to change pen width (same logic as LineItem)
+        """Resize/rotate item — full unified logic."""
+        # Width handle — drag vertically to change pen width
         if handle == 'WIDTH' and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
             local_pos = item.mapFromScene(scene_pos)
-            # Initialise drag baseline on first call (reset when mouse is released)
             if not getattr(item, '_width_drag_active', False):
                 item._width_drag_active = True
                 item._width_drag_start_pos = local_pos
@@ -1566,23 +1623,37 @@ class _OverlayCanvas(QGraphicsView):
             item.prepareGeometryChange()
             item.update()
             return
-        # _MarkerItem uses uniform scale — Ctrl always forces equal W/H
+
+            # TextBubbleItem
+
+        # TextBubbleItem
+        if isinstance(item, TextBubbleItem):
+            local_pos = item.mapFromScene(scene_pos)
+            if handle == 'BR':
+                new_w = max(item.MIN_SIZE, local_pos.x())
+                new_h = max(item.MIN_SIZE, local_pos.y())
+                item.prepareGeometryChange()
+                item._w = new_w
+                item._h = new_h
+                item._auto_grow()
+                item.update()
+            return
+
+        # _MarkerItem: uniform scale
         if isinstance(item, _MarkerItem):
             local_pos = item.mapFromScene(scene_pos)
-            old_r = item.RADIUS * item._scale
-            if proportional or handle in ('TL', 'TR', 'BL', 'BR'):
-                # equal W/H: use the larger of dx/dy from centre
-                dist = max(abs(local_pos.x()), abs(local_pos.y()))
-            else:
-                dist = math.hypot(local_pos.x(), local_pos.y())
-            dist = max(dist, item.RADIUS * 0.2)   # minimum size guard
+            dist = math.hypot(local_pos.x(), local_pos.y())
+            dist = max(dist, item.RADIUS * 0.2)
             item.prepareGeometryChange()
             item._scale = dist / item.RADIUS
             item.update()
             return
+
+        # --- ROTATION ---
         if handle == 'ROTATE':
-            center = item.mapToScene(item.rect().center())
-            diff  = scene_pos - center
+            item.update() 
+            center_scene = item.mapToScene(item.rect().center())
+            diff = scene_pos - center_scene
             angle = math.degrees(math.atan2(diff.y(), diff.x())) + 90
             if proportional:
                 angle = round(angle / 45) * 45
@@ -1590,30 +1661,48 @@ class _OverlayCanvas(QGraphicsView):
             item.setRotation(angle)
             item.update()
             return
-        old_rect   = item.rect()
-        local_pos  = item.mapFromScene(scene_pos)
-        fixed      = QPointF(
-            old_rect.right()  if 'L' in handle else
-            old_rect.left()   if 'R' in handle else old_rect.center().x(),
-            old_rect.bottom() if 'T' in handle else
-            old_rect.top()    if 'B' in handle else old_rect.center().y())
-        old_fixed_scene = item.mapToScene(fixed)
-        l = local_pos.x() if 'L' in handle else old_rect.left()
-        r = local_pos.x() if 'R' in handle else old_rect.right()
-        t = local_pos.y() if 'T' in handle else old_rect.top()
-        b = local_pos.y() if 'B' in handle else old_rect.bottom()
-        new_rect = QRectF(QPointF(l, t), QPointF(r, b)).normalized()
-        if proportional:
-            side = max(new_rect.width(), new_rect.height())
-            l = (r - side) if 'L' in handle else l
-            r = (l + side) if 'R' in handle else r
-            t = (b - side) if 'T' in handle else t
-            b = (t + side) if 'B' in handle else b
-            new_rect = QRectF(QPointF(l, t), QPointF(r, b)).normalized()
-        item.setRect(new_rect)
-        item.setTransformOriginPoint(new_rect.center())
-        new_fixed_scene = item.mapToScene(fixed)
-        item.setPos(item.pos() + old_fixed_scene - new_fixed_scene)
+
+        # --- STANDARD SCALING (Rect, Ellipse, Pixmap, Freehand) ---
+        if hasattr(item, 'rect'):
+            old_rect = item.rect()
+            local_pos = item.mapFromScene(scene_pos)
+            
+            fixed_local = QPointF()
+            if 'L' in handle: fixed_local.setX(old_rect.right())
+            elif 'R' in handle: fixed_local.setX(old_rect.left())
+            else: fixed_local.setX(old_rect.center().x())
+
+            if 'T' in handle: fixed_local.setY(old_rect.bottom())
+            elif 'B' in handle: fixed_local.setY(old_rect.top())
+            else: fixed_local.setY(old_rect.center().y())
+            
+            old_scene_fixed = item.mapToScene(fixed_local)
+
+            left, top, right, bottom = old_rect.left(), old_rect.top(), old_rect.right(), old_rect.bottom()
+            
+            if 'L' in handle: left = local_pos.x()
+            if 'R' in handle: right = local_pos.x()
+            if 'T' in handle: top = local_pos.y()
+            if 'B' in handle: bottom = local_pos.y()
+            
+            new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+            
+            if proportional:
+                side = max(new_rect.width(), new_rect.height())
+                if 'L' in handle: left = right - side
+                else: right = left + side
+                if 'T' in handle: top = bottom - side
+                else: bottom = top + side
+                new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+
+            item.prepareGeometryChange()
+            item.setRect(new_rect)
+            item.setTransformOriginPoint(new_rect.center())
+            
+            new_scene_fixed = item.mapToScene(fixed_local)
+            delta = old_scene_fixed - new_scene_fixed
+            item.setPos(item.pos() + delta)
+            item.update()
 
     # ------------------------------------------------------------------
     def _apply_props(self, item, color: QColor, width: int):
@@ -1669,15 +1758,11 @@ class HighlightEditDialog(QDialog):
         self._update_btn()
 
     def _pick_color(self):
-        dlg = QColorDialog(self.color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                c.setAlpha(self.color.alpha())
-                self.color = c
-                self._update_btn()
+        c = _show_color_dialog(self.color, self, alpha=False)
+        if c is not None:
+            c.setAlpha(self.color.alpha())
+            self.color = c
+            self._update_btn()
 
     def _on_opacity_changed(self, val):
         self.color.setAlpha(val)
@@ -1761,7 +1846,7 @@ class HighlightRectItem(QGraphicsRectItem):
         menu = QMenu()
         edit_act = menu.addAction("✏️ Edit")
         del_act  = menu.addAction("🗑️ Delete")
-        action = menu.exec(event.screenPos().toPoint())
+        action = menu.exec(event.screenPos())
         if action == edit_act:
             self._open_edit_dialog(event)
         elif action == del_act:
@@ -1771,9 +1856,10 @@ class HighlightRectItem(QGraphicsRectItem):
 
     def _open_edit_dialog(self, event=None):
         dlg = HighlightEditDialog(self._color)
+        _set_dialog_on_top(dlg)
         # Show near the item
         if event:
-            dlg.move(event.screenPos().toPoint())
+            dlg.move(event.screenPos())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_color = dlg.result_color()
             self._color = new_color
@@ -1843,80 +1929,129 @@ class ArrowItem(QGraphicsLineItem):
             painter.drawPath(path)
         if self.isSelected():
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # Handle size: 16px screen-space, scale-independent
+            s = 16 / (self.canvas.transform().m11() if self.canvas else 1)
+            r = s / 2
+            # p1 endpoint handle — white fill, blue border
             painter.setBrush(QBrush(Qt.GlobalColor.white))
-            painter.setPen(QPen(Qt.GlobalColor.blue, 1.5))
-            s = 10 / (self.canvas.transform().m11() if self.canvas else 1)
-            painter.drawEllipse(self.line().p1(), s/2, s/2)
-            painter.drawEllipse(self.line().p2(), s/2, s/2)
-            # Width handle at midpoint
+            painter.setPen(QPen(Qt.GlobalColor.blue, 2.0))
+            painter.drawEllipse(self.line().p1(), r, r)
+            # p2 endpoint handle — white fill, blue border
+            painter.drawEllipse(self.line().p2(), r, r)
+            # Width handle at midpoint — yellow fill, dark border
             mid = QPointF((self.line().p1().x() + self.line().p2().x()) / 2,
                           (self.line().p1().y() + self.line().p2().y()) / 2)
             painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
-            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
-            painter.drawEllipse(mid, s/2, s/2)
+            painter.setPen(QPen(QColor(60, 60, 60), 2.0))
+            painter.drawEllipse(mid, r, r)
+
+    def _handle_hit_radius(self):
+        """Hit-test radius for endpoint/width handles, in item-local coords.
+        Fixed at 18px screen-space so handles are easy to grab regardless of zoom."""
+        return 18 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
+
+    def shape(self):
+        """Override shape() so Qt's scene hit-testing covers the full handle surfaces,
+        not just the thin line geometry. Includes a fat stroke along the line body
+        plus circular regions at p1, p2, and the midpoint (width handle)."""
+        r = self._handle_hit_radius()
+        line = self.line()
+        p1, p2 = line.p1(), line.p2()
+        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+
+        # Fat stroke along the line body
+        body = QPainterPath()
+        body.moveTo(p1)
+        body.lineTo(p2)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(max(self.pen().width() + 4, r * 2))
+        result = stroker.createStroke(body)
+
+        # Add circular hit zones for each handle
+        for pt in (p1, p2, mid):
+            circle = QPainterPath()
+            circle.addEllipse(pt, r, r)
+            result = result.united(circle)
+
+        return result
 
     def mousePressEvent(self, event):
         p = event.pos()
         p1, p2 = self.line().p1(), self.line().p2()
-        dist = 22 / (self.canvas.transform().m11() if self.canvas else 1)
-        if (p - p1).manhattanLength() < dist:
+        # Use true Euclidean distance (not manhattanLength) for accurate circular hit zones
+        r = self._handle_hit_radius()
+
+        if math.hypot(p.x() - p1.x(), p.y() - p1.y()) <= r:
             self.active_handle = 'p1'
-        elif (p - p2).manhattanLength() < dist:
+            event.accept()
+        elif math.hypot(p.x() - p2.x(), p.y() - p2.y()) <= r:
             self.active_handle = 'p2'
+            event.accept()
         else:
-            # Check width handle at midpoint
             mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
-            if (p - mid).manhattanLength() < dist:
+            if math.hypot(p.x() - mid.x(), p.y() - mid.y()) <= r:
                 self.active_handle = 'width'
                 self._width_drag_start_pos = p
-                self._width_drag_start_w   = self.pen().width()
+                self._width_drag_start_w = self.pen().width()
+                event.accept()
             else:
                 self.active_handle = None
                 super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.active_handle in ('p1', 'p2'):
+        if getattr(self, 'active_handle', None) in ('p1', 'p2'):
             self.prepareGeometryChange()
             line = self.line()
             new_pos = event.pos()
+
+            # 45-degree angle snapping constraint
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 anchor = line.p2() if self.active_handle == 'p1' else line.p1()
                 dx, dy = new_pos.x() - anchor.x(), new_pos.y() - anchor.y()
-                angle = math.atan2(dy, dx)
-                snapped_angle = round(math.degrees(angle) / 45) * 45
+                snapped_angle = round(math.degrees(math.atan2(dy, dx)) / 45) * 45
                 d = math.hypot(dx, dy)
                 new_pos = QPointF(anchor.x() + d * math.cos(math.radians(snapped_angle)),
                                   anchor.y() + d * math.sin(math.radians(snapped_angle)))
+
             if self.active_handle == 'p1':
                 line.setP1(new_pos)
             else:
                 line.setP2(new_pos)
+
             self.setLine(line)
-        elif self.active_handle == 'width':
-            # Drag to change pen width starting from current width
+            event.accept()
+
+        elif getattr(self, 'active_handle', None) == 'width':
             line = self.line()
             if line.length() > 0:
                 start_pos = getattr(self, '_width_drag_start_pos', event.pos())
-                start_w   = getattr(self, '_width_drag_start_w', self.pen().width())
+                start_w = getattr(self, '_width_drag_start_w', self.pen().width())
                 dy = event.pos().y() - start_pos.y()
                 new_w = max(1, int(start_w + dy * 0.3))
+
                 pen = self.pen()
                 pen.setWidth(new_w)
                 self.setPen(pen)
                 self.prepareGeometryChange()
                 self.update()
+
                 if hasattr(self, 'canvas') and self.canvas:
-                    win = self.canvas.window()
-                    if hasattr(win, 'spin'):
+                    win = self.canvas.window() if hasattr(self.canvas, 'window') else None
+                    if win and hasattr(win, 'spin'):
                         win.spin.blockSignals(True)
                         win.spin.setValue(new_w)
                         win.spin.blockSignals(False)
+            event.accept()
         else:
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        self.active_handle = None
-        super().mouseReleaseEvent(event)
+        # Always fully release the state flag on mouse up
+        if getattr(self, 'active_handle', None):
+            self.active_handle = None
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
 
 
 class TextBubbleItem(QGraphicsItem):
@@ -2171,24 +2306,16 @@ class _BubbleInputDialog(QDialog):
         self._update_btn_styles()
 
     def _pick_fg(self):
-        dlg = QColorDialog(self.fg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.fg_color = c
-                self._update_btn_styles()
+        c = _show_color_dialog(self.fg_color, self, force_opaque=True)
+        if c is not None:
+            self.fg_color = c
+            self._update_btn_styles()
 
     def _pick_bg(self):
-        dlg = QColorDialog(self.bg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.bg_color = c
-                self._update_btn_styles()
+        c = _show_color_dialog(self.bg_color, self, force_opaque=True)
+        if c is not None:
+            self.bg_color = c
+            self._update_btn_styles()
 
     def _update_btn_styles(self):
         c = self.fg_color
@@ -2237,24 +2364,16 @@ class _BubbleEditDialog(QDialog):
         self._update_btn_styles()
 
     def _pick_fg(self):
-        dlg = QColorDialog(self.fg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.fg_color = c
-                self._update_btn_styles()
+        c = _show_color_dialog(self.fg_color, self, force_opaque=True)
+        if c is not None:
+            self.fg_color = c
+            self._update_btn_styles()
 
     def _pick_bg(self):
-        dlg = QColorDialog(self.bg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.bg_color = c
-                self._update_btn_styles()
+        c = _show_color_dialog(self.bg_color, self, force_opaque=True)
+        if c is not None:
+            self.bg_color = c
+            self._update_btn_styles()
 
     def _update_btn_styles(self):
         c = self.fg_color
@@ -2293,24 +2412,16 @@ class _MarkerEditDialog(QDialog):
         self._update_styles()
 
     def _pick_bg(self):
-        dlg = QColorDialog(self.bg_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.bg_color = c
-                self._update_styles()
+        c = _show_color_dialog(self.bg_color, self, force_opaque=True)
+        if c is not None:
+            self.bg_color = c
+            self._update_styles()
 
     def _pick_txt(self):
-        dlg = QColorDialog(self.text_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.text_color = c
-                self._update_styles()
+        c = _show_color_dialog(self.text_color, self, force_opaque=True)
+        if c is not None:
+            self.text_color = c
+            self._update_styles()
 
     def _update_styles(self):
         c = self.bg_color
@@ -2559,34 +2670,23 @@ class _TextInputDialog(QDialog):
         self._update_btn_color()
 
     def _pick_col(self):
-        dlg = QColorDialog(self.color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.color = c
-                self._update_btn_color()
+        c = _show_color_dialog(self.color, self, force_opaque=True)
+        if c is not None:
+            self.color = c
+            self._update_btn_color()
 
     def _pick_hl(self):
-        dlg = QColorDialog(self.highlight, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.highlight = c
-                self._update_btn_color()
+        # Highlight color keeps alpha (intentionally semi-transparent)
+        c = _show_color_dialog(self.highlight, self)
+        if c is not None:
+            self.highlight = c
+            self._update_btn_color()
 
     def _pick_ol_color(self):
-        dlg = QColorDialog(self.outline_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            c = dlg.selectedColor()
-            if c.isValid():
-                self.outline_color = c
-                self._update_btn_color()
+        c = _show_color_dialog(self.outline_color, self, force_opaque=True)
+        if c is not None:
+            self.outline_color = c
+            self._update_btn_color()
 
     def _update_btn_color(self):
         c = self.color
@@ -2664,6 +2764,9 @@ class EnhancedRegionSelector(QWidget):
         self._draw_color        = QColor(255, 0, 0)
         self._draw_width        = 3
         self._hide_bg           = False
+        # Freehand tool keeps its own independent color and width
+        self._freehand_color    = QColor(255, 0, 0)
+        self._freehand_width    = 3
 
         # Drawing state
         self._draw_start_scene   = None     # QPointF scene coords
@@ -2683,6 +2786,8 @@ class EnhancedRegionSelector(QWidget):
         self._canvas = _OverlayCanvas(self)
         self._canvas.sync_geometry()
         self._canvas.raise_()
+        # Sync color swatch and freehand defaults when selection changes
+        self._canvas._scene.selectionChanged.connect(self._on_selection_changed)
 
         # ── Window-rect cache — disabled (detection mode removed) ──────────────
         self._win_rects: list[QRect] = []
@@ -2855,6 +2960,28 @@ class EnhancedRegionSelector(QWidget):
     #  Toolbar
     # ══════════════════════════════════════════════════════════════════════════
 
+    def _on_selection_changed(self):
+        """Called when scene selection changes.
+        If a FreehandItem is selected, update the toolbar color swatch and
+        sync _freehand_width/_freehand_color so the Edit dialog pre-fills correctly."""
+        selected = self._canvas._scene.selectedItems()
+        for item in selected:
+            if isinstance(item, FreehandItem):
+                w = item.pen().width()
+                c = item.pen().color()
+                self._freehand_width = w if w > 0 else self._freehand_width
+                self._freehand_color = QColor(c)
+                self._color_preview.setStyleSheet(
+                    f"background:{c.name()}; border:1px solid white; border-radius:3px;")
+                return
+        # No freehand item in selection — restore swatch to the active tool color
+        if self._current_tool == self.TOOL_FREEHAND:
+            swatch = self._freehand_color
+        else:
+            swatch = self._draw_color
+        self._color_preview.setStyleSheet(
+            f"background:{swatch.name()}; border:1px solid white; border-radius:3px;")
+
     def _build_toolbar(self):
         bar = QWidget(self,
                       Qt.WindowType.FramelessWindowHint |
@@ -2938,12 +3065,66 @@ class EnhancedRegionSelector(QWidget):
         if tool_id == self.TOOL_IMAGE:
             self._import_image(); return
         if tool_id == self.TOOL_COLOR:
+            # In Freehand mode: always show the Freehand edit dialog (width + color)
+            if self._current_tool == self.TOOL_FREEHAND:
+                selected = self._canvas._scene.selectedItems()
+                freehand_items = [i for i in selected if isinstance(i, FreehandItem)]
+                if freehand_items:
+                    # Edit the selected freehand item's properties
+                    item = freehand_items[0]
+                    dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
+                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                        new_width, new_color = dlg.result_data()
+                        pen = item.pen()
+                        pen.setWidth(new_width)
+                        pen.setColor(new_color)
+                        item.setPen(pen)
+                        item.update()
+                        # Save into freehand-specific slots
+                        self._freehand_width = new_width
+                        self._freehand_color = QColor(new_color)
+                        self._color_preview.setStyleSheet(
+                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
+                        if hasattr(self, 'spin'):
+                            self.spin.blockSignals(True)
+                            self.spin.setValue(new_width)
+                            self.spin.blockSignals(False)
+                else:
+                    # No freehand item selected — edit default stroke width/color for Freehand tool
+                    dlg = FreehandEditDialog(self._freehand_width, self._freehand_color, self)
+                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                        new_width, new_color = dlg.result_data()
+                        self._freehand_width = new_width
+                        self._freehand_color = QColor(new_color)
+                        self._color_preview.setStyleSheet(
+                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
+                        if hasattr(self, 'spin'):
+                            self.spin.blockSignals(True)
+                            self.spin.setValue(new_width)
+                            self.spin.blockSignals(False)
+                return
             self._pick_color(); return
+
+        # Reset drawing state when switching tools to avoid stale start position
+        self._draw_start_scene = None
+        # Clear any stale resize state (e.g. after handle drag on Line/Arrow)
+        self._resizing_item  = None
+        self._resize_handle  = None
+        if self._preview_item is not None:
+            try:
+                self._canvas._scene.removeItem(self._preview_item)
+            except Exception:
+                pass
+            self._preview_item = None
 
         self._current_tool = tool_id
         for tid, btn in self._tool_btns.items():
             if btn.isCheckable():
                 btn.setChecked(tid == tool_id)
+        # Update color swatch: Freehand has its own independent color
+        swatch_color = self._freehand_color if tool_id == self.TOOL_FREEHAND else self._draw_color
+        self._color_preview.setStyleSheet(
+            f"background:{swatch_color.name()}; border:1px solid white; border-radius:3px;")
 
         # Show/hide capture button
         if self._is_draw_tool(tool_id):
@@ -2969,21 +3150,48 @@ class EnhancedRegionSelector(QWidget):
         not create new annotations). The previous tool is restored afterwards."""
         prev_tool = self._current_tool
         # Switch to SELECT so stray clicks don't spawn duplicate annotations
-        self._select_tool(self.TOOL_SELECT)
+        self._current_tool = self.TOOL_SELECT
+        for tid, btn in self._tool_btns.items():
+            if btn.isCheckable():
+                btn.setChecked(tid == self.TOOL_SELECT)
+        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self._toolbar.hide()
         self.releaseKeyboard()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         QApplication.processEvents()
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        # On Linux the fullscreen overlay sits above normal WindowStaysOnTop dialogs;
+        # X11BypassWindowManagerHint forces the dialog above everything.
+        flags = Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint
+        if IS_LINUX:
+            flags |= Qt.WindowType.X11BypassWindowManagerHint
+        dlg.setWindowFlags(flags)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
         result = dlg.exec()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        # Canvas MUST remain transparent so the parent overlay can route mouse events properly
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        # Clear any stale resize/draw state before restoring the previous tool
+        self._resizing_item    = None
+        self._resize_handle    = None
+        self._draw_start_scene = None
+        self._preview_item     = None
         # Restore the tool that was active before the dialog
-        self._select_tool(prev_tool)
+        # Use direct assignment to avoid re-triggering IMAGE/COLOR side effects
+        if prev_tool not in (self.TOOL_IMAGE, self.TOOL_COLOR):
+            self._current_tool = prev_tool
+            for tid, btn in self._tool_btns.items():
+                if btn.isCheckable():
+                    btn.setChecked(tid == prev_tool)
+            cross = (self.TOOL_DETECT, self.TOOL_RECT, self.TOOL_CIRCLE,
+                     self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
+                     self.TOOL_FREEHAND)
+            cur = Qt.CursorShape.CrossCursor if prev_tool in cross else Qt.CursorShape.ArrowCursor
+            self.setCursor(QCursor(cur))
+        else:
+            self._current_tool = self.TOOL_SELECT
         self._toolbar.show()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
@@ -3049,17 +3257,46 @@ class EnhancedRegionSelector(QWidget):
                 item.update()
             return True
 
+        if isinstance(item, FreehandItem):
+            dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                new_width, new_color = dlg.result_data()
+                pen = item.pen()
+                pen.setWidth(new_width)
+                pen.setColor(new_color)
+                item.setPen(pen)
+                item.update()
+                # Save into freehand-specific slots (independent from other tools)
+                self._freehand_width = new_width
+                self._freehand_color = QColor(new_color)
+                self._color_preview.setStyleSheet(
+                    f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
+                if hasattr(self, 'spin'):
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(new_width)
+                    self.spin.blockSignals(False)
+            return True
+
         return False  # no dedicated dialog for this type
 
     def _open_generic_color_picker(self, apply_to_item=None):
         """Show a plain QColorDialog and apply result to the drawing colour
-        and optionally to *apply_to_item*."""
-        dlg = QColorDialog(self._draw_color, self)
+        and optionally to *apply_to_item*.
+        For all tools except Highlight the dialog opens with alpha=255 by default."""
+        is_highlight = isinstance(apply_to_item, HighlightRectItem)
+        # Build initial color: for non-Highlight tools always show alpha=255 in the picker
+        init_color = QColor(self._draw_color)
+        if not is_highlight:
+            init_color.setAlpha(255)
+        dlg = QColorDialog(init_color, self)
         dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
         if self._exec_dialog(dlg):
             c = dlg.selectedColor()
             if c.isValid():
+                # Force alpha=255 for all annotation tools (Highlight manages its own alpha)
+                if not is_highlight:
+                    c.setAlpha(255)
                 self._draw_color = c
                 self._color_preview.setStyleSheet(
                     f"background:{c.name()}; border:1px solid white; border-radius:3px;")
@@ -3075,21 +3312,53 @@ class EnhancedRegionSelector(QWidget):
 
     def _import_image(self):
         self._toolbar.hide()
-        self.releaseKeyboard() # Allow navigating folders via keyboard
-        path, _ = QFileDialog.getOpenFileName(
-            None, "Import Image", "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
-        if path:
-            pix = QPixmap(path)
-            if not pix.isNull():
-                center = QPointF(self._geo.width() / 2 - pix.width()  / 2,
-                                 self._geo.height()/ 2 - pix.height() / 2)
-                self._canvas.add_pixmap(center, pix)
-                # Switch to SELECT so the user can move/resize it immediately
-                self._select_tool(self.TOOL_SELECT)
+        self.releaseKeyboard()
+        # Make the entire overlay pass-through so the file dialog gets mouse events
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        # Briefly lower the overlay so the dialog can paint on top
+        self.lower()
+        QApplication.processEvents()
+
+        # Parent MUST be 'self' so it inherits the overlay's z-index and bypasses modality block
+        dlg = QFileDialog(self, "Import Image", "",
+                          "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        flags = (Qt.WindowType.Window |
+                 Qt.WindowType.WindowStaysOnTopHint |
+                 Qt.WindowType.Dialog)
+        if IS_LINUX:
+            flags |= Qt.WindowType.X11BypassWindowManagerHint
+        dlg.setWindowFlags(flags)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        QApplication.processEvents()
+
+        # Restore mouse events only AFTER dialog closes (exec is blocking)
+        result = dlg.exec()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        # Canvas MUST remain transparent so the parent overlay can route mouse events properly
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        # Raise the overlay back after the dialog closes
+        self.raise_()
+        self._canvas.raise_()
+
+        if result == QFileDialog.DialogCode.Accepted:
+            files = dlg.selectedFiles()
+            if files:
+                pix = QPixmap(files[0])
+                if not pix.isNull():
+                    center = QPointF(self._geo.width() / 2 - pix.width()  / 2,
+                                     self._geo.height()/ 2 - pix.height() / 2)
+                    self._canvas.add_pixmap(center, pix)
+
+        # Always switch to SELECT after image import so user can move/resize it
+        self._select_tool(self.TOOL_SELECT)
         self._toolbar.show()
         self.activateWindow(); self.setFocus()
-        self.grabKeyboard() # Re-lock keyboard
+        self.grabKeyboard()
 
     def _capture_with_annotations(self):
         """
@@ -3241,6 +3510,11 @@ class EnhancedRegionSelector(QWidget):
             if item and handle:
                 self._resizing_item = item
                 self._resize_handle = handle
+                # Send a synthetic press at the item's position so the scene
+                # registers it as the current mouse grabber — this ensures the
+                # paired synthetic release in mouseReleaseEvent will correctly
+                # clear the grabber rather than leaving it in a stale state.
+                self._canvas.send_mouse_to_scene(e)
                 return
             self._canvas.send_mouse_to_scene(e)
             return
@@ -3251,7 +3525,7 @@ class EnhancedRegionSelector(QWidget):
         self._preview_item = None
 
         if self._current_tool == self.TOOL_FREEHAND:
-            self._canvas.begin_freehand(scene_pos, self._draw_color, self._draw_width)
+            self._canvas.begin_freehand(scene_pos, self._freehand_color, self._freehand_width)
 
         elif self._current_tool == self.TOOL_MARKER:
             self._canvas.add_marker(scene_pos, self._draw_color)
@@ -3267,6 +3541,8 @@ class EnhancedRegionSelector(QWidget):
                     item.outline_enabled   = ol_on
                     item.outline_width     = ol_w
                     item.outline_color     = ol_col
+            # After placing text, switch to SELECT so user can immediately move it
+            self._select_tool(self.TOOL_SELECT)
 
         elif self._current_tool == self.TOOL_BUBBLE:
             dlg = _BubbleInputDialog(QColor(self._draw_color), self)
@@ -3274,6 +3550,8 @@ class EnhancedRegionSelector(QWidget):
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
                     self._canvas.add_bubble(scene_pos, txt, fg_col, bg_col)
+            # After placing bubble, switch to SELECT so other tools work normally
+            self._select_tool(self.TOOL_SELECT)
 
     def mouseMoveEvent(self, e):
         gpos = e.globalPosition().toPoint()
@@ -3428,8 +3706,20 @@ class EnhancedRegionSelector(QWidget):
         # ── SELECT mode ───────────────────────────────────────────────────────
         if self._current_tool == self.TOOL_SELECT:
             if getattr(self, '_resizing_item', None):
+                item = self._resizing_item
                 self._resizing_item = None
                 self._resize_handle = None
+                # Clear any width-drag state on the item
+                if hasattr(item, '_width_drag_active'):
+                    item._width_drag_active = False
+                # Clear active_handle on Line/Arrow items (safety)
+                if hasattr(item, 'active_handle'):
+                    item.active_handle = None
+                # CRITICAL: send a synthetic release to the QGraphicsScene so it
+                # clears its internal mouse-grabber state. Without this, the scene
+                # keeps routing all future send_mouse_to_scene calls to the old
+                # grabbed item, making every subsequently placed object uneditable.
+                self._canvas.send_mouse_to_scene(e)
                 return
             self._canvas.send_mouse_to_scene(e)
             return
@@ -3460,6 +3750,26 @@ class EnhancedRegionSelector(QWidget):
 
             elif isinstance(item, _MarkerItem):
                 self._edit_marker(item)
+
+            elif isinstance(item, FreehandItem):
+                self._edit_freehand(item)
+
+    def _edit_freehand(self, item):
+        """Open FreehandEditDialog for a selected FreehandItem — same UI/logic as Image Editor."""
+        dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            new_width, new_color = dlg.result_data()
+            pen = item.pen()
+            pen.setWidth(new_width)
+            pen.setColor(new_color)
+            item.setPen(pen)
+            item.update()
+            # Keep freehand-specific defaults in sync for future strokes
+            self._freehand_width = new_width
+            self._freehand_color = QColor(new_color)
+            # Update color swatch on toolbar
+            self._color_preview.setStyleSheet(
+                f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
 
     def _edit_text(self, item):
         # Pre-fill dialog with existing text item data
@@ -3526,7 +3836,7 @@ class EnhancedRegionSelector(QWidget):
             item.update()
 
     def contextMenuEvent(self, e):
-        lpos = e.position().toPoint()
+        lpos = e.pos()
         scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
         item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
         if item is not None:
@@ -3569,6 +3879,17 @@ class EnhancedRegionSelector(QWidget):
                 action = menu.exec(e.globalPos())
                 if action == edit_act:
                     self._edit_highlight(item)
+                elif action == dup_act:
+                    self._duplicate_item_beside(item)
+                elif action == del_act:
+                    self._canvas._scene.removeItem(item)
+            elif isinstance(item, FreehandItem):
+                edit_act = menu.addAction("✏️ Edit Freehand")
+                dup_act  = menu.addAction("⧉ Duplicate")
+                del_act  = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action == edit_act:
+                    self._edit_freehand(item)
                 elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
@@ -5091,6 +5412,57 @@ class ImageEditorStartDialog(QDialog):
 #  FINAL IMAGE EDITOR (FIXED SCALING, DELETE, SAVE AS & CTRL PROPORTIONS)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class FreehandEditDialog(QDialog):
+    """Edit dialog for Freehand strokes — line width and color."""
+    def __init__(self, current_width: int, current_color: QColor, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Edit Freehand")
+        self._width = current_width
+        self._color = QColor(current_color)
+        lay = QVBoxLayout(self)
+
+        # Line width
+        width_row = QHBoxLayout()
+        width_row.addWidget(QLabel("Line width:"))
+        self.spin_width = QSpinBox()
+        self.spin_width.setRange(1, 100)
+        self.spin_width.setValue(current_width)
+        self.spin_width.setSuffix(" px")
+        width_row.addWidget(self.spin_width)
+        lay.addLayout(width_row)
+
+        # Line color
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Line color:"))
+        self.btn_color = QPushButton()
+        self.btn_color.setFixedSize(80, 28)
+        self.btn_color.clicked.connect(self._pick_color)
+        color_row.addWidget(self.btn_color)
+        lay.addLayout(color_row)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._update_btn()
+
+    def _pick_color(self):
+        c = _show_color_dialog(self._color, self, force_opaque=True)
+        if c is not None:
+            self._color = c
+            self._update_btn()
+
+    def _update_btn(self):
+        c = self._color
+        self.btn_color.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},1.0); "
+            f"color: {'black' if c.lightness() > 128 else 'white'}; border: 1px solid #888;")
+
+    def result_data(self):
+        return self.spin_width.value(), QColor(self._color)
+
+
 class FreehandItem(QGraphicsPathItem):
     def __init__(self, path, canvas=None):
         super().__init__(path)
@@ -5127,6 +5499,65 @@ class FreehandItem(QGraphicsPathItem):
         self._base_path = self.path()
         self._rect = self._base_path.boundingRect()
 
+    def _open_edit_dialog(self, screen_pos=None):
+        """Open FreehandEditDialog above the canvas via the overlay's _exec_dialog."""
+        # Locate the CaptureRegionWindow (overlay) that owns this item
+        overlay = None
+        if self.scene() and self.scene().views():
+            for view in self.scene().views():
+                win = view.window()
+                if win and hasattr(win, '_exec_dialog'):
+                    overlay = win
+                    break
+
+        dlg = FreehandEditDialog(self.pen().width(), self.pen().color(),
+                                 parent=overlay)
+
+        if overlay is not None:
+            result = overlay._exec_dialog(dlg)
+        else:
+            # Fallback when no overlay is found (e.g. standalone ImageEditorWindow)
+            _set_dialog_on_top(dlg)
+            if screen_pos:
+                dlg.move(screen_pos)
+            result = dlg.exec()
+
+        if result == QDialog.DialogCode.Accepted:
+            new_width, new_color = dlg.result_data()
+            pen = self.pen()
+            pen.setWidth(new_width)
+            pen.setColor(new_color)
+            self.setPen(pen)
+            self.update()
+            # Sync the Size spinner in the parent window
+            if self.scene() and self.scene().views():
+                win = self.scene().views()[0].window()
+                if win and hasattr(win, 'spin'):
+                    win.spin.blockSignals(True)
+                    win.spin.setValue(new_width)
+                    win.spin.blockSignals(False)
+            # Update _draw_width on the overlay so new strokes use the new width
+            if overlay is not None and hasattr(overlay, '_draw_width'):
+                overlay._draw_width = new_width
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._open_edit_dialog(event.screenPos().toPoint())
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        edit_act = menu.addAction("✏️ Edit")
+        del_act  = menu.addAction("🗑️ Delete")
+        action = menu.exec(event.screenPos())
+        if action == edit_act:
+            self._open_edit_dialog(event.screenPos().toPoint())
+        elif action == del_act:
+            if self.scene():
+                self.scene().removeItem(self)
+        event.accept()
+
     def boundingRect(self):
         return self._rect.adjusted(-5, -50, 5, 5)
 
@@ -5135,12 +5566,34 @@ class FreehandItem(QGraphicsPathItem):
         option.state &= ~QStyle.StateFlag.State_Selected
         painter.setPen(self.pen())
         painter.drawPath(self.path())
-        
+
         if self.isSelected():
-            pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
-            painter.setPen(pen)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # Dashed bounding box
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.GlobalColor.transparent)
             painter.drawRect(self._rect)
+            # Corner & edge resize handles (identical to ResizableRectItem)
+            r = self._rect
+            for hp in [
+                r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight(),
+                QPointF(r.center().x(), r.top()),
+                QPointF(r.center().x(), r.bottom()),
+                QPointF(r.left(),  r.center().y()),
+                QPointF(r.right(), r.center().y()),
+            ]:
+                painter.setBrush(QBrush(Qt.GlobalColor.white))
+                painter.setPen(QPen(QColor(60, 120, 255), 1.5))
+                painter.drawEllipse(hp, 5, 5)
+            # Rotation handle above top edge (identical to ResizableRectItem)
+            rot_pt = QPointF(r.center().x(), r.top() - 30)
+            painter.setBrush(QBrush(QColor(180, 255, 180, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
+            painter.drawEllipse(rot_pt, 6, 6)
+            painter.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DotLine))
+            painter.drawLine(QPointF(r.center().x(), r.top()), rot_pt)
+            painter.restore()
 
 
 class LineItem(QGraphicsLineItem):
@@ -5163,81 +5616,132 @@ class LineItem(QGraphicsLineItem):
         painter.setPen(self.pen())
         painter.drawLine(self.line())
         
-        # Rysujemy uchwyty tylko jeśli zaznaczone
+        # Draw handles only when selected
         if self.isSelected():
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # Handle size: 16px screen-space, scale-independent
+            s = 16 / (self.canvas.transform().m11() if self.canvas else 1)
+            r = s / 2
+            # p1 endpoint handle — white fill, blue border
             painter.setBrush(QBrush(Qt.GlobalColor.white))
-            painter.setPen(QPen(Qt.GlobalColor.blue, 1.5))
-            # Rozmiar uchwytu stały niezależnie od zoomu
-            s = 10 / (self.canvas.transform().m11() if self.canvas else 1)
-            painter.drawEllipse(self.line().p1(), s/2, s/2)
-            painter.drawEllipse(self.line().p2(), s/2, s/2)
-            # Width handle at midpoint
+            painter.setPen(QPen(Qt.GlobalColor.blue, 2.0))
+            painter.drawEllipse(self.line().p1(), r, r)
+            # p2 endpoint handle — white fill, blue border
+            painter.drawEllipse(self.line().p2(), r, r)
+            # Width handle at midpoint — yellow fill, dark border
             mid = QPointF((self.line().p1().x() + self.line().p2().x()) / 2,
                           (self.line().p1().y() + self.line().p2().y()) / 2)
             painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
-            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
-            painter.drawEllipse(mid, s/2, s/2)
+            painter.setPen(QPen(QColor(60, 60, 60), 2.0))
+            painter.drawEllipse(mid, r, r)
+
+    def _handle_hit_radius(self):
+        """Hit-test radius for endpoint/width handles, in item-local coords.
+        Fixed at 18px screen-space so handles are easy to grab regardless of zoom."""
+        return 18 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
+
+    def shape(self):
+        """Override shape() so Qt's scene hit-testing covers the full handle surfaces,
+        not just the thin line geometry. Includes a fat stroke along the line body
+        plus circular regions at p1, p2, and the midpoint (width handle)."""
+        r = self._handle_hit_radius()
+        line = self.line()
+        p1, p2 = line.p1(), line.p2()
+        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+
+        # Fat stroke along the line body
+        body = QPainterPath()
+        body.moveTo(p1)
+        body.lineTo(p2)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(max(self.pen().width() + 4, r * 2))
+        result = stroker.createStroke(body)
+
+        # Add circular hit zones for each handle
+        for pt in (p1, p2, mid):
+            circle = QPainterPath()
+            circle.addEllipse(pt, r, r)
+            result = result.united(circle)
+
+        return result
 
     def mousePressEvent(self, event):
         p = event.pos()
         p1, p2 = self.line().p1(), self.line().p2()
-        # Larger hit area for handles (easier to grab)
-        dist = 22 / (self.canvas.transform().m11() if self.canvas else 1)
-        if (p - p1).manhattanLength() < dist:
+        # Use true Euclidean distance (not manhattanLength) for accurate circular hit zones
+        r = self._handle_hit_radius()
+
+        if math.hypot(p.x() - p1.x(), p.y() - p1.y()) <= r:
             self.active_handle = 'p1'
-        elif (p - p2).manhattanLength() < dist:
+            event.accept()
+        elif math.hypot(p.x() - p2.x(), p.y() - p2.y()) <= r:
             self.active_handle = 'p2'
+            event.accept()
         else:
-            # Width handle at midpoint
             mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
-            if (p - mid).manhattanLength() < dist:
+            if math.hypot(p.x() - mid.x(), p.y() - mid.y()) <= r:
                 self.active_handle = 'width'
                 self._width_drag_start_pos = p
-                self._width_drag_start_w   = self.pen().width()
+                self._width_drag_start_w = self.pen().width()
+                event.accept()
             else:
                 self.active_handle = None
                 super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.active_handle in ('p1', 'p2'):
-            self.prepareGeometryChange() # Usuwa smużenie
+        if getattr(self, 'active_handle', None) in ('p1', 'p2'):
+            self.prepareGeometryChange()
             line = self.line()
             new_pos = event.pos()
-            
+
+            # 45-degree angle snapping constraint
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 anchor = line.p2() if self.active_handle == 'p1' else line.p1()
                 dx, dy = new_pos.x() - anchor.x(), new_pos.y() - anchor.y()
-                angle = math.atan2(dy, dx)
-                # Angle snapping co 45 stopni
-                snapped_angle = round(math.degrees(angle) / 45) * 45
-                dist = math.hypot(dx, dy)
-                new_pos = QPointF(anchor.x() + dist * math.cos(math.radians(snapped_angle)),
-                                 anchor.y() + dist * math.sin(math.radians(snapped_angle)))
-            
-            if self.active_handle == 'p1': line.setP1(new_pos)
-            else: line.setP2(new_pos)
+                snapped_angle = round(math.degrees(math.atan2(dy, dx)) / 45) * 45
+                d = math.hypot(dx, dy)
+                new_pos = QPointF(anchor.x() + d * math.cos(math.radians(snapped_angle)),
+                                  anchor.y() + d * math.sin(math.radians(snapped_angle)))
+
+            if self.active_handle == 'p1':
+                line.setP1(new_pos)
+            else:
+                line.setP2(new_pos)
+
             self.setLine(line)
-        elif self.active_handle == 'width':
+            event.accept()
+
+        elif getattr(self, 'active_handle', None) == 'width':
             line = self.line()
             if line.length() > 0:
                 start_pos = getattr(self, '_width_drag_start_pos', event.pos())
-                start_w   = getattr(self, '_width_drag_start_w', self.pen().width())
+                start_w = getattr(self, '_width_drag_start_w', self.pen().width())
                 dy = event.pos().y() - start_pos.y()
                 new_w = max(1, int(start_w + dy * 0.3))
+
                 pen = self.pen()
                 pen.setWidth(new_w)
                 self.setPen(pen)
                 self.prepareGeometryChange()
                 self.update()
+
                 if hasattr(self, 'canvas') and self.canvas:
-                    win = self.canvas.window()
-                    if hasattr(win, 'spin'):
+                    win = self.canvas.window() if hasattr(self.canvas, 'window') else None
+                    if win and hasattr(win, 'spin'):
                         win.spin.blockSignals(True)
                         win.spin.setValue(new_w)
                         win.spin.blockSignals(False)
+            event.accept()
         else:
             super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        # Always fully release the state flag on mouse up
+        if getattr(self, 'active_handle', None):
+            self.active_handle = None
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
 
 
 class HighlightTextItem(QGraphicsTextItem):
@@ -5906,7 +6410,7 @@ class EditorCanvas(QGraphicsView):
             def _do_text_dialog():
                 dlg = _TextInputDialog(_col, self.window())
                 dlg.sz.setValue(_fsz)
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                _set_dialog_on_top(dlg)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     txt, new_fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
                     if txt.strip():
@@ -5937,7 +6441,7 @@ class EditorCanvas(QGraphicsView):
             QTimer.singleShot(0, _do_text_dialog)
         elif self.current_tool == "Bubble" and self.start_point:
             dlg = _BubbleInputDialog(self.stroke_color, self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            _set_dialog_on_top(dlg)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
@@ -5974,16 +6478,19 @@ class EditorCanvas(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
-        scene_pos = self.mapToScene(event.pos())
+        scene_pos = self.mapToScene(event.position().toPoint())
         item = self.scene.itemAt(scene_pos, self.transform())
         if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
             win = self.window()
             if hasattr(win, '_edit_text_item'):
                 win._edit_text_item(item)
                 return
+        elif isinstance(item, FreehandItem):
+            item._open_edit_dialog(event.globalPosition().toPoint())
+            return
         elif isinstance(item, HighlightRectItem):
             dlg = HighlightEditDialog(item._color, self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            _set_dialog_on_top(dlg)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 new_color = dlg.result_color()
                 item._color = new_color
@@ -5993,7 +6500,7 @@ class EditorCanvas(QGraphicsView):
                 self.is_dirty = True
         elif isinstance(item, TextBubbleItem):
             dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            _set_dialog_on_top(dlg)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
@@ -6009,7 +6516,7 @@ class EditorCanvas(QGraphicsView):
                 QColor(item._bg_color),
                 QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
                 self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            _set_dialog_on_top(dlg)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 item._bg_color   = dlg.bg_color
                 item._text_color = dlg.text_color
@@ -6019,7 +6526,7 @@ class EditorCanvas(QGraphicsView):
             super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
-        scene_pos = self.mapToScene(event.pos())
+        scene_pos = self.mapToScene(event.pos())  # QContextMenuEvent uses .pos(), not .position()
         item = self.scene.itemAt(scene_pos, self.transform())
         if item in (self.bg_item, self.crop_item) or item is None:
             super().contextMenuEvent(event)
@@ -6055,7 +6562,7 @@ class EditorCanvas(QGraphicsView):
                 return
             if action == edit_act:
                 dlg = HighlightEditDialog(item._color, self)
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                _set_dialog_on_top(dlg)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     new_color = dlg.result_color()
                     item._color = new_color
@@ -6082,7 +6589,7 @@ class EditorCanvas(QGraphicsView):
                 return
             if action == edit_act:
                 dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                _set_dialog_on_top(dlg)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     txt, fg_col, bg_col = dlg.result_data()
                     if txt.strip():
@@ -6106,11 +6613,29 @@ class EditorCanvas(QGraphicsView):
                     QColor(item._bg_color),
                     QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
                     self)
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                _set_dialog_on_top(dlg)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     item._bg_color   = dlg.bg_color
                     item._text_color = dlg.text_color
                     item.update()
+                    self.is_dirty = True
+            elif action == del_act:
+                self.scene.removeItem(item)
+                self.is_dirty = True
+        elif isinstance(item, FreehandItem):
+            menu = QMenu(self)
+            edit_act = menu.addAction("✏️ Edit")
+            dup_act  = menu.addAction("⧉ Duplicate")
+            del_act  = menu.addAction("🗑️ Delete")
+            action = menu.exec(event.globalPos())
+            if action == edit_act:
+                item._open_edit_dialog(event.globalPos())
+                self.is_dirty = True
+            elif action == dup_act:
+                dup = self._clone_item(item)
+                if dup:
+                    dup.setPos(item.pos() + QPointF(20, 20))
+                    self.scene.addItem(dup)
                     self.is_dirty = True
             elif action == del_act:
                 self.scene.removeItem(item)
@@ -6719,6 +7244,22 @@ class ImageEditorWindow(QMainWindow):
                     item.update()
                     self.canvas.is_dirty = True
                 return
+            if isinstance(item, FreehandItem):
+                dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
+                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    new_width, new_color = dlg.result_data()
+                    pen = item.pen()
+                    pen.setWidth(new_width)
+                    pen.setColor(new_color)
+                    item.setPen(pen)
+                    item.update()
+                    self.canvas.stroke_width = new_width
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(new_width)
+                    self.spin.blockSignals(False)
+                    self.canvas.is_dirty = True
+                return
             if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
                 self._edit_text_item(item)
                 return
@@ -6732,7 +7273,11 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.is_dirty = True
             return
 
-        dialog = QColorDialog(self.canvas.stroke_color, self)
+        init_col = QColor(self.canvas.stroke_color)
+        if self.canvas.current_tool != "Highlight":
+            init_col.setAlpha(255)
+        
+        dialog = QColorDialog(init_col, self)
         dialog.setWindowTitle("Pick Color & Alpha")
         dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
@@ -6797,6 +7342,13 @@ class ImageEditorWindow(QMainWindow):
                     f.setPointSize(max(1, value))
                     item.setFont(f)
                     self.canvas.is_dirty = True
+                elif isinstance(item, FreehandItem):
+                    # Live-update stroke width for freehand items
+                    pen = item.pen()
+                    pen.setWidth(max(1, value))
+                    item.setPen(pen)
+                    item.update()
+                    self.canvas.is_dirty = True
                 elif hasattr(item, 'pen') and hasattr(item, 'setPen'):
                     # Live-update stroke width for shape/line/arrow items
                     pen = item.pen()
@@ -6843,6 +7395,16 @@ class ImageEditorWindow(QMainWindow):
                     self.spin.setValue(size)
                     self.spin.blockSignals(False)
                     self.canvas.font_size = size
+                return
+            elif isinstance(item, FreehandItem):
+                # Freehand item — read pen width
+                width = item.pen().width()
+                if width > 0:
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(width)
+                    self.spin.blockSignals(False)
+                    self.canvas.stroke_width = width
+                    self.spin_stroke.setValue(width)
                 return
             elif hasattr(item, 'pen') and callable(item.pen):
                 # Shape / line / arrow — read pen width
@@ -8677,12 +9239,16 @@ def _script_dir() -> Path:
 
 
 def load_app_icon() -> QIcon:
-    """Search for PyshareX.ico in ./icons/ subfolder, then script dir, then fallback."""
+    """Search for PyShareX.ico in ./icons/ subfolder, then script dir, then fallback.
+    Tries all known capitalisation variants so it works on case-sensitive filesystems."""
     base = _script_dir()
     for candidate in [
+        base / "icons" / "PyShareX.ico",
         base / "icons" / "PyshareX.ico",
-        base / "PyshareX.ico",
         base / "icons" / "pysharex.ico",
+        base / "icons" / "PySharex.ico",
+        base / "PyShareX.ico",
+        base / "PyshareX.ico",
         base / "pysharex.ico",
     ]:
         if candidate.exists():
