@@ -1929,33 +1929,42 @@ class ArrowItem(QGraphicsLineItem):
             painter.drawPath(path)
         if self.isSelected():
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # Handle size: 16px screen-space, scale-independent
+            s = 16 / (self.canvas.transform().m11() if self.canvas else 1)
+            r = s / 2
+            # p1 endpoint handle — white fill, blue border
             painter.setBrush(QBrush(Qt.GlobalColor.white))
-            painter.setPen(QPen(Qt.GlobalColor.blue, 1.5))
-            s = 10 / (self.canvas.transform().m11() if self.canvas else 1)
-            painter.drawEllipse(self.line().p1(), s/2, s/2)
-            painter.drawEllipse(self.line().p2(), s/2, s/2)
-            # Width handle at midpoint
+            painter.setPen(QPen(Qt.GlobalColor.blue, 2.0))
+            painter.drawEllipse(self.line().p1(), r, r)
+            # p2 endpoint handle — white fill, blue border
+            painter.drawEllipse(self.line().p2(), r, r)
+            # Width handle at midpoint — yellow fill, dark border
             mid = QPointF((self.line().p1().x() + self.line().p2().x()) / 2,
                           (self.line().p1().y() + self.line().p2().y()) / 2)
             painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
-            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
-            painter.drawEllipse(mid, s/2, s/2)
+            painter.setPen(QPen(QColor(60, 60, 60), 2.0))
+            painter.drawEllipse(mid, r, r)
+
+    def _handle_hit_radius(self):
+        """Hit-test radius for endpoint/width handles, in item-local coords.
+        Fixed at 18px screen-space so handles are easy to grab regardless of zoom."""
+        return 18 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
 
     def mousePressEvent(self, event):
         p = event.pos()
         p1, p2 = self.line().p1(), self.line().p2()
-        dist = 22 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
+        # Use true Euclidean distance (not manhattanLength) for accurate circular hit zones
+        r = self._handle_hit_radius()
 
-        # Ensure we ACCEPT the event to grab the mouse state correctly
-        if (p - p1).manhattanLength() < dist:
+        if math.hypot(p.x() - p1.x(), p.y() - p1.y()) <= r:
             self.active_handle = 'p1'
             event.accept()
-        elif (p - p2).manhattanLength() < dist:
+        elif math.hypot(p.x() - p2.x(), p.y() - p2.y()) <= r:
             self.active_handle = 'p2'
             event.accept()
         else:
             mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
-            if (p - mid).manhattanLength() < dist:
+            if math.hypot(p.x() - mid.x(), p.y() - mid.y()) <= r:
                 self.active_handle = 'width'
                 self._width_drag_start_pos = p
                 self._width_drag_start_w = self.pen().width()
@@ -5330,37 +5339,45 @@ class LineItem(QGraphicsLineItem):
         painter.setPen(self.pen())
         painter.drawLine(self.line())
         
-        # Rysujemy uchwyty tylko jeśli zaznaczone
+        # Draw handles only when selected
         if self.isSelected():
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # Handle size: 16px screen-space, scale-independent
+            s = 16 / (self.canvas.transform().m11() if self.canvas else 1)
+            r = s / 2
+            # p1 endpoint handle — white fill, blue border
             painter.setBrush(QBrush(Qt.GlobalColor.white))
-            painter.setPen(QPen(Qt.GlobalColor.blue, 1.5))
-            # Rozmiar uchwytu stały niezależnie od zoomu
-            s = 10 / (self.canvas.transform().m11() if self.canvas else 1)
-            painter.drawEllipse(self.line().p1(), s/2, s/2)
-            painter.drawEllipse(self.line().p2(), s/2, s/2)
-            # Width handle at midpoint
+            painter.setPen(QPen(Qt.GlobalColor.blue, 2.0))
+            painter.drawEllipse(self.line().p1(), r, r)
+            # p2 endpoint handle — white fill, blue border
+            painter.drawEllipse(self.line().p2(), r, r)
+            # Width handle at midpoint — yellow fill, dark border
             mid = QPointF((self.line().p1().x() + self.line().p2().x()) / 2,
                           (self.line().p1().y() + self.line().p2().y()) / 2)
             painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
-            painter.setPen(QPen(QColor(60, 60, 60), 1.5))
-            painter.drawEllipse(mid, s/2, s/2)
+            painter.setPen(QPen(QColor(60, 60, 60), 2.0))
+            painter.drawEllipse(mid, r, r)
+
+    def _handle_hit_radius(self):
+        """Hit-test radius for endpoint/width handles, in item-local coords.
+        Fixed at 18px screen-space so handles are easy to grab regardless of zoom."""
+        return 18 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
 
     def mousePressEvent(self, event):
         p = event.pos()
         p1, p2 = self.line().p1(), self.line().p2()
-        dist = 22 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
+        # Use true Euclidean distance (not manhattanLength) for accurate circular hit zones
+        r = self._handle_hit_radius()
 
-        # Ensure we ACCEPT the event to grab the mouse state correctly
-        if (p - p1).manhattanLength() < dist:
+        if math.hypot(p.x() - p1.x(), p.y() - p1.y()) <= r:
             self.active_handle = 'p1'
             event.accept()
-        elif (p - p2).manhattanLength() < dist:
+        elif math.hypot(p.x() - p2.x(), p.y() - p2.y()) <= r:
             self.active_handle = 'p2'
             event.accept()
         else:
             mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
-            if (p - mid).manhattanLength() < dist:
+            if math.hypot(p.x() - mid.x(), p.y() - mid.y()) <= r:
                 self.active_handle = 'width'
                 self._width_drag_start_pos = p
                 self._width_drag_start_w = self.pen().width()
