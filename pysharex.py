@@ -1553,10 +1553,15 @@ class _OverlayCanvas(QGraphicsView):
         """Return (item, handle_name) if pos is over a resize handle."""
         for item in self._scene.selectedItems():
             # Include all annotation item types that support handles
+            # Allow native event handling for Line and Arrow items to avoid conflicts
+            if isinstance(item, (ArrowItem, LineItem)):
+                continue
+
+            # Include all other annotation item types that support bounding-box handles
             if not isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem,
-                                     ResizablePixmapItem, FreehandItem,
-                                     TextBubbleItem, ArrowItem, LineItem,
-                                     _MarkerItem)):
+                                    ResizablePixmapItem, FreehandItem,
+                                    TextBubbleItem,
+                                    _MarkerItem)):
                 continue
             local_pos = item.mapFromScene(scene_pos)
             rect = item.rect()
@@ -1567,17 +1572,6 @@ class _OverlayCanvas(QGraphicsView):
                 r = item.RADIUS * item._scale
                 if math.hypot(local_pos.x() + r, local_pos.y()) <= item.HANDLE_RADIUS + 6:
                     return item, 'TL'  # reuse TL to trigger uniform scale
-                continue
-
-            # ArrowItem / LineItem: end-point handles
-            if isinstance(item, (ArrowItem, LineItem)):
-                line = item.line()
-                p1 = line.p1()
-                p2 = line.p2()
-                if math.hypot(local_pos.x() - p1.x(), local_pos.y() - p1.y()) <= m:
-                    return item, 'TL'  # p1 — mapped to TL resize logic
-                if math.hypot(local_pos.x() - p2.x(), local_pos.y() - p2.y()) <= m:
-                    return item, 'BR'  # p2 — mapped to BR resize logic
                 continue
 
             # Rotation handle — above top edge (all rect/ellipse/pixmap/freehand items)
@@ -1630,31 +1624,7 @@ class _OverlayCanvas(QGraphicsView):
             item.update()
             return
 
-        # ArrowItem / LineItem
-        if isinstance(item, (ArrowItem, LineItem)):
-            line = item.line()
-            local_pos = item.mapFromScene(scene_pos)
-            if handle == 'TL':
-                item.prepareGeometryChange()
-                line.setP1(local_pos)
-                item.setLine(line)
-            elif handle == 'BR':
-                item.prepareGeometryChange()
-                line.setP2(local_pos)
-                item.setLine(line)
-            elif handle == 'WIDTH':
-                if not getattr(item, '_width_drag_active', False):
-                    item._width_drag_active = True
-                    item._width_drag_start_pos = local_pos
-                    item._width_drag_start_w   = item.pen().width()
-                dy = local_pos.y() - item._width_drag_start_pos.y()
-                new_w = max(1, int(item._width_drag_start_w + dy * 0.3))
-                pen = item.pen()
-                pen.setWidth(new_w)
-                item.setPen(pen)
-                item.prepareGeometryChange()
-            item.update()
-            return
+            # TextBubbleItem
 
         # TextBubbleItem
         if isinstance(item, TextBubbleItem):
