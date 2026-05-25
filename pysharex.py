@@ -3038,13 +3038,39 @@ class EnhancedRegionSelector(QWidget):
         if tool_id == self.TOOL_IMAGE:
             self._import_image(); return
         if tool_id == self.TOOL_COLOR:
-            # If currently in Freehand mode with a selected item, open its edit dialog
+            # In Freehand mode: always show the Freehand edit dialog (width + color)
             if self._current_tool == self.TOOL_FREEHAND:
                 selected = self._canvas._scene.selectedItems()
                 freehand_items = [i for i in selected if isinstance(i, FreehandItem)]
                 if freehand_items:
-                    self._pick_color()
-                    return
+                    # Edit the selected freehand item's properties
+                    item = freehand_items[0]
+                    dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
+                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                        new_width, new_color = dlg.result_data()
+                        pen = item.pen()
+                        pen.setWidth(new_width)
+                        pen.setColor(new_color)
+                        item.setPen(pen)
+                        item.update()
+                        self._draw_width = new_width
+                        self._draw_color = QColor(new_color)
+                        if hasattr(self, 'spin'):
+                            self.spin.blockSignals(True)
+                            self.spin.setValue(new_width)
+                            self.spin.blockSignals(False)
+                else:
+                    # No freehand item selected — edit default stroke width/color for Freehand tool
+                    dlg = FreehandEditDialog(self._draw_width, self._draw_color, self)
+                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                        new_width, new_color = dlg.result_data()
+                        self._draw_width = new_width
+                        self._draw_color = QColor(new_color)
+                        if hasattr(self, 'spin'):
+                            self.spin.blockSignals(True)
+                            self.spin.setValue(new_width)
+                            self.spin.blockSignals(False)
+                return
             self._pick_color(); return
 
         # Reset drawing state when switching tools to avoid stale start position
@@ -3196,7 +3222,7 @@ class EnhancedRegionSelector(QWidget):
             return True
 
         if isinstance(item, FreehandItem):
-            dlg = FreehandEditDialog(item.pen().width(), item.pen().color())
+            dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 new_width, new_color = dlg.result_data()
                 pen = item.pen()
@@ -3204,6 +3230,14 @@ class EnhancedRegionSelector(QWidget):
                 pen.setColor(new_color)
                 item.setPen(pen)
                 item.update()
+                # Sync Size spinner
+                if hasattr(self, 'spin'):
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(new_width)
+                    self.spin.blockSignals(False)
+                # Update _draw_width so future strokes use the new width
+                self._draw_width = new_width
+                self._draw_color = QColor(new_color)
             return True
 
         return False  # no dedicated dialog for this type
@@ -5398,25 +5432,45 @@ class FreehandItem(QGraphicsPathItem):
         self._rect = self._base_path.boundingRect()
 
     def _open_edit_dialog(self, screen_pos=None):
-        """Open FreehandEditDialog above the canvas."""
-        dlg = FreehandEditDialog(self.pen().width(), self.pen().color())
-        _set_dialog_on_top(dlg)
-        if screen_pos:
-            dlg.move(screen_pos)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        """Open FreehandEditDialog above the canvas via the overlay's _exec_dialog."""
+        # Locate the CaptureRegionWindow (overlay) that owns this item
+        overlay = None
+        if self.scene() and self.scene().views():
+            for view in self.scene().views():
+                win = view.window()
+                if win and hasattr(win, '_exec_dialog'):
+                    overlay = win
+                    break
+
+        dlg = FreehandEditDialog(self.pen().width(), self.pen().color(),
+                                 parent=overlay)
+
+        if overlay is not None:
+            result = overlay._exec_dialog(dlg)
+        else:
+            # Fallback when no overlay is found (e.g. standalone ImageEditorWindow)
+            _set_dialog_on_top(dlg)
+            if screen_pos:
+                dlg.move(screen_pos)
+            result = dlg.exec()
+
+        if result == QDialog.DialogCode.Accepted:
             new_width, new_color = dlg.result_data()
             pen = self.pen()
             pen.setWidth(new_width)
             pen.setColor(new_color)
             self.setPen(pen)
             self.update()
-            # Sync the Size spinner in the parent window (ImageEditorWindow)
+            # Sync the Size spinner in the parent window
             if self.scene() and self.scene().views():
                 win = self.scene().views()[0].window()
                 if win and hasattr(win, 'spin'):
                     win.spin.blockSignals(True)
                     win.spin.setValue(new_width)
                     win.spin.blockSignals(False)
+            # Update _draw_width on the overlay so new strokes use the new width
+            if overlay is not None and hasattr(overlay, '_draw_width'):
+                overlay._draw_width = new_width
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
