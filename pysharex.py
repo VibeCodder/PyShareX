@@ -1975,20 +1975,20 @@ class ArrowItem(QGraphicsLineItem):
         p = event.pos()
         p1, p2 = self.line().p1(), self.line().p2()
         dist = 22 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
-        
+
         if (p - p1).manhattanLength() < dist:
             self.active_handle = 'p1'
-            event.accept()
+            event.ignore()
         elif (p - p2).manhattanLength() < dist:
             self.active_handle = 'p2'
-            event.accept()
+            event.ignore()
         else:
             mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
             if (p - mid).manhattanLength() < dist:
                 self.active_handle = 'width'
                 self._width_drag_start_pos = p
                 self._width_drag_start_w   = self.pen().width()
-                event.accept()
+                event.ignore()
             else:
                 self.active_handle = None
                 super().mousePressEvent(event)
@@ -2042,7 +2042,7 @@ class ArrowItem(QGraphicsLineItem):
     def mouseReleaseEvent(self, event):
         if getattr(self, 'active_handle', None):
             self.active_handle = None
-            event.accept()
+            event.ignore()
         else:
             super().mouseReleaseEvent(event)
 
@@ -5373,29 +5373,12 @@ class LineItem(QGraphicsLineItem):
             painter.setPen(QPen(QColor(60, 60, 60), 1.5))
             painter.drawEllipse(mid, s/2, s/2)
 
-    def mousePressEvent(self, event):
-        p = event.pos()
-        p1, p2 = self.line().p1(), self.line().p2()
-        dist = 22 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
-        
-        if (p - p1).manhattanLength() < dist:
-            self.active_handle = 'p1'
-            event.accept()
-        elif (p - p2).manhattanLength() < dist:
-            self.active_handle = 'p2'
-            event.accept()
+    def mouseReleaseEvent(self, event):
+        if getattr(self, 'active_handle', None):
+            self.active_handle = None
+            event.ignore()
         else:
-            mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
-            if (p - mid).manhattanLength() < dist:
-                self.active_handle = 'width'
-                self._width_drag_start_pos = p
-                self._width_drag_start_w   = self.pen().width()
-                event.accept()
-            else:
-                self.active_handle = None
-                super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
+            super().mouseReleaseEvent(event)
         if getattr(self, 'active_handle', None) in ('p1', 'p2'):
             self.prepareGeometryChange()
             line = self.line()
