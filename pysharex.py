@@ -2786,6 +2786,8 @@ class EnhancedRegionSelector(QWidget):
         self._canvas = _OverlayCanvas(self)
         self._canvas.sync_geometry()
         self._canvas.raise_()
+        # Sync color swatch and freehand defaults when selection changes
+        self._canvas._scene.selectionChanged.connect(self._on_selection_changed)
 
         # ── Window-rect cache — disabled (detection mode removed) ──────────────
         self._win_rects: list[QRect] = []
@@ -2957,6 +2959,28 @@ class EnhancedRegionSelector(QWidget):
     # ══════════════════════════════════════════════════════════════════════════
     #  Toolbar
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _on_selection_changed(self):
+        """Called when scene selection changes.
+        If a FreehandItem is selected, update the toolbar color swatch and
+        sync _freehand_width/_freehand_color so the Edit dialog pre-fills correctly."""
+        selected = self._canvas._scene.selectedItems()
+        for item in selected:
+            if isinstance(item, FreehandItem):
+                w = item.pen().width()
+                c = item.pen().color()
+                self._freehand_width = w if w > 0 else self._freehand_width
+                self._freehand_color = QColor(c)
+                self._color_preview.setStyleSheet(
+                    f"background:{c.name()}; border:1px solid white; border-radius:3px;")
+                return
+        # No freehand item in selection — restore swatch to the active tool color
+        if self._current_tool == self.TOOL_FREEHAND:
+            swatch = self._freehand_color
+        else:
+            swatch = self._draw_color
+        self._color_preview.setStyleSheet(
+            f"background:{swatch.name()}; border:1px solid white; border-radius:3px;")
 
     def _build_toolbar(self):
         bar = QWidget(self,
@@ -3727,6 +3751,26 @@ class EnhancedRegionSelector(QWidget):
             elif isinstance(item, _MarkerItem):
                 self._edit_marker(item)
 
+            elif isinstance(item, FreehandItem):
+                self._edit_freehand(item)
+
+    def _edit_freehand(self, item):
+        """Open FreehandEditDialog for a selected FreehandItem — same UI/logic as Image Editor."""
+        dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            new_width, new_color = dlg.result_data()
+            pen = item.pen()
+            pen.setWidth(new_width)
+            pen.setColor(new_color)
+            item.setPen(pen)
+            item.update()
+            # Keep freehand-specific defaults in sync for future strokes
+            self._freehand_width = new_width
+            self._freehand_color = QColor(new_color)
+            # Update color swatch on toolbar
+            self._color_preview.setStyleSheet(
+                f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
+
     def _edit_text(self, item):
         # Pre-fill dialog with existing text item data
         dlg = _TextInputDialog(item.defaultTextColor(), self)
@@ -3845,7 +3889,7 @@ class EnhancedRegionSelector(QWidget):
                 del_act  = menu.addAction("🗑️ Delete")
                 action = menu.exec(e.globalPos())
                 if action == edit_act:
-                    self._open_item_edit_dialog(item)
+                    self._edit_freehand(item)
                 elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
