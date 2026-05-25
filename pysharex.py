@@ -3038,6 +3038,13 @@ class EnhancedRegionSelector(QWidget):
         if tool_id == self.TOOL_IMAGE:
             self._import_image(); return
         if tool_id == self.TOOL_COLOR:
+            # If currently in Freehand mode with a selected item, open its edit dialog
+            if self._current_tool == self.TOOL_FREEHAND:
+                selected = self._canvas._scene.selectedItems()
+                freehand_items = [i for i in selected if isinstance(i, FreehandItem)]
+                if freehand_items:
+                    self._pick_color()
+                    return
             self._pick_color(); return
 
         # Reset drawing state when switching tools to avoid stale start position
@@ -3185,6 +3192,17 @@ class EnhancedRegionSelector(QWidget):
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 item._bg_color   = dlg.bg_color
                 item._text_color = dlg.text_color
+                item.update()
+            return True
+
+        if isinstance(item, FreehandItem):
+            dlg = FreehandEditDialog(item.pen().width(), item.pen().color())
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                new_width, new_color = dlg.result_data()
+                pen = item.pen()
+                pen.setWidth(new_width)
+                pen.setColor(new_color)
+                item.setPen(pen)
                 item.update()
             return True
 
@@ -5292,6 +5310,57 @@ class ImageEditorStartDialog(QDialog):
 #  FINAL IMAGE EDITOR (FIXED SCALING, DELETE, SAVE AS & CTRL PROPORTIONS)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class FreehandEditDialog(QDialog):
+    """Edit dialog for Freehand strokes — line width and color."""
+    def __init__(self, current_width: int, current_color: QColor, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Edit Freehand")
+        self._width = current_width
+        self._color = QColor(current_color)
+        lay = QVBoxLayout(self)
+
+        # Line width
+        width_row = QHBoxLayout()
+        width_row.addWidget(QLabel("Line width:"))
+        self.spin_width = QSpinBox()
+        self.spin_width.setRange(1, 100)
+        self.spin_width.setValue(current_width)
+        self.spin_width.setSuffix(" px")
+        width_row.addWidget(self.spin_width)
+        lay.addLayout(width_row)
+
+        # Line color
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Line color:"))
+        self.btn_color = QPushButton()
+        self.btn_color.setFixedSize(80, 28)
+        self.btn_color.clicked.connect(self._pick_color)
+        color_row.addWidget(self.btn_color)
+        lay.addLayout(color_row)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._update_btn()
+
+    def _pick_color(self):
+        c = _show_color_dialog(self._color, self, force_opaque=True)
+        if c is not None:
+            self._color = c
+            self._update_btn()
+
+    def _update_btn(self):
+        c = self._color
+        self.btn_color.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},1.0); "
+            f"color: {'black' if c.lightness() > 128 else 'white'}; border: 1px solid #888;")
+
+    def result_data(self):
+        return self.spin_width.value(), QColor(self._color)
+
+
 class FreehandItem(QGraphicsPathItem):
     def __init__(self, path, canvas=None):
         super().__init__(path)
@@ -5327,6 +5396,45 @@ class FreehandItem(QGraphicsPathItem):
         # wywołane chwilę wcześniej w locie już zaktualizowało drzewo sceny Qt.
         self._base_path = self.path()
         self._rect = self._base_path.boundingRect()
+
+    def _open_edit_dialog(self, screen_pos=None):
+        """Open FreehandEditDialog above the canvas."""
+        dlg = FreehandEditDialog(self.pen().width(), self.pen().color())
+        _set_dialog_on_top(dlg)
+        if screen_pos:
+            dlg.move(screen_pos)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_width, new_color = dlg.result_data()
+            pen = self.pen()
+            pen.setWidth(new_width)
+            pen.setColor(new_color)
+            self.setPen(pen)
+            self.update()
+            # Sync the Size spinner in the parent window (ImageEditorWindow)
+            if self.scene() and self.scene().views():
+                win = self.scene().views()[0].window()
+                if win and hasattr(win, 'spin'):
+                    win.spin.blockSignals(True)
+                    win.spin.setValue(new_width)
+                    win.spin.blockSignals(False)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._open_edit_dialog(event.screenPos().toPoint())
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        edit_act = menu.addAction("✏️ Edit")
+        del_act  = menu.addAction("🗑️ Delete")
+        action = menu.exec(event.screenPos())
+        if action == edit_act:
+            self._open_edit_dialog(event.screenPos().toPoint())
+        elif action == del_act:
+            if self.scene():
+                self.scene().removeItem(self)
+        event.accept()
 
     def boundingRect(self):
         return self._rect.adjusted(-5, -50, 5, 5)
@@ -6233,6 +6341,9 @@ class EditorCanvas(QGraphicsView):
             if hasattr(win, '_edit_text_item'):
                 win._edit_text_item(item)
                 return
+        elif isinstance(item, FreehandItem):
+            item._open_edit_dialog(event.globalPosition().toPoint())
+            return
         elif isinstance(item, HighlightRectItem):
             dlg = HighlightEditDialog(item._color, self)
             _set_dialog_on_top(dlg)
@@ -6363,6 +6474,24 @@ class EditorCanvas(QGraphicsView):
                     item._bg_color   = dlg.bg_color
                     item._text_color = dlg.text_color
                     item.update()
+                    self.is_dirty = True
+            elif action == del_act:
+                self.scene.removeItem(item)
+                self.is_dirty = True
+        elif isinstance(item, FreehandItem):
+            menu = QMenu(self)
+            edit_act = menu.addAction("✏️ Edit")
+            dup_act  = menu.addAction("⧉ Duplicate")
+            del_act  = menu.addAction("🗑️ Delete")
+            action = menu.exec(event.globalPos())
+            if action == edit_act:
+                item._open_edit_dialog(event.globalPos())
+                self.is_dirty = True
+            elif action == dup_act:
+                dup = self._clone_item(item)
+                if dup:
+                    dup.setPos(item.pos() + QPointF(20, 20))
+                    self.scene.addItem(dup)
                     self.is_dirty = True
             elif action == del_act:
                 self.scene.removeItem(item)
@@ -6971,6 +7100,22 @@ class ImageEditorWindow(QMainWindow):
                     item.update()
                     self.canvas.is_dirty = True
                 return
+            if isinstance(item, FreehandItem):
+                dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
+                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    new_width, new_color = dlg.result_data()
+                    pen = item.pen()
+                    pen.setWidth(new_width)
+                    pen.setColor(new_color)
+                    item.setPen(pen)
+                    item.update()
+                    self.canvas.stroke_width = new_width
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(new_width)
+                    self.spin.blockSignals(False)
+                    self.canvas.is_dirty = True
+                return
             if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
                 self._edit_text_item(item)
                 return
@@ -7053,6 +7198,13 @@ class ImageEditorWindow(QMainWindow):
                     f.setPointSize(max(1, value))
                     item.setFont(f)
                     self.canvas.is_dirty = True
+                elif isinstance(item, FreehandItem):
+                    # Live-update stroke width for freehand items
+                    pen = item.pen()
+                    pen.setWidth(max(1, value))
+                    item.setPen(pen)
+                    item.update()
+                    self.canvas.is_dirty = True
                 elif hasattr(item, 'pen') and hasattr(item, 'setPen'):
                     # Live-update stroke width for shape/line/arrow items
                     pen = item.pen()
@@ -7099,6 +7251,16 @@ class ImageEditorWindow(QMainWindow):
                     self.spin.setValue(size)
                     self.spin.blockSignals(False)
                     self.canvas.font_size = size
+                return
+            elif isinstance(item, FreehandItem):
+                # Freehand item — read pen width
+                width = item.pen().width()
+                if width > 0:
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(width)
+                    self.spin.blockSignals(False)
+                    self.canvas.stroke_width = width
+                    self.spin_stroke.setValue(width)
                 return
             elif hasattr(item, 'pen') and callable(item.pen):
                 # Shape / line / arrow — read pen width
