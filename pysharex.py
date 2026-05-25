@@ -2764,6 +2764,9 @@ class EnhancedRegionSelector(QWidget):
         self._draw_color        = QColor(255, 0, 0)
         self._draw_width        = 3
         self._hide_bg           = False
+        # Freehand tool keeps its own independent color and width
+        self._freehand_color    = QColor(255, 0, 0)
+        self._freehand_width    = 3
 
         # Drawing state
         self._draw_start_scene   = None     # QPointF scene coords
@@ -3053,19 +3056,24 @@ class EnhancedRegionSelector(QWidget):
                         pen.setColor(new_color)
                         item.setPen(pen)
                         item.update()
-                        self._draw_width = new_width
-                        self._draw_color = QColor(new_color)
+                        # Save into freehand-specific slots
+                        self._freehand_width = new_width
+                        self._freehand_color = QColor(new_color)
+                        self._color_preview.setStyleSheet(
+                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
                         if hasattr(self, 'spin'):
                             self.spin.blockSignals(True)
                             self.spin.setValue(new_width)
                             self.spin.blockSignals(False)
                 else:
                     # No freehand item selected — edit default stroke width/color for Freehand tool
-                    dlg = FreehandEditDialog(self._draw_width, self._draw_color, self)
+                    dlg = FreehandEditDialog(self._freehand_width, self._freehand_color, self)
                     if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                         new_width, new_color = dlg.result_data()
-                        self._draw_width = new_width
-                        self._draw_color = QColor(new_color)
+                        self._freehand_width = new_width
+                        self._freehand_color = QColor(new_color)
+                        self._color_preview.setStyleSheet(
+                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
                         if hasattr(self, 'spin'):
                             self.spin.blockSignals(True)
                             self.spin.setValue(new_width)
@@ -3089,6 +3097,10 @@ class EnhancedRegionSelector(QWidget):
         for tid, btn in self._tool_btns.items():
             if btn.isCheckable():
                 btn.setChecked(tid == tool_id)
+        # Update color swatch: Freehand has its own independent color
+        swatch_color = self._freehand_color if tool_id == self.TOOL_FREEHAND else self._draw_color
+        self._color_preview.setStyleSheet(
+            f"background:{swatch_color.name()}; border:1px solid white; border-radius:3px;")
 
         # Show/hide capture button
         if self._is_draw_tool(tool_id):
@@ -3230,14 +3242,15 @@ class EnhancedRegionSelector(QWidget):
                 pen.setColor(new_color)
                 item.setPen(pen)
                 item.update()
-                # Sync Size spinner
+                # Save into freehand-specific slots (independent from other tools)
+                self._freehand_width = new_width
+                self._freehand_color = QColor(new_color)
+                self._color_preview.setStyleSheet(
+                    f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
                 if hasattr(self, 'spin'):
                     self.spin.blockSignals(True)
                     self.spin.setValue(new_width)
                     self.spin.blockSignals(False)
-                # Update _draw_width so future strokes use the new width
-                self._draw_width = new_width
-                self._draw_color = QColor(new_color)
             return True
 
         return False  # no dedicated dialog for this type
@@ -3488,7 +3501,7 @@ class EnhancedRegionSelector(QWidget):
         self._preview_item = None
 
         if self._current_tool == self.TOOL_FREEHAND:
-            self._canvas.begin_freehand(scene_pos, self._draw_color, self._draw_width)
+            self._canvas.begin_freehand(scene_pos, self._freehand_color, self._freehand_width)
 
         elif self._current_tool == self.TOOL_MARKER:
             self._canvas.add_marker(scene_pos, self._draw_color)
@@ -3822,6 +3835,17 @@ class EnhancedRegionSelector(QWidget):
                 action = menu.exec(e.globalPos())
                 if action == edit_act:
                     self._edit_highlight(item)
+                elif action == dup_act:
+                    self._duplicate_item_beside(item)
+                elif action == del_act:
+                    self._canvas._scene.removeItem(item)
+            elif isinstance(item, FreehandItem):
+                edit_act = menu.addAction("✏️ Edit Freehand")
+                dup_act  = menu.addAction("⧉ Duplicate")
+                del_act  = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action == edit_act:
+                    self._open_item_edit_dialog(item)
                 elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
@@ -9149,12 +9173,16 @@ def _script_dir() -> Path:
 
 
 def load_app_icon() -> QIcon:
-    """Search for PyshareX.ico in ./icons/ subfolder, then script dir, then fallback."""
+    """Search for PyShareX.ico in ./icons/ subfolder, then script dir, then fallback.
+    Tries all known capitalisation variants so it works on case-sensitive filesystems."""
     base = _script_dir()
     for candidate in [
+        base / "icons" / "PyShareX.ico",
         base / "icons" / "PyshareX.ico",
-        base / "PyshareX.ico",
         base / "icons" / "pysharex.ico",
+        base / "icons" / "PySharex.ico",
+        base / "PyShareX.ico",
+        base / "PyshareX.ico",
         base / "pysharex.ico",
     ]:
         if candidate.exists():
