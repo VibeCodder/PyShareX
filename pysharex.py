@@ -1950,6 +1950,31 @@ class ArrowItem(QGraphicsLineItem):
         Fixed at 18px screen-space so handles are easy to grab regardless of zoom."""
         return 18 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
 
+    def shape(self):
+        """Override shape() so Qt's scene hit-testing covers the full handle surfaces,
+        not just the thin line geometry. Includes a fat stroke along the line body
+        plus circular regions at p1, p2, and the midpoint (width handle)."""
+        r = self._handle_hit_radius()
+        line = self.line()
+        p1, p2 = line.p1(), line.p2()
+        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+
+        # Fat stroke along the line body
+        body = QPainterPath()
+        body.moveTo(p1)
+        body.lineTo(p2)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(max(self.pen().width() + 4, r * 2))
+        result = stroker.createStroke(body)
+
+        # Add circular hit zones for each handle
+        for pt in (p1, p2, mid):
+            circle = QPainterPath()
+            circle.addEllipse(pt, r, r)
+            result = result.united(circle)
+
+        return result
+
     def mousePressEvent(self, event):
         p = event.pos()
         p1, p2 = self.line().p1(), self.line().p2()
@@ -5362,6 +5387,31 @@ class LineItem(QGraphicsLineItem):
         """Hit-test radius for endpoint/width handles, in item-local coords.
         Fixed at 18px screen-space so handles are easy to grab regardless of zoom."""
         return 18 / (self.canvas.transform().m11() if getattr(self, 'canvas', None) else 1)
+
+    def shape(self):
+        """Override shape() so Qt's scene hit-testing covers the full handle surfaces,
+        not just the thin line geometry. Includes a fat stroke along the line body
+        plus circular regions at p1, p2, and the midpoint (width handle)."""
+        r = self._handle_hit_radius()
+        line = self.line()
+        p1, p2 = line.p1(), line.p2()
+        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+
+        # Fat stroke along the line body
+        body = QPainterPath()
+        body.moveTo(p1)
+        body.lineTo(p2)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(max(self.pen().width() + 4, r * 2))
+        result = stroker.createStroke(body)
+
+        # Add circular hit zones for each handle
+        for pt in (p1, p2, mid):
+            circle = QPainterPath()
+            circle.addEllipse(pt, r, r)
+            result = result.united(circle)
+
+        return result
 
     def mousePressEvent(self, event):
         p = event.pos()
