@@ -3027,6 +3027,102 @@ class EnhancedRegionSelector(QWidget):
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(4)
 
+        # ── Drag handle (left side) ───────────────────────────────────────────
+        # Lets the user grab and reposition the toolbar anywhere on screen.
+        drag_handle = QLabel("⠿")
+        drag_handle.setFixedSize(18, 36)
+        drag_handle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        drag_handle.setToolTip("Drag to move toolbar")
+        drag_handle.setStyleSheet(
+            "color: #6c7086; font-size: 20px; background: transparent; border: none;"
+        )
+        drag_handle.setCursor(Qt.CursorShape.SizeAllCursor)
+        lay.addWidget(drag_handle)
+        lay.addSpacing(4)
+
+        # Track drag state on the bar widget itself
+        bar._drag_active = False
+        # _drag_icon: a top-level label that follows the cursor during drag
+        drag_icon = QLabel("⠿", None)
+        drag_icon.setWindowFlags(
+            Qt.WindowType.ToolTip |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.X11BypassWindowManagerHint
+        )
+        drag_icon.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        drag_icon.setStyleSheet(
+            "color: #cdd6f4; font-size: 22px; background: rgba(40,40,60,200);"
+            "border: 1px solid #89b4fa; border-radius: 6px; padding: 2px 4px;"
+        )
+        drag_icon.setFixedSize(28, 36)
+        drag_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bar._drag_icon = drag_icon
+
+        def _handle_mouse_press(event, b=bar, h=drag_handle):
+            if event.button() == Qt.MouseButton.LeftButton:
+                b._drag_active = True
+                # Show floating drag icon exactly at cursor
+                gpos = event.globalPosition().toPoint()
+                b._drag_icon.move(gpos.x(), gpos.y())
+                b._drag_icon.show()
+                b._drag_icon.raise_()
+                event.accept()
+
+        def _handle_mouse_move(event, b=bar):
+            if b._drag_active and event.buttons() & Qt.MouseButton.LeftButton:
+                gpos = event.globalPosition().toPoint()
+                # Floating icon follows cursor exactly (top-level, global coords)
+                b._drag_icon.move(gpos.x(), gpos.y())
+                # Toolbar is a child widget — must convert global → parent-local coords
+                b.move(b.parent().mapFromGlobal(gpos))
+                # Mark that user manually positioned toolbar (suppress auto-monitor logic)
+                b._user_dragged = True
+                event.accept()
+
+        def _handle_mouse_release(event, b=bar):
+            if event.button() == Qt.MouseButton.LeftButton:
+                b._drag_active = False
+                b._drag_icon.hide()
+                event.accept()
+
+        # Mouse events must be tracked on the handle; enable mouse tracking so
+        # mouseMoveEvent fires even when the cursor drifts outside the label.
+        drag_handle.setMouseTracking(True)
+        drag_handle.mousePressEvent   = _handle_mouse_press
+        drag_handle.mouseMoveEvent    = _handle_mouse_move
+        drag_handle.mouseReleaseEvent = _handle_mouse_release
+
+        # Also track on the bar itself — if cursor moves fast and leaves the
+        # handle widget, the bar continues receiving move/release events.
+        bar._user_dragged = False
+
+        _orig_bar_mouse_press   = bar.mousePressEvent
+        _orig_bar_mouse_move    = bar.mouseMoveEvent
+        _orig_bar_mouse_release = bar.mouseReleaseEvent
+
+        def _bar_mouse_move(event, b=bar):
+            if b._drag_active and event.buttons() & Qt.MouseButton.LeftButton:
+                gpos = event.globalPosition().toPoint()
+                b._drag_icon.move(gpos.x(), gpos.y())
+                b.move(b.parent().mapFromGlobal(gpos))
+                b._user_dragged = True
+                event.accept()
+            else:
+                _orig_bar_mouse_move(event)
+
+        def _bar_mouse_release(event, b=bar):
+            if b._drag_active and event.button() == Qt.MouseButton.LeftButton:
+                b._drag_active = False
+                b._drag_icon.hide()
+                event.accept()
+            else:
+                _orig_bar_mouse_release(event)
+
+        bar.setMouseTracking(True)
+        bar.mouseMoveEvent    = _bar_mouse_move
+        bar.mouseReleaseEvent = _bar_mouse_release
+
         tools = [
             (self.TOOL_SELECT,    None,  "Select / move / resize annotations (Del to delete)"),
             (self.TOOL_RECT,      "⬜",  "Draw rectangle annotation"),
@@ -3606,15 +3702,17 @@ class EnhancedRegionSelector(QWidget):
         gpos = e.globalPosition().toPoint()
         lpos = e.position().toPoint()
 
-        # Dynamically move the toolbar to the monitor where the cursor currently is
-        cursor_screen = QApplication.screenAt(gpos)
-        if cursor_screen:
-            screen_geo = cursor_screen.geometry()
-            tx = screen_geo.x() - self._geo.x() + screen_geo.width() // 2 - self._toolbar.width() // 2
-            ty = screen_geo.y() - self._geo.y() + 8
-            # Only move if the toolbar is on the wrong monitor (avoids micro-stutters)
-            if abs(self._toolbar.x() - tx) > 100 or abs(self._toolbar.y() - ty) > 100:
-                self._toolbar.move(tx, ty)
+        # Dynamically move the toolbar to the monitor where the cursor currently is,
+        # but only if the user has not manually repositioned it via the drag handle.
+        if not getattr(self._toolbar, '_user_dragged', False):
+            cursor_screen = QApplication.screenAt(gpos)
+            if cursor_screen:
+                screen_geo = cursor_screen.geometry()
+                tx = screen_geo.x() - self._geo.x() + screen_geo.width() // 2 - self._toolbar.width() // 2
+                ty = screen_geo.y() - self._geo.y() + 8
+                # Only move if the toolbar is on the wrong monitor (avoids micro-stutters)
+                if abs(self._toolbar.x() - tx) > 100 or abs(self._toolbar.y() - ty) > 100:
+                    self._toolbar.move(tx, ty)
 
         # ── Inline capture-selection mode ─────────────────────────────────────
         if self._current_tool == "_capture_select":
