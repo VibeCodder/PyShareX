@@ -7292,17 +7292,21 @@ class ImageEditorWindow(QMainWindow):
             return
 
         init_col = QColor(self.canvas.stroke_color)
-        if self.canvas.current_tool != "Highlight":
-            init_col.setAlpha(255)
-        
+        init_col.setAlpha(255)  # Always default to fully opaque
+
+        # Only show alpha channel slider for Highlight tool (intentionally semi-transparent)
+        show_alpha = (self.canvas.current_tool == "Highlight")
         dialog = QColorDialog(init_col, self)
-        dialog.setWindowTitle("Pick Color & Alpha")
-        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dialog.setWindowTitle("Pick Color")
+        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, show_alpha)
         dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
 
         if dialog.exec():
             c = dialog.selectedColor()
             if c.isValid():
+                # Force alpha=255 for all tools except Highlight
+                if self.canvas.current_tool != "Highlight":
+                    c.setAlpha(255)
                 self.canvas.stroke_color = c
                 self.canvas.fill_color = c
 
@@ -7317,7 +7321,7 @@ class ImageEditorWindow(QMainWindow):
                         item.setDefaultTextColor(c)
                         self.canvas.is_dirty = True
                     elif isinstance(item, HighlightRectItem):
-                        pass # Highlight shape has its own dialog now
+                        pass  # Highlight shape has its own dialog
                     else:
                         if hasattr(item, 'setPen') and hasattr(item, 'pen'):
                             pen = item.pen()
