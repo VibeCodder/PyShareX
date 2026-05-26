@@ -134,6 +134,10 @@ def _show_color_dialog(initial_color: QColor, parent=None,
     color_to_show = QColor(initial_color)
     if force_opaque:
         color_to_show.setAlpha(255)
+    elif IS_LINUX and alpha and color_to_show.alpha() == 0:
+        # On Linux, QColorDialog defaults alpha to 0 if the initial color has
+        # alpha=0. Force it to 255 so the picker opens fully opaque by default.
+        color_to_show.setAlpha(255)
 
     dlg = QColorDialog(color_to_show, parent)
     dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, alpha)
@@ -144,6 +148,10 @@ def _show_color_dialog(initial_color: QColor, parent=None,
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.X11BypassWindowManagerHint
         )
+        # On Linux the alpha spin-box may still show 0 even after passing a
+        # color with alpha=255 to the constructor — set it explicitly.
+        if alpha:
+            dlg.setCurrentColor(color_to_show)
     dlg.raise_()
     dlg.activateWindow()
     if dlg.exec():
