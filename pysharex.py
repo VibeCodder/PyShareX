@@ -2183,13 +2183,13 @@ class TextBubbleItem(QGraphicsItem):
 
         # Cone (behind box) — draw first so box covers the base
         painter.setBrush(QBrush(bg))
-        painter.setPen(QPen(self._fg_color.darker(150), 1.5))
+        painter.setPen(Qt.PenStyle.NoPen)  # No border on cone
         painter.drawPath(self._cone_path())
 
         # Box — opaque fill covers the cone base cleanly
         box = QRectF(0, 0, self._w, self._h)
         painter.setBrush(QBrush(bg))
-        painter.setPen(QPen(self._fg_color.darker(150), 1.5))
+        painter.setPen(Qt.PenStyle.NoPen)  # No border on box
         painter.drawRoundedRect(box, 6, 6)
 
         # Text — binary-search the largest font that fits the box both in

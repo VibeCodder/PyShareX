@@ -40,6 +40,7 @@ from PySide6.QtGui import (
     QFont, QPen, QBrush, QCursor, QPainterPath, QImage, QPainterPathStroker,
     QFontMetricsF
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import QShortcut
 
 try:
@@ -133,6 +134,10 @@ def _show_color_dialog(initial_color: QColor, parent=None,
     color_to_show = QColor(initial_color)
     if force_opaque:
         color_to_show.setAlpha(255)
+    elif IS_LINUX and alpha and color_to_show.alpha() == 0:
+        # On Linux, QColorDialog defaults alpha to 0 if the initial color has
+        # alpha=0. Force it to 255 so the picker opens fully opaque by default.
+        color_to_show.setAlpha(255)
 
     dlg = QColorDialog(color_to_show, parent)
     dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, alpha)
@@ -143,6 +148,10 @@ def _show_color_dialog(initial_color: QColor, parent=None,
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.X11BypassWindowManagerHint
         )
+        # On Linux the alpha spin-box may still show 0 even after passing a
+        # color with alpha=255 to the constructor — set it explicitly.
+        if alpha:
+            dlg.setCurrentColor(color_to_show)
     dlg.raise_()
     dlg.activateWindow()
     if dlg.exec():
@@ -2174,13 +2183,13 @@ class TextBubbleItem(QGraphicsItem):
 
         # Cone (behind box) — draw first so box covers the base
         painter.setBrush(QBrush(bg))
-        painter.setPen(QPen(self._fg_color.darker(150), 1.5))
+        painter.setPen(Qt.PenStyle.NoPen)  # No border on cone
         painter.drawPath(self._cone_path())
 
         # Box — opaque fill covers the cone base cleanly
         box = QRectF(0, 0, self._w, self._h)
         painter.setBrush(QBrush(bg))
-        painter.setPen(QPen(self._fg_color.darker(150), 1.5))
+        painter.setPen(Qt.PenStyle.NoPen)  # No border on box
         painter.drawRoundedRect(box, 6, 6)
 
         # Text — binary-search the largest font that fits the box both in
@@ -2767,6 +2776,9 @@ class EnhancedRegionSelector(QWidget):
         # Freehand tool keeps its own independent color and width
         self._freehand_color    = QColor(255, 0, 0)
         self._freehand_width    = 3
+        # Marker and Bubble tools each keep their own independent color
+        self._marker_color      = QColor(255, 0, 0)
+        self._bubble_color      = QColor(255, 0, 0)
 
         # Drawing state
         self._draw_start_scene   = None     # QPointF scene coords
@@ -2977,10 +2989,14 @@ class EnhancedRegionSelector(QWidget):
         # No freehand item in selection — restore swatch to the active tool color
         if self._current_tool == self.TOOL_FREEHAND:
             swatch = self._freehand_color
+        elif self._current_tool == self.TOOL_MARKER:
+            swatch = self._marker_color
+        elif self._current_tool == self.TOOL_BUBBLE:
+            swatch = self._bubble_color
         else:
             swatch = self._draw_color
         self._color_preview.setStyleSheet(
-            f"background:{swatch.name()}; border:1px solid white; border-radius:3px;")
+            f"background:rgba({swatch.red()},{swatch.green()},{swatch.blue()},{swatch.alphaF():.2f}); border:1px solid white; border-radius:3px;")
 
     def _build_toolbar(self):
         bar = QWidget(self,
@@ -3003,31 +3019,42 @@ class EnhancedRegionSelector(QWidget):
                 min-width: 80px; max-width: 80px; font-size: 13px;
             }
             QPushButton#captureBtn:hover { background: #2e9e2e; }
+            QPushButton#colorPickerBtn {
+                min-width: 58px; max-width: 58px; font-size: 18px;
+            }
         """)
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(4)
 
         tools = [
-            (self.TOOL_SELECT,    "🖱️", "Select / move / resize annotations (Del to delete)"),
-            (self.TOOL_RECT,      "⬜", "Draw rectangle annotation"),
-            (self.TOOL_CIRCLE,    "⭕", "Draw ellipse annotation"),
-            (self.TOOL_HIGHLIGHT, "🟨", "Draw highlight (semi-transparent yellow rectangle)"),
-            (self.TOOL_FREEHAND,  "✏️", "Freehand drawing"),
-            (self.TOOL_LINE,      "📏", "Draw straight line"),
-            (self.TOOL_ARROW,     "➡️", "Draw arrow"),
-            (self.TOOL_BUBBLE,    "💬", "Add text bubble"),
-            (self.TOOL_MARKER,    "📍", "Add numbered marker"),
-            (self.TOOL_TEXT,      "T",  "Add text annotation"),
-            (self.TOOL_IMAGE,     "🖼️", "Import image onto canvas"),
-            (self.TOOL_COLOR,     "🎨", "Change annotation color / width"),
+            (self.TOOL_SELECT,    None,  "Select / move / resize annotations (Del to delete)"),
+            (self.TOOL_RECT,      "⬜",  "Draw rectangle annotation"),
+            (self.TOOL_CIRCLE,    "⭕",  "Draw ellipse annotation"),
+            (self.TOOL_HIGHLIGHT, "🟨",  "Draw highlight (semi-transparent yellow rectangle)"),
+            (self.TOOL_FREEHAND,  "✏️",  "Freehand drawing"),
+            (self.TOOL_LINE,      "📏",  "Draw straight line"),
+            (self.TOOL_ARROW,     "➡️",  "Draw arrow"),
+            (self.TOOL_BUBBLE,    "💬",  "Add text bubble"),
+            (self.TOOL_MARKER,    "📍",  "Add numbered marker"),
+            (self.TOOL_TEXT,      "T",   "Add text annotation"),
+            (self.TOOL_IMAGE,     "🖼️",  "Import image onto canvas"),
+            (self.TOOL_COLOR,     None,  "Change annotation color / width"),
         ]
         self._tool_btns = {}
         for tid, icon, tip in tools:
-            btn = QPushButton(icon)
+            btn = QPushButton()
             btn.setCheckable(tid not in (self.TOOL_COLOR, self.TOOL_IMAGE))
             btn.setToolTip(tip)
             btn.clicked.connect(lambda _, t=tid: self._select_tool(t))
+            if tid == self.TOOL_SELECT:
+                btn.setIcon(_svg_icon(_SVG_SELECT, 32))
+                btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_COLOR:
+                btn.setObjectName("colorPickerBtn")
+                btn.setText("🎨🔧")
+            else:
+                btn.setText(icon)
             lay.addWidget(btn)
             self._tool_btns[tid] = btn
         self._tool_btns[self.TOOL_RECT].setChecked(True)
@@ -3121,10 +3148,17 @@ class EnhancedRegionSelector(QWidget):
         for tid, btn in self._tool_btns.items():
             if btn.isCheckable():
                 btn.setChecked(tid == tool_id)
-        # Update color swatch: Freehand has its own independent color
-        swatch_color = self._freehand_color if tool_id == self.TOOL_FREEHAND else self._draw_color
+        # Update color swatch: each independent tool has its own color
+        if tool_id == self.TOOL_FREEHAND:
+            swatch_color = self._freehand_color
+        elif tool_id == self.TOOL_MARKER:
+            swatch_color = self._marker_color
+        elif tool_id == self.TOOL_BUBBLE:
+            swatch_color = self._bubble_color
+        else:
+            swatch_color = self._draw_color
         self._color_preview.setStyleSheet(
-            f"background:{swatch_color.name()}; border:1px solid white; border-radius:3px;")
+            f"background:rgba({swatch_color.red()},{swatch_color.green()},{swatch_color.blue()},{swatch_color.alphaF():.2f}); border:1px solid white; border-radius:3px;")
 
         # Show/hide capture button
         if self._is_draw_tool(tool_id):
@@ -3282,24 +3316,39 @@ class EnhancedRegionSelector(QWidget):
     def _open_generic_color_picker(self, apply_to_item=None):
         """Show a plain QColorDialog and apply result to the drawing colour
         and optionally to *apply_to_item*.
-        For all tools except Highlight the dialog opens with alpha=255 by default."""
+        Highlight keeps its own alpha; all other tools preserve user-chosen alpha."""
         is_highlight = isinstance(apply_to_item, HighlightRectItem)
-        # Build initial color: for non-Highlight tools always show alpha=255 in the picker
-        init_color = QColor(self._draw_color)
-        if not is_highlight:
+
+        # Pick the right source color for the current tool so the dialog opens
+        # with whatever the user last chose (including their alpha value).
+        if self._current_tool == self.TOOL_FREEHAND:
+            init_color = QColor(self._freehand_color)
+        elif self._current_tool == self.TOOL_MARKER:
+            init_color = QColor(self._marker_color)
+        elif self._current_tool == self.TOOL_BUBBLE:
+            init_color = QColor(self._bubble_color)
+        else:
+            init_color = QColor(self._draw_color)
+
+        # For non-highlight tools: if alpha is 0 (uninitialised), default to 255.
+        # Otherwise keep whatever the user previously set.
+        if not is_highlight and init_color.alpha() == 0:
             init_color.setAlpha(255)
-        dlg = QColorDialog(init_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if self._exec_dialog(dlg):
-            c = dlg.selectedColor()
-            if c.isValid():
-                # Force alpha=255 for all annotation tools (Highlight manages its own alpha)
-                if not is_highlight:
-                    c.setAlpha(255)
+
+        # Use _show_color_dialog so the Linux alpha=0 bug fix is applied.
+        c = _show_color_dialog(init_color, self, alpha=True)
+        if c is not None and c.isValid():
+            # Save color into the correct per-tool slot
+            if self._current_tool == self.TOOL_FREEHAND:
+                self._freehand_color = c
+            elif self._current_tool == self.TOOL_MARKER:
+                self._marker_color = c
+            elif self._current_tool == self.TOOL_BUBBLE:
+                self._bubble_color = c
+            else:
                 self._draw_color = c
                 self._color_preview.setStyleSheet(
-                    f"background:{c.name()}; border:1px solid white; border-radius:3px;")
+                    f"background:rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); border:1px solid white; border-radius:3px;")
                 if apply_to_item is not None:
                     # Preserve the item's current pen width instead of resetting to default
                     current_width = (apply_to_item.pen().width()
@@ -3528,7 +3577,7 @@ class EnhancedRegionSelector(QWidget):
             self._canvas.begin_freehand(scene_pos, self._freehand_color, self._freehand_width)
 
         elif self._current_tool == self.TOOL_MARKER:
-            self._canvas.add_marker(scene_pos, self._draw_color)
+            self._canvas.add_marker(scene_pos, self._marker_color)
 
         elif self._current_tool == self.TOOL_TEXT:
             dlg = _TextInputDialog(QColor(self._draw_color), self)
@@ -3545,7 +3594,7 @@ class EnhancedRegionSelector(QWidget):
             self._select_tool(self.TOOL_SELECT)
 
         elif self._current_tool == self.TOOL_BUBBLE:
-            dlg = _BubbleInputDialog(QColor(self._draw_color), self)
+            dlg = _BubbleInputDialog(QColor(self._bubble_color), self)
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
@@ -6099,6 +6148,9 @@ class EditorCanvas(QGraphicsView):
         self.is_filled = False
         self.text_highlight_color = QColor(255, 255, 0, 255)
         self.highlight_tool_color = QColor(255, 255, 0, 90)
+        # Marker and Bubble tools each keep their own independent color
+        self.marker_color = QColor(255, 0, 0, 255)
+        self.bubble_color = QColor(255, 0, 0, 255)
         self._pan_start = None
         
         # Massive sceneRect allows infinite panning regardless of zoom
@@ -6306,7 +6358,7 @@ class EditorCanvas(QGraphicsView):
                 1.0)
             marker = _MarkerItem(self.start_point, number)
             marker._scale = last_scale
-            marker._bg_color = QColor(self.stroke_color)
+            marker._bg_color = QColor(self.marker_color)
             marker.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
                             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
                             QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -6440,7 +6492,7 @@ class EditorCanvas(QGraphicsView):
 
             QTimer.singleShot(0, _do_text_dialog)
         elif self.current_tool == "Bubble" and self.start_point:
-            dlg = _BubbleInputDialog(self.stroke_color, self)
+            dlg = _BubbleInputDialog(self.bubble_color, self)
             _set_dialog_on_top(dlg)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
@@ -6966,25 +7018,29 @@ class ImageEditorWindow(QMainWindow):
             tbar.addWidget(self.btn_capture_region)
             tbar.addSpacing(8)
 
-        for n, i in [("Select", "🖱️"), ("Crop", "📐"), ("Rectangle", "⬜"), ("Circle", "⭕"),
+        for n, i in [("Select", None), ("Crop", "📐"), ("Rectangle", "⬜"), ("Circle", "⭕"),
                      ("Line", "📏"), ("Arrow", "➡️"), ("Highlight", "🟨"), ("Freehand", "✏️"),
                      ("Bubble", "💬"), ("Text", "T"), ("Marker", "📍"), ("Eraser", "🧹")]:
-            b = QPushButton(i); b.setCheckable(True)
-            b.setFixedSize(40, 40)  # Większy stały rozmiar
-            # Styl: usunięcie marginesów i wyśrodkowanie tekstu/emoji
+            b = QPushButton(); b.setCheckable(True)
+            b.setFixedSize(40, 40)
             b.setStyleSheet("""
-                QPushButton { 
-                    font-size: 20px; 
-                    padding: 0px; 
-                    margin: 0px; 
-                    border: 1px solid #ccc; 
-                    border-radius: 4px; 
+                QPushButton {
+                    font-size: 20px;
+                    padding: 0px;
+                    margin: 0px;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
                 }
-                QPushButton:checked { 
-                    background-color: #3498db; 
-                    color: white; 
+                QPushButton:checked {
+                    background-color: #3498db;
+                    color: white;
                 }
             """)
+            if n == "Select":
+                b.setIcon(_svg_icon(_SVG_SELECT, 32))
+                b.setIconSize(QSize(32, 32))
+            else:
+                b.setText(i)
             b.clicked.connect(lambda ch, name=n: self.select_tool(name))
             tbar.addWidget(b); self.btns[n] = b
             
@@ -7022,7 +7078,9 @@ class ImageEditorWindow(QMainWindow):
         
         # Row 2: Props
         pbar = QHBoxLayout()
-        self.btn_c = QPushButton("🎨Color / Alpha")
+        self.btn_c = QPushButton("🎨🔧 Color / Set")
+        self.btn_c.setFixedHeight(36)
+        self.btn_c.setMinimumWidth(140)
         self.btn_c.clicked.connect(self.pick_color)
         pbar.addWidget(self.btn_c)
         
@@ -7273,42 +7331,52 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.is_dirty = True
             return
 
-        init_col = QColor(self.canvas.stroke_color)
-        if self.canvas.current_tool != "Highlight":
-            init_col.setAlpha(255)
-        
-        dialog = QColorDialog(init_col, self)
-        dialog.setWindowTitle("Pick Color & Alpha")
-        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        # Pick the right source color for the current tool so the dialog opens
+        # with whatever alpha the user last chose — not a reset to 0.
+        if self.canvas.current_tool == "Marker":
+            init_col = QColor(self.canvas.marker_color)
+        elif self.canvas.current_tool == "Bubble":
+            init_col = QColor(self.canvas.bubble_color)
+        else:
+            init_col = QColor(self.canvas.stroke_color)
 
-        if dialog.exec():
-            c = dialog.selectedColor()
-            if c.isValid():
+        # Only default to fully opaque when alpha was never set (0 = uninitialised).
+        if init_col.alpha() == 0:
+            init_col.setAlpha(255)
+
+        # Use _show_color_dialog so the Linux alpha=0 bug fix is applied consistently.
+        c = _show_color_dialog(init_col, self, alpha=True)
+        if c is not None and c.isValid():
+            # Save color into the correct per-tool slot
+            if self.canvas.current_tool == "Marker":
+                self.canvas.marker_color = c
+            elif self.canvas.current_tool == "Bubble":
+                self.canvas.bubble_color = c
+            else:
                 self.canvas.stroke_color = c
                 self.canvas.fill_color = c
 
-                # Update color preview button
-                rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
-                self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
-                self.update_live_props()
+            # Update color preview button
+            rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
+            self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
+            self.update_live_props()
 
-                # Live-apply color to all currently selected items
-                for item in self.canvas.scene.selectedItems():
-                    if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-                        item.setDefaultTextColor(c)
-                        self.canvas.is_dirty = True
-                    elif isinstance(item, HighlightRectItem):
-                        pass # Highlight shape has its own dialog now
-                    else:
-                        if hasattr(item, 'setPen') and hasattr(item, 'pen'):
-                            pen = item.pen()
-                            pen.setColor(c)
-                            item.setPen(pen)
-                        if hasattr(item, 'setBrush') and self.canvas.is_filled and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
-                            item.setBrush(QBrush(c))
-                        item.update()
-                        self.canvas.is_dirty = True
+            # Live-apply color to all currently selected items
+            for item in self.canvas.scene.selectedItems():
+                if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+                    item.setDefaultTextColor(c)
+                    self.canvas.is_dirty = True
+                elif isinstance(item, HighlightRectItem):
+                    pass  # Highlight shape has its own dialog
+                else:
+                    if hasattr(item, 'setPen') and hasattr(item, 'pen'):
+                        pen = item.pen()
+                        pen.setColor(c)
+                        item.setPen(pen)
+                    if hasattr(item, 'setBrush') and self.canvas.is_filled and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+                        item.setBrush(QBrush(c))
+                    item.update()
+                    self.canvas.is_dirty = True
 
     def update_live_props(self):
         self.canvas.stroke_width = self.spin_stroke.value()
@@ -7460,27 +7528,25 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.is_dirty = True
 
     def pick_highlight_color(self):
-        dialog = QColorDialog(self.canvas.text_highlight_color, self)
-        dialog.setWindowTitle("Pick Text Highlight Color & Alpha")
-        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        
-        if dialog.exec():
-            c = dialog.selectedColor()
-            if c.isValid():
-                # Ensure alpha defaults to fully opaque if user left it at 0
-                if c.alpha() == 0:
-                    c.setAlpha(255)
-                self.canvas.text_highlight_color = c
-                rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
-                self.btn_hc.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
-                
-                # Natychmiast aplikuj tło do zaznaczonych tekstów
-                for item in self.canvas.scene.selectedItems():
-                    if isinstance(item, HighlightTextItem):
-                        item.highlight_color = c
-                        item.update()
-                self.canvas.is_dirty = True
+        # Build initial color: preserve user's previously chosen alpha.
+        # Only default to a visible alpha (180) when uninitialised (alpha == 0).
+        init_col = QColor(self.canvas.text_highlight_color)
+        if init_col.alpha() == 0:
+            init_col.setAlpha(180)
+
+        # Use _show_color_dialog so the Linux alpha=0 bug fix is applied consistently.
+        c = _show_color_dialog(init_col, self, alpha=True)
+        if c is not None and c.isValid():
+            self.canvas.text_highlight_color = c
+            rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
+            self.btn_hc.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
+
+            # Immediately apply highlight color to all selected text items
+            for item in self.canvas.scene.selectedItems():
+                if isinstance(item, HighlightTextItem):
+                    item.highlight_color = c
+                    item.update()
+            self.canvas.is_dirty = True
 
     def import_image(self):
         from PySide6.QtWidgets import QFileDialog
@@ -9236,6 +9302,49 @@ def _script_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).parent
+
+
+def _svg_icon(svg_str: str, size: int = 32) -> QIcon:
+    """Render an SVG string to a QIcon of the given pixel size."""
+    renderer = QSvgRenderer(svg_str.encode())
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pm)
+
+def _svg_emoji_icon(svg_str: str, emoji: str, btn_w: int, btn_h: int) -> QIcon:
+    """Render SVG on the left and emoji on the right into a single QIcon
+    sized to fill the button (btn_w x btn_h).  Both glyphs share the same
+    height so they look visually balanced."""
+    pm = QPixmap(btn_w, btn_h)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    # SVG occupies the left square
+    svg_size = btn_h - 4          # 2 px padding top/bottom
+    renderer = QSvgRenderer(svg_str.encode())
+    from PySide6.QtCore import QRectF
+    renderer.render(painter, QRectF(2, 2, svg_size, svg_size))
+    # Emoji occupies the right portion
+    emoji_px = max(10, btn_h - 8)
+    font = QFont()
+    font.setPixelSize(emoji_px)
+    painter.setFont(font)
+    painter.setPen(Qt.GlobalColor.white)
+    emoji_x = 2 + svg_size + 2
+    emoji_rect = QRectF(emoji_x, 0, btn_w - emoji_x - 1, btn_h)
+    painter.drawText(emoji_rect,
+                     Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                     emoji)
+    painter.end()
+    return QIcon(pm)
+
+# SVG source for the Select cursor tool
+_SVG_SELECT = """<svg width="77.068" height="77.068" version="1.1" viewBox="0 0 18.496 18.496" xmlns="http://www.w3.org/2000/svg">
+ <path d="m3.8616 1.6312v15.048l3.9126-3.9126 3.0097 4.665 2.3325-1.5048-2.7242-4.3081 4.7557-0.35688z" fill="#fff" stroke="#000" stroke-width="1.5048"/>
+</svg>"""
 
 
 def load_app_icon() -> QIcon:
