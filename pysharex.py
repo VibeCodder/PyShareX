@@ -3308,27 +3308,37 @@ class EnhancedRegionSelector(QWidget):
     def _open_generic_color_picker(self, apply_to_item=None):
         """Show a plain QColorDialog and apply result to the drawing colour
         and optionally to *apply_to_item*.
-        Highlight keeps its own alpha; all other tools default to alpha=255 but allow changes."""
+        Highlight keeps its own alpha; all other tools preserve user-chosen alpha."""
         is_highlight = isinstance(apply_to_item, HighlightRectItem)
-        # Build initial color: for non-Highlight tools default to alpha=255 in the picker
-        init_color = QColor(self._draw_color)
-        if not is_highlight:
-            init_color.setAlpha(self._draw_color.alpha() if self._draw_color.alpha() < 255 else 255)
-        dlg = QColorDialog(init_color, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if self._exec_dialog(dlg):
-            c = dlg.selectedColor()
-            if c.isValid():
-                # Save color into the correct per-tool slot
-                if self._current_tool == self.TOOL_FREEHAND:
-                    self._freehand_color = c
-                elif self._current_tool == self.TOOL_MARKER:
-                    self._marker_color = c
-                elif self._current_tool == self.TOOL_BUBBLE:
-                    self._bubble_color = c
-                else:
-                    self._draw_color = c
+
+        # Pick the right source color for the current tool so the dialog opens
+        # with whatever the user last chose (including their alpha value).
+        if self._current_tool == self.TOOL_FREEHAND:
+            init_color = QColor(self._freehand_color)
+        elif self._current_tool == self.TOOL_MARKER:
+            init_color = QColor(self._marker_color)
+        elif self._current_tool == self.TOOL_BUBBLE:
+            init_color = QColor(self._bubble_color)
+        else:
+            init_color = QColor(self._draw_color)
+
+        # For non-highlight tools: if alpha is 0 (uninitialised), default to 255.
+        # Otherwise keep whatever the user previously set.
+        if not is_highlight and init_color.alpha() == 0:
+            init_color.setAlpha(255)
+
+        # Use _show_color_dialog so the Linux alpha=0 bug fix is applied.
+        c = _show_color_dialog(init_color, self, alpha=True)
+        if c is not None and c.isValid():
+            # Save color into the correct per-tool slot
+            if self._current_tool == self.TOOL_FREEHAND:
+                self._freehand_color = c
+            elif self._current_tool == self.TOOL_MARKER:
+                self._marker_color = c
+            elif self._current_tool == self.TOOL_BUBBLE:
+                self._bubble_color = c
+            else:
+                self._draw_color = c
                 self._color_preview.setStyleSheet(
                     f"background:rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); border:1px solid white; border-radius:3px;")
                 if apply_to_item is not None:
