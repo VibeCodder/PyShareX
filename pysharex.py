@@ -2768,6 +2768,9 @@ class EnhancedRegionSelector(QWidget):
         # Freehand tool keeps its own independent color and width
         self._freehand_color    = QColor(255, 0, 0)
         self._freehand_width    = 3
+        # Marker and Bubble tools each keep their own independent color
+        self._marker_color      = QColor(255, 0, 0)
+        self._bubble_color      = QColor(255, 0, 0)
 
         # Drawing state
         self._draw_start_scene   = None     # QPointF scene coords
@@ -2978,10 +2981,14 @@ class EnhancedRegionSelector(QWidget):
         # No freehand item in selection — restore swatch to the active tool color
         if self._current_tool == self.TOOL_FREEHAND:
             swatch = self._freehand_color
+        elif self._current_tool == self.TOOL_MARKER:
+            swatch = self._marker_color
+        elif self._current_tool == self.TOOL_BUBBLE:
+            swatch = self._bubble_color
         else:
             swatch = self._draw_color
         self._color_preview.setStyleSheet(
-            f"background:{swatch.name()}; border:1px solid white; border-radius:3px;")
+            f"background:rgba({swatch.red()},{swatch.green()},{swatch.blue()},{swatch.alphaF():.2f}); border:1px solid white; border-radius:3px;")
 
     def _build_toolbar(self):
         bar = QWidget(self,
@@ -3133,10 +3140,17 @@ class EnhancedRegionSelector(QWidget):
         for tid, btn in self._tool_btns.items():
             if btn.isCheckable():
                 btn.setChecked(tid == tool_id)
-        # Update color swatch: Freehand has its own independent color
-        swatch_color = self._freehand_color if tool_id == self.TOOL_FREEHAND else self._draw_color
+        # Update color swatch: each independent tool has its own color
+        if tool_id == self.TOOL_FREEHAND:
+            swatch_color = self._freehand_color
+        elif tool_id == self.TOOL_MARKER:
+            swatch_color = self._marker_color
+        elif tool_id == self.TOOL_BUBBLE:
+            swatch_color = self._bubble_color
+        else:
+            swatch_color = self._draw_color
         self._color_preview.setStyleSheet(
-            f"background:{swatch_color.name()}; border:1px solid white; border-radius:3px;")
+            f"background:rgba({swatch_color.red()},{swatch_color.green()},{swatch_color.blue()},{swatch_color.alphaF():.2f}); border:1px solid white; border-radius:3px;")
 
         # Show/hide capture button
         if self._is_draw_tool(tool_id):
@@ -3294,24 +3308,29 @@ class EnhancedRegionSelector(QWidget):
     def _open_generic_color_picker(self, apply_to_item=None):
         """Show a plain QColorDialog and apply result to the drawing colour
         and optionally to *apply_to_item*.
-        For all tools except Highlight the dialog opens with alpha=255 by default."""
+        Highlight keeps its own alpha; all other tools default to alpha=255 but allow changes."""
         is_highlight = isinstance(apply_to_item, HighlightRectItem)
-        # Build initial color: for non-Highlight tools always show alpha=255 in the picker
+        # Build initial color: for non-Highlight tools default to alpha=255 in the picker
         init_color = QColor(self._draw_color)
         if not is_highlight:
-            init_color.setAlpha(255)
+            init_color.setAlpha(self._draw_color.alpha() if self._draw_color.alpha() < 255 else 255)
         dlg = QColorDialog(init_color, self)
         dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
         if self._exec_dialog(dlg):
             c = dlg.selectedColor()
             if c.isValid():
-                # Force alpha=255 for all annotation tools (Highlight manages its own alpha)
-                if not is_highlight:
-                    c.setAlpha(255)
-                self._draw_color = c
+                # Save color into the correct per-tool slot
+                if self._current_tool == self.TOOL_FREEHAND:
+                    self._freehand_color = c
+                elif self._current_tool == self.TOOL_MARKER:
+                    self._marker_color = c
+                elif self._current_tool == self.TOOL_BUBBLE:
+                    self._bubble_color = c
+                else:
+                    self._draw_color = c
                 self._color_preview.setStyleSheet(
-                    f"background:{c.name()}; border:1px solid white; border-radius:3px;")
+                    f"background:rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); border:1px solid white; border-radius:3px;")
                 if apply_to_item is not None:
                     # Preserve the item's current pen width instead of resetting to default
                     current_width = (apply_to_item.pen().width()
@@ -3540,7 +3559,7 @@ class EnhancedRegionSelector(QWidget):
             self._canvas.begin_freehand(scene_pos, self._freehand_color, self._freehand_width)
 
         elif self._current_tool == self.TOOL_MARKER:
-            self._canvas.add_marker(scene_pos, self._draw_color)
+            self._canvas.add_marker(scene_pos, self._marker_color)
 
         elif self._current_tool == self.TOOL_TEXT:
             dlg = _TextInputDialog(QColor(self._draw_color), self)
@@ -3557,7 +3576,7 @@ class EnhancedRegionSelector(QWidget):
             self._select_tool(self.TOOL_SELECT)
 
         elif self._current_tool == self.TOOL_BUBBLE:
-            dlg = _BubbleInputDialog(QColor(self._draw_color), self)
+            dlg = _BubbleInputDialog(QColor(self._bubble_color), self)
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
@@ -6111,6 +6130,9 @@ class EditorCanvas(QGraphicsView):
         self.is_filled = False
         self.text_highlight_color = QColor(255, 255, 0, 255)
         self.highlight_tool_color = QColor(255, 255, 0, 90)
+        # Marker and Bubble tools each keep their own independent color
+        self.marker_color = QColor(255, 0, 0, 255)
+        self.bubble_color = QColor(255, 0, 0, 255)
         self._pan_start = None
         
         # Massive sceneRect allows infinite panning regardless of zoom
@@ -6318,7 +6340,7 @@ class EditorCanvas(QGraphicsView):
                 1.0)
             marker = _MarkerItem(self.start_point, number)
             marker._scale = last_scale
-            marker._bg_color = QColor(self.stroke_color)
+            marker._bg_color = QColor(self.marker_color)
             marker.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
                             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
                             QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -6452,7 +6474,7 @@ class EditorCanvas(QGraphicsView):
 
             QTimer.singleShot(0, _do_text_dialog)
         elif self.current_tool == "Bubble" and self.start_point:
-            dlg = _BubbleInputDialog(self.stroke_color, self)
+            dlg = _BubbleInputDialog(self.bubble_color, self)
             _set_dialog_on_top(dlg)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
@@ -7292,23 +7314,26 @@ class ImageEditorWindow(QMainWindow):
             return
 
         init_col = QColor(self.canvas.stroke_color)
-        init_col.setAlpha(255)  # Always default to fully opaque
+        if init_col.alpha() == 0:
+            init_col.setAlpha(255)  # Default to fully opaque only if alpha was never set
 
-        # Only show alpha channel slider for Highlight tool (intentionally semi-transparent)
-        show_alpha = (self.canvas.current_tool == "Highlight")
+        # Show alpha channel slider for all tools (Highlight manages its own dialog separately)
         dialog = QColorDialog(init_col, self)
         dialog.setWindowTitle("Pick Color")
-        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, show_alpha)
+        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
         dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
 
         if dialog.exec():
             c = dialog.selectedColor()
             if c.isValid():
-                # Force alpha=255 for all tools except Highlight
-                if self.canvas.current_tool != "Highlight":
-                    c.setAlpha(255)
-                self.canvas.stroke_color = c
-                self.canvas.fill_color = c
+                # Save color into the correct per-tool slot
+                if self.canvas.current_tool == "Marker":
+                    self.canvas.marker_color = c
+                elif self.canvas.current_tool == "Bubble":
+                    self.canvas.bubble_color = c
+                else:
+                    self.canvas.stroke_color = c
+                    self.canvas.fill_color = c
 
                 # Update color preview button
                 rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
