@@ -40,6 +40,7 @@ from PySide6.QtGui import (
     QFont, QPen, QBrush, QCursor, QPainterPath, QImage, QPainterPathStroker,
     QFontMetricsF
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import QShortcut
 
 try:
@@ -3003,31 +3004,42 @@ class EnhancedRegionSelector(QWidget):
                 min-width: 80px; max-width: 80px; font-size: 13px;
             }
             QPushButton#captureBtn:hover { background: #2e9e2e; }
+            QPushButton#colorPickerBtn {
+                min-width: 58px; max-width: 58px; font-size: 18px;
+            }
         """)
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(4)
 
         tools = [
-            (self.TOOL_SELECT,    "🖱️", "Select / move / resize annotations (Del to delete)"),
-            (self.TOOL_RECT,      "⬜", "Draw rectangle annotation"),
-            (self.TOOL_CIRCLE,    "⭕", "Draw ellipse annotation"),
-            (self.TOOL_HIGHLIGHT, "🟨", "Draw highlight (semi-transparent yellow rectangle)"),
-            (self.TOOL_FREEHAND,  "✏️", "Freehand drawing"),
-            (self.TOOL_LINE,      "📏", "Draw straight line"),
-            (self.TOOL_ARROW,     "➡️", "Draw arrow"),
-            (self.TOOL_BUBBLE,    "💬", "Add text bubble"),
-            (self.TOOL_MARKER,    "📍", "Add numbered marker"),
-            (self.TOOL_TEXT,      "T",  "Add text annotation"),
-            (self.TOOL_IMAGE,     "🖼️", "Import image onto canvas"),
-            (self.TOOL_COLOR,     "🎨", "Change annotation color / width"),
+            (self.TOOL_SELECT,    None,  "Select / move / resize annotations (Del to delete)"),
+            (self.TOOL_RECT,      "⬜",  "Draw rectangle annotation"),
+            (self.TOOL_CIRCLE,    "⭕",  "Draw ellipse annotation"),
+            (self.TOOL_HIGHLIGHT, "🟨",  "Draw highlight (semi-transparent yellow rectangle)"),
+            (self.TOOL_FREEHAND,  "✏️",  "Freehand drawing"),
+            (self.TOOL_LINE,      "📏",  "Draw straight line"),
+            (self.TOOL_ARROW,     "➡️",  "Draw arrow"),
+            (self.TOOL_BUBBLE,    "💬",  "Add text bubble"),
+            (self.TOOL_MARKER,    "📍",  "Add numbered marker"),
+            (self.TOOL_TEXT,      "T",   "Add text annotation"),
+            (self.TOOL_IMAGE,     "🖼️",  "Import image onto canvas"),
+            (self.TOOL_COLOR,     None,  "Change annotation color / width"),
         ]
         self._tool_btns = {}
         for tid, icon, tip in tools:
-            btn = QPushButton(icon)
+            btn = QPushButton()
             btn.setCheckable(tid not in (self.TOOL_COLOR, self.TOOL_IMAGE))
             btn.setToolTip(tip)
             btn.clicked.connect(lambda _, t=tid: self._select_tool(t))
+            if tid == self.TOOL_SELECT:
+                btn.setIcon(_svg_icon(_SVG_SELECT, 32))
+                btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_COLOR:
+                btn.setObjectName("colorPickerBtn")
+                btn.setText("🎨🔧")
+            else:
+                btn.setText(icon)
             lay.addWidget(btn)
             self._tool_btns[tid] = btn
         self._tool_btns[self.TOOL_RECT].setChecked(True)
@@ -6966,25 +6978,29 @@ class ImageEditorWindow(QMainWindow):
             tbar.addWidget(self.btn_capture_region)
             tbar.addSpacing(8)
 
-        for n, i in [("Select", "🖱️"), ("Crop", "📐"), ("Rectangle", "⬜"), ("Circle", "⭕"),
+        for n, i in [("Select", None), ("Crop", "📐"), ("Rectangle", "⬜"), ("Circle", "⭕"),
                      ("Line", "📏"), ("Arrow", "➡️"), ("Highlight", "🟨"), ("Freehand", "✏️"),
                      ("Bubble", "💬"), ("Text", "T"), ("Marker", "📍"), ("Eraser", "🧹")]:
-            b = QPushButton(i); b.setCheckable(True)
-            b.setFixedSize(40, 40)  # Większy stały rozmiar
-            # Styl: usunięcie marginesów i wyśrodkowanie tekstu/emoji
+            b = QPushButton(); b.setCheckable(True)
+            b.setFixedSize(40, 40)
             b.setStyleSheet("""
-                QPushButton { 
-                    font-size: 20px; 
-                    padding: 0px; 
-                    margin: 0px; 
-                    border: 1px solid #ccc; 
-                    border-radius: 4px; 
+                QPushButton {
+                    font-size: 20px;
+                    padding: 0px;
+                    margin: 0px;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
                 }
-                QPushButton:checked { 
-                    background-color: #3498db; 
-                    color: white; 
+                QPushButton:checked {
+                    background-color: #3498db;
+                    color: white;
                 }
             """)
+            if n == "Select":
+                b.setIcon(_svg_icon(_SVG_SELECT, 32))
+                b.setIconSize(QSize(32, 32))
+            else:
+                b.setText(i)
             b.clicked.connect(lambda ch, name=n: self.select_tool(name))
             tbar.addWidget(b); self.btns[n] = b
             
@@ -7022,7 +7038,9 @@ class ImageEditorWindow(QMainWindow):
         
         # Row 2: Props
         pbar = QHBoxLayout()
-        self.btn_c = QPushButton("🎨Color / Alpha")
+        self.btn_c = QPushButton("🎨🔧 Color / Set")
+        self.btn_c.setFixedHeight(36)
+        self.btn_c.setMinimumWidth(140)
         self.btn_c.clicked.connect(self.pick_color)
         pbar.addWidget(self.btn_c)
         
@@ -9236,6 +9254,49 @@ def _script_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).parent
+
+
+def _svg_icon(svg_str: str, size: int = 32) -> QIcon:
+    """Render an SVG string to a QIcon of the given pixel size."""
+    renderer = QSvgRenderer(svg_str.encode())
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pm)
+
+def _svg_emoji_icon(svg_str: str, emoji: str, btn_w: int, btn_h: int) -> QIcon:
+    """Render SVG on the left and emoji on the right into a single QIcon
+    sized to fill the button (btn_w x btn_h).  Both glyphs share the same
+    height so they look visually balanced."""
+    pm = QPixmap(btn_w, btn_h)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    # SVG occupies the left square
+    svg_size = btn_h - 4          # 2 px padding top/bottom
+    renderer = QSvgRenderer(svg_str.encode())
+    from PySide6.QtCore import QRectF
+    renderer.render(painter, QRectF(2, 2, svg_size, svg_size))
+    # Emoji occupies the right portion
+    emoji_px = max(10, btn_h - 8)
+    font = QFont()
+    font.setPixelSize(emoji_px)
+    painter.setFont(font)
+    painter.setPen(Qt.GlobalColor.white)
+    emoji_x = 2 + svg_size + 2
+    emoji_rect = QRectF(emoji_x, 0, btn_w - emoji_x - 1, btn_h)
+    painter.drawText(emoji_rect,
+                     Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                     emoji)
+    painter.end()
+    return QIcon(pm)
+
+# SVG source for the Select cursor tool
+_SVG_SELECT = """<svg width="77.068" height="77.068" version="1.1" viewBox="0 0 18.496 18.496" xmlns="http://www.w3.org/2000/svg">
+ <path d="m3.8616 1.6312v15.048l3.9126-3.9126 3.0097 4.665 2.3325-1.5048-2.7242-4.3081 4.7557-0.35688z" fill="#fff" stroke="#000" stroke-width="1.5048"/>
+</svg>"""
 
 
 def load_app_icon() -> QIcon:
