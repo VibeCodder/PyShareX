@@ -7331,49 +7331,52 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.is_dirty = True
             return
 
-        init_col = QColor(self.canvas.stroke_color)
+        # Pick the right source color for the current tool so the dialog opens
+        # with whatever alpha the user last chose — not a reset to 0.
+        if self.canvas.current_tool == "Marker":
+            init_col = QColor(self.canvas.marker_color)
+        elif self.canvas.current_tool == "Bubble":
+            init_col = QColor(self.canvas.bubble_color)
+        else:
+            init_col = QColor(self.canvas.stroke_color)
+
+        # Only default to fully opaque when alpha was never set (0 = uninitialised).
         if init_col.alpha() == 0:
-            init_col.setAlpha(255)  # Default to fully opaque only if alpha was never set
+            init_col.setAlpha(255)
 
-        # Show alpha channel slider for all tools (Highlight manages its own dialog separately)
-        dialog = QColorDialog(init_col, self)
-        dialog.setWindowTitle("Pick Color")
-        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        # Use _show_color_dialog so the Linux alpha=0 bug fix is applied consistently.
+        c = _show_color_dialog(init_col, self, alpha=True)
+        if c is not None and c.isValid():
+            # Save color into the correct per-tool slot
+            if self.canvas.current_tool == "Marker":
+                self.canvas.marker_color = c
+            elif self.canvas.current_tool == "Bubble":
+                self.canvas.bubble_color = c
+            else:
+                self.canvas.stroke_color = c
+                self.canvas.fill_color = c
 
-        if dialog.exec():
-            c = dialog.selectedColor()
-            if c.isValid():
-                # Save color into the correct per-tool slot
-                if self.canvas.current_tool == "Marker":
-                    self.canvas.marker_color = c
-                elif self.canvas.current_tool == "Bubble":
-                    self.canvas.bubble_color = c
+            # Update color preview button
+            rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
+            self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
+            self.update_live_props()
+
+            # Live-apply color to all currently selected items
+            for item in self.canvas.scene.selectedItems():
+                if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+                    item.setDefaultTextColor(c)
+                    self.canvas.is_dirty = True
+                elif isinstance(item, HighlightRectItem):
+                    pass  # Highlight shape has its own dialog
                 else:
-                    self.canvas.stroke_color = c
-                    self.canvas.fill_color = c
-
-                # Update color preview button
-                rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
-                self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
-                self.update_live_props()
-
-                # Live-apply color to all currently selected items
-                for item in self.canvas.scene.selectedItems():
-                    if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-                        item.setDefaultTextColor(c)
-                        self.canvas.is_dirty = True
-                    elif isinstance(item, HighlightRectItem):
-                        pass  # Highlight shape has its own dialog
-                    else:
-                        if hasattr(item, 'setPen') and hasattr(item, 'pen'):
-                            pen = item.pen()
-                            pen.setColor(c)
-                            item.setPen(pen)
-                        if hasattr(item, 'setBrush') and self.canvas.is_filled and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
-                            item.setBrush(QBrush(c))
-                        item.update()
-                        self.canvas.is_dirty = True
+                    if hasattr(item, 'setPen') and hasattr(item, 'pen'):
+                        pen = item.pen()
+                        pen.setColor(c)
+                        item.setPen(pen)
+                    if hasattr(item, 'setBrush') and self.canvas.is_filled and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+                        item.setBrush(QBrush(c))
+                    item.update()
+                    self.canvas.is_dirty = True
 
     def update_live_props(self):
         self.canvas.stroke_width = self.spin_stroke.value()
@@ -7525,27 +7528,25 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.is_dirty = True
 
     def pick_highlight_color(self):
-        dialog = QColorDialog(self.canvas.text_highlight_color, self)
-        dialog.setWindowTitle("Pick Text Highlight Color & Alpha")
-        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
-        dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        
-        if dialog.exec():
-            c = dialog.selectedColor()
-            if c.isValid():
-                # Ensure alpha defaults to fully opaque if user left it at 0
-                if c.alpha() == 0:
-                    c.setAlpha(255)
-                self.canvas.text_highlight_color = c
-                rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
-                self.btn_hc.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
-                
-                # Natychmiast aplikuj tło do zaznaczonych tekstów
-                for item in self.canvas.scene.selectedItems():
-                    if isinstance(item, HighlightTextItem):
-                        item.highlight_color = c
-                        item.update()
-                self.canvas.is_dirty = True
+        # Build initial color: preserve user's previously chosen alpha.
+        # Only default to a visible alpha (180) when uninitialised (alpha == 0).
+        init_col = QColor(self.canvas.text_highlight_color)
+        if init_col.alpha() == 0:
+            init_col.setAlpha(180)
+
+        # Use _show_color_dialog so the Linux alpha=0 bug fix is applied consistently.
+        c = _show_color_dialog(init_col, self, alpha=True)
+        if c is not None and c.isValid():
+            self.canvas.text_highlight_color = c
+            rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
+            self.btn_hc.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
+
+            # Immediately apply highlight color to all selected text items
+            for item in self.canvas.scene.selectedItems():
+                if isinstance(item, HighlightTextItem):
+                    item.highlight_color = c
+                    item.update()
+            self.canvas.is_dirty = True
 
     def import_image(self):
         from PySide6.QtWidgets import QFileDialog
