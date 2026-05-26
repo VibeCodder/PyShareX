@@ -102,7 +102,8 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 
 ## Image Editor
 
-<img width="1938" height="1038" alt="region_2026-05-21_20-51-03" src="https://github.com/user-attachments/assets/af240848-4c39-4e7c-8734-7a7ccfe94915" />
+<img width="1920" height="1020" alt="pythonw_tjdZQXCcZy" src="https://github.com/user-attachments/assets/90835aa5-9a6e-4afc-a80f-4a0167fce0d3" />
+
 
 
 ## Aplication normally works in the background (System Tray)
