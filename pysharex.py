@@ -74,6 +74,10 @@ try:
 except ImportError:
     EASYOCR_AVAILABLE = False
 
+# Must be set before paddleocr/paddlepaddle is imported — disables OneDNN/MKL-DNN
+# which causes ConvertPirAttribute2RuntimeAttribute crash on Windows CPU
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+
 try:
     from paddleocr import PaddleOCR as _PaddleOCR
     PADDLEOCR_AVAILABLE = True
@@ -103,13 +107,59 @@ def _get_easyocr_reader():
     return _easyocr_reader
 
 
+# Stores both the reader instance and which API generation it uses
+_paddleocr_api_version = None   # "v3" | "v2" | None
+_paddleocr_init_error  = None   # last init error message, shown to user
+
 def _get_paddleocr_reader():
-    global _paddleocr_reader
+    global _paddleocr_reader, _paddleocr_api_version, _paddleocr_init_error
     if _paddleocr_reader is None and PADDLEOCR_AVAILABLE:
-        try:
-            _paddleocr_reader = _PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-        except Exception as e:
-            print(f"PaddleOCR init error: {e}")
+        # Disable OneDNN/MKL-DNN — causes ConvertPirAttribute crash on Windows
+        os.environ.setdefault("FLAGS_use_mkldnn", "0")
+        os.environ.setdefault("PADDLE_DISABLE_MKL", "1")
+        os.environ.setdefault("FLAGS_onednn_cpu_enable", "0")
+        # PaddleOCR 3.x removed use_angle_cls; try without it first.
+        # PaddleOCR 2.x requires use_angle_cls=True for best results.
+        # Build kwargs progressively — drop params that cause TypeError/unknown-arg errors
+        def _try_init_paddle(kwargs: dict):
+            """Try to init PaddleOCR, stripping one unknown kwarg at a time."""
+            import copy
+            kw = copy.copy(kwargs)
+            removable = ["show_log", "use_angle_cls", "use_textline_orientation"]
+            tried = set()
+            while True:
+                try:
+                    return _PaddleOCR(**kw)
+                except Exception as e:
+                    msg = str(e)
+                    removed = False
+                    for param in removable:
+                        if param in kw and param not in tried and (
+                            "Unknown argument" in msg or param in msg
+                        ):
+                            del kw[param]
+                            tried.add(param)
+                            removed = True
+                            break
+                    if not removed:
+                        raise  # nothing left to strip — real error
+
+        last_err = None
+        for ver, kwargs in [
+            ("v3", {"lang": "en", "show_log": False}),
+            ("v2", {"use_angle_cls": True, "lang": "en", "show_log": False}),
+        ]:
+            try:
+                inst = _try_init_paddle(kwargs)
+                _paddleocr_reader = inst
+                _paddleocr_api_version = ver
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if _paddleocr_reader is None:
+            _paddleocr_init_error = str(last_err)
+            print(f"PaddleOCR init error: {last_err}")
     return _paddleocr_reader
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -886,7 +936,8 @@ class NotificationToast(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self._opacity = 1.0
         self._filepath = filepath
-        self._on_click_open = on_click_open
+        self._on_click_open   = on_click_open
+        self._on_click_folder = on_click_folder
 
         self.setStyleSheet("""
             QWidget#MainFrame {
@@ -965,9 +1016,32 @@ class NotificationToast(QWidget):
         else: self.setWindowOpacity(self._opacity)
 
     def mousePressEvent(self, e):
-        if self._filepath and Path(self._filepath).exists():
-            if platform.system() == "Windows": os.startfile(self._filepath)
+        if not self._filepath:
             self.close()
+            return
+        p = self._filepath
+        folder = str(Path(p).parent)
+        sys_name = platform.system()
+
+        if self._on_click_open and Path(p).exists():
+            # Open the file itself — cross-platform
+            if sys_name == "Windows":
+                os.startfile(p)
+            elif sys_name == "Darwin":
+                _popen(["open", p])
+            else:
+                _popen(["xdg-open", p])
+
+        if self._on_click_folder and Path(folder).exists():
+            # Open containing folder — cross-platform
+            if sys_name == "Windows":
+                _popen(["explorer", "/select,", p.replace("/", "\\")])
+            elif sys_name == "Darwin":
+                _popen(["open", folder])
+            else:
+                _popen(["xdg-open", folder])
+
+        self.close()
 
 def notify(config: Config, filepath: str, pixmap=None):
     notif = config.get("notifications", {})
@@ -999,14 +1073,19 @@ def notify(config: Config, filepath: str, pixmap=None):
             pixmap = QPixmap.fromImage(qi)
         except: pass
 
-    QTimer.singleShot(0, lambda: _show_toast(title, msg, pixmap, filepath))
+    click_open_file   = notif.get("click_open_file",   True)
+    click_open_folder = notif.get("click_open_folder", False)
+    QTimer.singleShot(0, lambda: _show_toast(title, msg, pixmap, filepath,
+                                             click_open_file, click_open_folder))
 
 _toasts = []
-def _show_toast(title, msg, pixmap, filepath):
+def _show_toast(title, msg, pixmap, filepath,
+                on_click_open=True, on_click_folder=False):
     global _toasts
-    # Czyścimy stare, niewidoczne powiadomienia
     _toasts = [t for t in _toasts if t.isVisible()]
-    t = NotificationToast(title, msg, pixmap, filepath)
+    t = NotificationToast(title, msg, pixmap, filepath,
+                          on_click_open=on_click_open,
+                          on_click_folder=on_click_folder)
     _toasts.append(t)
 
 
@@ -1305,19 +1384,35 @@ class RegionSelector(QWidget):
                 try:
                     import mss
                     with mss.mss() as sct:
-                        # Match Qt screen → MSS monitor by comparing their
-                        # physical top-left origins, not by sort-order index.
-                        # This is robust for all layouts including Case 1/3
-                        # (portrait monitor on the left/right) and Case 5
-                        # (3+ monitors), as well as their mirrored variants.
+                        # Use _emit_region_from_global_rect logic — match by
+                        # physical origin (geometry * ratio) not by list order,
+                        # so all monitor layouts including mixed-DPI and 3+
+                        # monitors work correctly (same as EnhancedRegionSelector).
                         qt_phys_x = round(logical_geom.x() * ratio)
                         qt_phys_y = round(logical_geom.y() * ratio)
-                        for mon in sct.monitors[1:]:
+                        # Sort both lists the same way EnhancedRegionSelector does
+                        # so index-based fallback also works correctly.
+                        mss_mons_sorted = sorted(sct.monitors[1:],
+                                                 key=lambda m: (m["left"], m["top"]))
+                        matched = False
+                        for mon in mss_mons_sorted:
                             if (abs(mon["left"] - qt_phys_x) <= 2 and
                                     abs(mon["top"]  - qt_phys_y) <= 2):
                                 final_x = mon["left"] + phys_local_x
                                 final_y = mon["top"]  + phys_local_y
+                                matched = True
                                 break
+                        if not matched:
+                            # Fallback: index-match sorted Qt screens → sorted MSS
+                            qt_screens_sorted = sorted(
+                                QApplication.screens(),
+                                key=lambda s: (s.geometry().x(), s.geometry().y()))
+                            screen_idx = qt_screens_sorted.index(screen) \
+                                if screen in qt_screens_sorted else 0
+                            if screen_idx < len(mss_mons_sorted):
+                                mon = mss_mons_sorted[screen_idx]
+                                final_x = mon["left"] + phys_local_x
+                                final_y = mon["top"]  + phys_local_y
                 except Exception as ex:
                     print(f"[PyshareX] Monitor matching error: {ex}")
 
@@ -1364,17 +1459,28 @@ def _emit_region_from_global_rect(r: QRect, signal):
 
     try:
         with mss.mss() as sct:
-            # Match by physical origin instead of sort-order index so that
-            # any arrangement of monitors (including mirrored Case 1 / Case 3
-            # and mixed-DPI setups) is handled correctly.
             qt_phys_x = round(logical_geom.x() * ratio)
             qt_phys_y = round(logical_geom.y() * ratio)
-            for mon in sct.monitors[1:]:
+            mss_mons_sorted = sorted(sct.monitors[1:],
+                                     key=lambda m: (m["left"], m["top"]))
+            matched = False
+            for mon in mss_mons_sorted:
                 if (abs(mon["left"] - qt_phys_x) <= 2 and
                         abs(mon["top"]  - qt_phys_y) <= 2):
                     final_x = mon["left"] + phys_local_x
                     final_y = mon["top"]  + phys_local_y
+                    matched = True
                     break
+            if not matched:
+                qt_screens_sorted = sorted(
+                    QApplication.screens(),
+                    key=lambda s: (s.geometry().x(), s.geometry().y()))
+                screen_idx = qt_screens_sorted.index(screen) \
+                    if screen in qt_screens_sorted else 0
+                if screen_idx < len(mss_mons_sorted):
+                    mon = mss_mons_sorted[screen_idx]
+                    final_x = mon["left"] + phys_local_x
+                    final_y = mon["top"]  + phys_local_y
     except Exception as ex:
         print(f"[PyshareX] Monitor matching error: {ex}")
 
@@ -4726,21 +4832,83 @@ class CaptureEngine:
                     "Falling back — try EasyOCR or Tesseract in Settings.")
         reader = _get_paddleocr_reader()
         if reader is None:
-            return "PaddleOCR failed to initialize."
+            detail = f"\n\nError: {_paddleocr_init_error}" if _paddleocr_init_error else ""
+            return (
+                f"PaddleOCR failed to initialize.{detail}\n\n"
+                "Possible fixes:\n"
+                "  • Upgrade: pip install --upgrade paddlepaddle paddleocr\n"
+                "  • Or switch to EasyOCR in Settings → OCR engine."
+            )
         try:
-            results = reader.ocr(image_path, cls=True)
-            lines = []
-            for block in (results or []):
-                if block is None:
-                    continue
-                for line in block:
-                    if line and len(line) >= 2:
-                        text_info = line[1]
-                        if isinstance(text_info, (list, tuple)) and text_info:
-                            lines.append(str(text_info[0]))
-                        elif isinstance(text_info, str):
-                            lines.append(text_info)
-            return "\n".join(lines)
+            # PaddleOCR expects BGR numpy array (same as OpenCV).
+            # Passing a file path triggers the OneDNN loader crash on Windows,
+            # so we always convert to BGR array first.
+            img_input = image_path  # fallback if numpy unavailable
+            try:
+                import numpy as _np
+                import cv2 as _cv2
+                img_input = _cv2.imdecode(
+                    _np.fromfile(image_path, dtype=_np.uint8), _cv2.IMREAD_COLOR
+                )  # result is BGR uint8 — exactly what PaddleOCR expects
+            except Exception:
+                try:
+                    import numpy as _np
+                    from PIL import Image as _PILImage
+                    _pil = _PILImage.open(image_path).convert("RGB")
+                    # PIL gives RGB → flip to BGR for PaddleOCR
+                    img_input = _np.array(_pil)[:, :, ::-1].copy()
+                except Exception:
+                    pass  # last resort: raw path
+
+            # PaddleOCR 3.x uses .predict(); 2.x uses .ocr()
+            if _paddleocr_api_version == "v3":
+                result_obj = reader.predict(img_input)
+                lines = []
+                for item in (result_obj or []):
+                    # PaddleX OCRResult behaves like a dict — access rec_texts directly
+                    try:
+                        texts = item["rec_texts"]
+                        if isinstance(texts, (list, tuple)):
+                            lines.extend([str(t) for t in texts if t])
+                        elif isinstance(texts, str) and texts:
+                            lines.append(texts)
+                        continue
+                    except (KeyError, TypeError):
+                        pass
+                    # Fallback: attribute access
+                    texts = getattr(item, "rec_texts", None)
+                    if isinstance(texts, (list, tuple)):
+                        lines.extend([str(t) for t in texts if t])
+                    elif isinstance(texts, str) and texts:
+                        lines.append(texts)
+                    else:
+                        # Last resort: legacy list of (box, (text, score))
+                        try:
+                            for line in item:
+                                if line and len(line) >= 2:
+                                    text_info = line[1]
+                                    if isinstance(text_info, (list, tuple)) and text_info:
+                                        lines.append(str(text_info[0]))
+                                    elif isinstance(text_info, str):
+                                        lines.append(text_info)
+                        except Exception:
+                            pass
+                return "\n".join(lines)
+            else:
+                # PaddleOCR 2.x
+                results = reader.ocr(img_input, cls=True)
+                lines = []
+                for block in (results or []):
+                    if block is None:
+                        continue
+                    for line in block:
+                        if line and len(line) >= 2:
+                            text_info = line[1]
+                            if isinstance(text_info, (list, tuple)) and text_info:
+                                lines.append(str(text_info[0]))
+                            elif isinstance(text_info, str):
+                                lines.append(text_info)
+                return "\n".join(lines)
         except Exception as e:
             return f"PaddleOCR error: {e}"
 
