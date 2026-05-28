@@ -5470,6 +5470,79 @@ class _HotkeyEdit(QWidget):
         super().closeEvent(e)
 
 
+class OcrProgressDialog(QWidget):
+    """Small non-blocking progress window shown while OCR/QR is running.
+    Uses QWidget (not QDialog) to guarantee it never blocks the event loop."""
+    def __init__(self, message="Running OCR…", parent=None):
+        super().__init__(None,
+                         Qt.WindowType.Window |
+                         Qt.WindowType.WindowStaysOnTopHint |
+                         Qt.WindowType.FramelessWindowHint |
+                         Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        frame = QFrame()
+        frame.setObjectName("OcrProgressFrame")
+        frame.setStyleSheet("""
+            QFrame#OcrProgressFrame {
+                background: #1e1e2e;
+                border: 1px solid #45475a;
+                border-radius: 12px;
+            }
+            QLabel { color: #cdd6f4; font-size: 13px; background: transparent; }
+            QLabel#title_lbl { font-size: 15px; font-weight: bold; color: #89b4fa; }
+        """)
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(28, 22, 28, 22)
+        inner.setSpacing(12)
+
+        title = QLabel("⏳ Processing…")
+        title.setObjectName("title_lbl")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        inner.addWidget(title)
+
+        self._msg_lbl = QLabel(message)
+        self._msg_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._msg_lbl.setWordWrap(True)
+        inner.addWidget(self._msg_lbl)
+
+        # Animated dots
+        self._dot_timer = QTimer(self)
+        self._dot_timer.setInterval(400)
+        self._dots = 0
+        self._base_msg = message
+        self._dot_timer.timeout.connect(self._tick)
+        self._dot_timer.start()
+
+        outer.addWidget(frame)
+        self.setFixedWidth(340)
+        self.adjustSize()
+
+        # Centre on primary screen
+        sg = QApplication.primaryScreen().availableGeometry()
+        self.move(sg.center() - self.rect().center())
+
+    def set_message(self, msg: str):
+        self._base_msg = msg
+        self._msg_lbl.setText(msg)
+
+    def _tick(self):
+        self._dots = (self._dots + 1) % 4
+        self._msg_lbl.setText(self._base_msg + "." * self._dots)
+
+    def closeEvent(self, e):
+        self._dot_timer.stop()
+        super().closeEvent(e)
+
+    def close(self):
+        self._dot_timer.stop()
+        super().close()
+
+
 class OcrResultDialog(QDialog):
     def __init__(self, text, parent=None):
         super().__init__(parent)
@@ -8294,19 +8367,25 @@ class OcrQrToolboxDialog(QDialog):
         if w < 5 or h < 5:
             self.show(); return
 
+        mw = self.main_window
+        mw._prog_show_sig.emit("Capturing region…")
+
         def go():
             time.sleep(0.05)
-            path = self.main_window.engine.capture_region(x, y, w, h)
+            path = mw.engine.capture_region(x, y, w, h)
             if not path:
+                mw._prog_hide_sig.emit()
                 self._ocr_result_sig.emit("Failed to capture screen region.")
                 return
-            engine = self.main_window.config.get("ocr_engine", "paddleocr")
-            if engine == "paddleocr":
-                txt = self.main_window.engine._ocr_paddleocr(path)
-            elif engine == "easyocr":
-                txt = self.main_window.engine._ocr_easyocr(path)
+            engine_name = mw.config.get("ocr_engine", "paddleocr")
+            mw._prog_msg_sig.emit(f"Running {engine_name.upper()}…")
+            if engine_name == "paddleocr":
+                txt = mw.engine._ocr_paddleocr(path)
+            elif engine_name == "easyocr":
+                txt = mw.engine._ocr_easyocr(path)
             else:
-                txt = self.main_window.engine._ocr_tesseract(path)
+                txt = mw.engine._ocr_tesseract(path)
+            mw._prog_hide_sig.emit()
             self._ocr_result_sig.emit(txt)
 
         threading.Thread(target=go, daemon=True).start()
@@ -8418,6 +8497,9 @@ class MainWindow(QMainWindow):
     _notify_sig   = Signal(str, object)  # filepath — must run on main thread
     _ocr_done_sig = Signal(str, str)     # (tekst, tytul)
     _hotkey_sig   = Signal(str)          # method_name — dispatched from pynput thread
+    _prog_show_sig = Signal(str)         # show progress window with message
+    _prog_msg_sig  = Signal(str)         # update progress message
+    _prog_hide_sig = Signal()            # hide/close progress window
 
     def __init__(self, config: Config):
         super().__init__()
@@ -8436,6 +8518,10 @@ class MainWindow(QMainWindow):
         self._hkl        = None
         self._ocr_done_sig.connect(self._show_ocr)
         self._hotkey_sig.connect(self._dispatch_hotkey)
+        self._ocr_prog = None
+        self._prog_show_sig.connect(self._prog_show)
+        self._prog_msg_sig.connect(self._prog_msg)
+        self._prog_hide_sig.connect(self._prog_hide)
         self.last_rec_pixmap = None  # Tu będziemy trzymać miniaturkę
         self.setWindowTitle("PyshareX")
         self.setMinimumSize(780, 540)
@@ -9606,74 +9692,65 @@ class MainWindow(QMainWindow):
         self._sel.cancelled.connect(self.show_win)
 
     def _run_ocr(self, x, y, w, h):
-        # Sprawdzamy, czy obszar nie jest za mały (podobnie jak przy zwykłym screenshot'cie)
-        if w < 5 or h < 5: 
+        if w < 5 or h < 5:
             self.show_win()
             return
 
         self._status("⏳ Running OCR…")
+        self._prog_show_sig.emit("Capturing region…")
 
         def go():
-            # Używamy dokładnie takiego samego opóźnienia jak w klasycznym zrzucie (0.05s)
             time.sleep(0.05)
-            
-            # Bezpośrednio wywołujemy sprawdzoną i działającą metodę capture_region!
             path = self.engine.capture_region(x, y, w, h)
             if not path:
-                self._ocr_done_sig.emit("Nie udało się przechwycić ekranu.", "OCR Result")
+                self._prog_hide_sig.emit()
+                self._ocr_done_sig.emit("Failed to capture screen region.", "OCR Result")
                 return
-
-            # Mając już w 100% poprawny plik na dysku, wykonujemy na nim OCR
-            engine = self.config.get("ocr_engine", "paddleocr")
-            if engine == "paddleocr":
+            engine_name = self.config.get("ocr_engine", "paddleocr")
+            self._prog_msg_sig.emit(f"Running {engine_name.upper()}…")
+            if engine_name == "paddleocr":
                 txt = self.engine._ocr_paddleocr(path)
-            elif engine == "easyocr":
+            elif engine_name == "easyocr":
                 txt = self.engine._ocr_easyocr(path)
             else:
                 txt = self.engine._ocr_tesseract(path)
-
+            self._prog_hide_sig.emit()
             self._ocr_done_sig.emit(txt, "OCR Result")
 
         threading.Thread(target=go, daemon=True).start()
 
     def _run_qr(self, x, y, w, h):
-        if w < 5 or h < 5: 
+        if w < 5 or h < 5:
             self.show_win()
             return
 
         self._status("⏳ Scanning QR…")
+        self._prog_show_sig.emit("Capturing region…")
 
         def go():
             time.sleep(0.05)
-            
-            # Ponownie, używamy poprawnej metody capture_region
             path = self.engine.capture_region(x, y, w, h)
             if not path:
-                self._ocr_done_sig.emit("Nie udało się przechwycić ekranu.", "QR Code Result")
+                self._prog_hide_sig.emit()
+                self._ocr_done_sig.emit("Failed to capture screen region.", "QR Code Result")
                 return
-
             if not CV2_AVAILABLE:
-                self._ocr_done_sig.emit("Brak biblioteki OpenCV. (pip install opencv-python)", "QR Code Result")
+                self._prog_hide_sig.emit()
+                self._ocr_done_sig.emit("OpenCV not installed.\npip install opencv-python", "QR Code Result")
                 return
-                
+            self._prog_msg_sig.emit("Scanning QR code…")
             try:
                 import cv2
                 import numpy as np
-                
-                # Używamy cv2.imdecode z numpy - w przeciwieństwie do zwykłego cv2.imread, 
-                # to podejście bezbłędnie radzi sobie z polskimi znakami w ścieżkach Windowsa!
                 img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
                 detector = cv2.QRCodeDetector()
                 data, bbox, _ = detector.detectAndDecode(img)
-                
-                if data:
-                    result = data
-                else:
-                    result = "Nie wykryto kodu QR w zaznaczonym obszarze."
-                    
+                result = data if data else "No QR code detected in the selected region."
+                self._prog_hide_sig.emit()
                 self._ocr_done_sig.emit(result, "QR Code Result")
             except Exception as e:
-                self._ocr_done_sig.emit(f"Wystąpił błąd podczas dekodowania: {e}", "QR Code Result")
+                self._prog_hide_sig.emit()
+                self._ocr_done_sig.emit(f"QR decode error: {e}", "QR Code Result")
 
         threading.Thread(target=go, daemon=True).start()
     
@@ -9729,6 +9806,27 @@ class MainWindow(QMainWindow):
         # Powiadomienie (używa Twojej istniejącej metody powiadomień)
         self._on_notify(str(path), None)
     
+    def _prog_show(self, message: str):
+        """Create and show the progress widget on the main thread."""
+        if self._ocr_prog is not None:
+            try: self._ocr_prog.close()
+            except Exception: pass
+        self._ocr_prog = OcrProgressDialog(message)
+        self._ocr_prog.setStyleSheet(self.styleSheet())
+        self._ocr_prog.show()
+
+    def _prog_msg(self, message: str):
+        """Update progress message on the main thread."""
+        if self._ocr_prog is not None:
+            self._ocr_prog.set_message(message)
+
+    def _prog_hide(self):
+        """Close the progress widget on the main thread."""
+        if self._ocr_prog is not None:
+            try: self._ocr_prog.close()
+            except Exception: pass
+            self._ocr_prog = None
+
     def _show_ocr(self, txt, title="Result"):
         dlg = OcrResultDialog(txt, parent=None)
         dlg.setWindowTitle(title)

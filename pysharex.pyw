@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu, QFileDialog, QDialog, QLineEdit,
     QComboBox, QCheckBox, QGroupBox, QScrollArea, QFrame,
     QMessageBox, QListWidget, QListWidgetItem,
-    QDialogButtonBox, QSpinBox, QTabWidget,
+    QDialogButtonBox, QSpinBox, QTabWidget, QRadioButton,
     QTextEdit, QSizePolicy, QStackedWidget, QColorDialog, QInputDialog,
     QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsRectItem,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem
@@ -74,6 +74,10 @@ try:
 except ImportError:
     EASYOCR_AVAILABLE = False
 
+# Must be set before paddleocr/paddlepaddle is imported — disables OneDNN/MKL-DNN
+# which causes ConvertPirAttribute2RuntimeAttribute crash on Windows CPU
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+
 try:
     from paddleocr import PaddleOCR as _PaddleOCR
     PADDLEOCR_AVAILABLE = True
@@ -103,13 +107,62 @@ def _get_easyocr_reader():
     return _easyocr_reader
 
 
+# Stores both the reader instance and which API generation it uses
+_paddleocr_api_version = None   # "v3" | "v2" | None
+_paddleocr_init_error  = None   # last init error message, shown to user
+
 def _get_paddleocr_reader():
-    global _paddleocr_reader
+    global _paddleocr_reader, _paddleocr_api_version, _paddleocr_init_error
     if _paddleocr_reader is None and PADDLEOCR_AVAILABLE:
-        try:
-            _paddleocr_reader = _PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-        except Exception as e:
-            print(f"PaddleOCR init error: {e}")
+        # Disable OneDNN/MKL-DNN — causes ConvertPirAttribute crash on Windows
+        os.environ.setdefault("FLAGS_use_mkldnn", "0")
+        os.environ.setdefault("PADDLE_DISABLE_MKL", "1")
+        os.environ.setdefault("FLAGS_onednn_cpu_enable", "0")
+        # PaddleOCR 3.x removed use_angle_cls; try without it first.
+        # PaddleOCR 2.x requires use_angle_cls=True for best results.
+        # Build kwargs progressively — drop params that cause TypeError/unknown-arg errors
+        def _try_init_paddle(kwargs: dict):
+            """Try to init PaddleOCR, stripping one unknown kwarg at a time."""
+            import copy
+            kw = copy.copy(kwargs)
+            removable = ["show_log", "use_angle_cls", "use_textline_orientation"]
+            tried = set()
+            while True:
+                try:
+                    return _PaddleOCR(**kw)
+                except Exception as e:
+                    msg = str(e)
+                    removed = False
+                    for param in removable:
+                        if param in kw and param not in tried and (
+                            "Unknown argument" in msg or param in msg
+                        ):
+                            del kw[param]
+                            tried.add(param)
+                            removed = True
+                            break
+                    if not removed:
+                        raise  # nothing left to strip — real error
+
+        last_err = None
+        for ver, kwargs in [
+            ("v3", {"lang": "en", "show_log": False}),
+            ("v2", {"use_angle_cls": True, "lang": "en", "show_log": False}),
+        ]:
+            try:
+                inst = _try_init_paddle(kwargs)
+                _paddleocr_reader = inst
+                _paddleocr_api_version = ver
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if _paddleocr_reader is None:
+            _paddleocr_init_error = str(last_err)
+            print(f"PaddleOCR init error: {last_err}")
+            if IS_LINUX:
+                print("[PyshareX] PaddleOCR may crash on Linux VMs or CPUs without AVX. "
+                      "Switch to EasyOCR in Settings → OCR engine.")
     return _paddleocr_reader
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -886,7 +939,8 @@ class NotificationToast(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self._opacity = 1.0
         self._filepath = filepath
-        self._on_click_open = on_click_open
+        self._on_click_open   = on_click_open
+        self._on_click_folder = on_click_folder
 
         self.setStyleSheet("""
             QWidget#MainFrame {
@@ -965,9 +1019,32 @@ class NotificationToast(QWidget):
         else: self.setWindowOpacity(self._opacity)
 
     def mousePressEvent(self, e):
-        if self._filepath and Path(self._filepath).exists():
-            if platform.system() == "Windows": os.startfile(self._filepath)
+        if not self._filepath:
             self.close()
+            return
+        p = self._filepath
+        folder = str(Path(p).parent)
+        sys_name = platform.system()
+
+        if self._on_click_open and Path(p).exists():
+            # Open the file itself — cross-platform
+            if sys_name == "Windows":
+                os.startfile(p)
+            elif sys_name == "Darwin":
+                _popen(["open", p])
+            else:
+                _popen(["xdg-open", p])
+
+        if self._on_click_folder and Path(folder).exists():
+            # Open containing folder — cross-platform
+            if sys_name == "Windows":
+                _popen(["explorer", "/select,", p.replace("/", "\\")])
+            elif sys_name == "Darwin":
+                _popen(["open", folder])
+            else:
+                _popen(["xdg-open", folder])
+
+        self.close()
 
 def notify(config: Config, filepath: str, pixmap=None):
     notif = config.get("notifications", {})
@@ -999,14 +1076,19 @@ def notify(config: Config, filepath: str, pixmap=None):
             pixmap = QPixmap.fromImage(qi)
         except: pass
 
-    QTimer.singleShot(0, lambda: _show_toast(title, msg, pixmap, filepath))
+    click_open_file   = notif.get("click_open_file",   True)
+    click_open_folder = notif.get("click_open_folder", False)
+    QTimer.singleShot(0, lambda: _show_toast(title, msg, pixmap, filepath,
+                                             click_open_file, click_open_folder))
 
 _toasts = []
-def _show_toast(title, msg, pixmap, filepath):
+def _show_toast(title, msg, pixmap, filepath,
+                on_click_open=True, on_click_folder=False):
     global _toasts
-    # Czyścimy stare, niewidoczne powiadomienia
     _toasts = [t for t in _toasts if t.isVisible()]
-    t = NotificationToast(title, msg, pixmap, filepath)
+    t = NotificationToast(title, msg, pixmap, filepath,
+                          on_click_open=on_click_open,
+                          on_click_folder=on_click_folder)
     _toasts.append(t)
 
 
@@ -1020,40 +1102,51 @@ def physical_to_logical_rect(phys_x, phys_y, phys_w, phys_h) -> QRect:
     from PySide6.QtCore import QRect
     
     # Sortujemy ekrany tak samo jak w RegionSelector, by indeksy się zgadzały
-    qt_screens = sorted(QApplication.screens(), key=lambda s: (s.geometry().x(), s.geometry().y()))
-    
-    with mss.mss() as sct:
-        # Sortujemy monitory fizyczne
-        mss_mons = sorted(sct.monitors[1:], key=lambda m: (m["left"], m["top"]))
-        
+    with mss.MSS() as sct:
+        target_mon    = None
         target_screen = None
-        target_mon = None
-        
-        # Znajdujemy, na którym monitorze fizycznym znajduje się punkt startowy
-        for q_scr, m_mon in zip(qt_screens, mss_mons):
-            if (m_mon["left"] <= phys_x < m_mon["left"] + m_mon["width"] and
-                m_mon["top"] <= phys_y < m_mon["top"] + m_mon["height"]):
-                target_screen = q_scr
-                target_mon = m_mon
-                break
-        
-        if not target_screen:
-            target_screen = QApplication.primaryScreen()
-            target_mon = mss_mons[0] if mss_mons else {"left": 0, "top": 0}
 
-        ratio = target_screen.devicePixelRatio()
+        # Find MSS monitor containing the physical point, then find the
+        # matching Qt screen by physical-origin comparison (not by index).
+        # This handles all layouts including portrait monitors (Case 1/3),
+        # mirrored variants, and 3+ monitor setups (Case 5).
+        for mon in sct.monitors[1:]:
+            if (mon["left"] <= phys_x < mon["left"] + mon["width"] and
+                    mon["top"]  <= phys_y < mon["top"]  + mon["height"]):
+                target_mon = mon
+                break
+
+        if target_mon is None:
+            # Point is outside all monitors — use primary as fallback
+            target_mon    = sct.monitors[1] if len(sct.monitors) > 1 else {"left": 0, "top": 0, "width": 1920, "height": 1080}
+            target_screen = QApplication.primaryScreen()
+
+        if target_screen is None:
+            # Match Qt screen whose physical origin equals target_mon's origin
+            for q_scr in QApplication.screens():
+                lg  = q_scr.geometry()
+                dpr = q_scr.devicePixelRatio()
+                qpx = round(lg.x() * dpr)
+                qpy = round(lg.y() * dpr)
+                if abs(qpx - target_mon["left"]) <= 2 and abs(qpy - target_mon["top"]) <= 2:
+                    target_screen = q_scr
+                    break
+
+        if target_screen is None:
+            target_screen = QApplication.primaryScreen()
+
+        ratio        = target_screen.devicePixelRatio()
         logical_geom = target_screen.geometry()
-        
-        # Obliczamy pozycję wewnątrz monitora (fizyczną) i zamieniamy na logiczną
+
+        # Physical offset inside the owning monitor → logical offset
         local_phys_x = phys_x - target_mon["left"]
         local_phys_y = phys_y - target_mon["top"]
-        
+
         local_log_x = local_phys_x / ratio
         local_log_y = local_phys_y / ratio
-        log_w = phys_w / ratio
-        log_h = phys_h / ratio
-        
-        # Dodajemy offset monitora w układzie Qt
+        log_w       = phys_w / ratio
+        log_h       = phys_h / ratio
+
         return QRect(
             int(logical_geom.x() + local_log_x),
             int(logical_geom.y() + local_log_y),
@@ -1266,38 +1359,65 @@ class RegionSelector(QWidget):
             r = QRect(self.global_start, self.global_end).normalized()
 
             if r.width() > 0 and r.height() > 0:
-                screen = QApplication.screenAt(r.center())
+                # Use topLeft for screen detection — more reliable than center
+                # when selection starts near a monitor boundary.
+                screen = QApplication.screenAt(r.topLeft())
+                if not screen:
+                    screen = QApplication.screenAt(r.center())
                 if not screen:
                     screen = QApplication.primaryScreen()
-                
-                ratio = screen.devicePixelRatio()
+
+                ratio        = screen.devicePixelRatio()
                 logical_geom = screen.geometry()
-                
+
+                # Offset of selection inside the owning screen (logical px)
                 local_x = r.x() - logical_geom.x()
                 local_y = r.y() - logical_geom.y()
-                
-                phys_w = int(r.width() * ratio)
-                phys_h = int(r.height() * ratio)
+
+                # Convert offset + size to physical px
                 phys_local_x = int(local_x * ratio)
                 phys_local_y = int(local_y * ratio)
-                
-                final_x = int(r.x() * ratio) 
-                final_y = int(r.y() * ratio)
-                
+                phys_w       = int(r.width()  * ratio)
+                phys_h       = int(r.height() * ratio)
+
+                # Safe fallback (used only when MSS matching fails)
+                final_x = int(logical_geom.x() * ratio) + phys_local_x
+                final_y = int(logical_geom.y() * ratio) + phys_local_y
+
                 try:
                     import mss
-                    with mss.mss() as sct:
-                        qt_screens = sorted(QApplication.screens(), key=lambda s: (s.geometry().x(), s.geometry().y()))
-                        mss_mons = sorted(sct.monitors[1:], key=lambda m: (m["left"], m["top"]))
-                        
-                        if screen in qt_screens:
-                            screen_idx = qt_screens.index(screen)
-                            if screen_idx < len(mss_mons):
-                                target_mon = mss_mons[screen_idx]
-                                final_x = target_mon["left"] + phys_local_x
-                                final_y = target_mon["top"]  + phys_local_y
+                    with mss.MSS() as sct:
+                        # Use _emit_region_from_global_rect logic — match by
+                        # physical origin (geometry * ratio) not by list order,
+                        # so all monitor layouts including mixed-DPI and 3+
+                        # monitors work correctly (same as EnhancedRegionSelector).
+                        qt_phys_x = round(logical_geom.x() * ratio)
+                        qt_phys_y = round(logical_geom.y() * ratio)
+                        # Sort both lists the same way EnhancedRegionSelector does
+                        # so index-based fallback also works correctly.
+                        mss_mons_sorted = sorted(sct.monitors[1:],
+                                                 key=lambda m: (m["left"], m["top"]))
+                        matched = False
+                        for mon in mss_mons_sorted:
+                            if (abs(mon["left"] - qt_phys_x) <= 2 and
+                                    abs(mon["top"]  - qt_phys_y) <= 2):
+                                final_x = mon["left"] + phys_local_x
+                                final_y = mon["top"]  + phys_local_y
+                                matched = True
+                                break
+                        if not matched:
+                            # Fallback: index-match sorted Qt screens → sorted MSS
+                            qt_screens_sorted = sorted(
+                                QApplication.screens(),
+                                key=lambda s: (s.geometry().x(), s.geometry().y()))
+                            screen_idx = qt_screens_sorted.index(screen) \
+                                if screen in qt_screens_sorted else 0
+                            if screen_idx < len(mss_mons_sorted):
+                                mon = mss_mons_sorted[screen_idx]
+                                final_x = mon["left"] + phys_local_x
+                                final_y = mon["top"]  + phys_local_y
                 except Exception as ex:
-                    print(f"[PyshareX] Błąd przy parowaniu monitorów: {ex}")
+                    print(f"[PyshareX] Monitor matching error: {ex}")
 
                 self.region_selected.emit(final_x, final_y, phys_w, phys_h)
 
@@ -1309,11 +1429,14 @@ class RegionSelector(QWidget):
 def _emit_region_from_global_rect(r: QRect, signal):
     """
     Convert a global-logical QRect to physical MSS coordinates and emit
-    region_selected(x, y, w, h).  Uses exactly the same logic as
-    RegionSelector.mouseReleaseEvent so multi-monitor behaviour is identical.
+    region_selected(x, y, w, h).
+
+    Matching strategy: compare the Qt screen's physical top-left origin
+    (geometry * devicePixelRatio) against each MSS monitor's left/top.
+    This works correctly for all monitor layouts shown in the reference
+    diagram (Cases 1–6) including portrait monitors, negative-coordinate
+    layouts, mirrored variants, and 3-monitor setups (Case 5).
     """
-    # Find screen under the rect's top-left corner (more reliable than center
-    # when the selection spans a monitor boundary).
     screen = QApplication.screenAt(r.topLeft())
     if not screen:
         screen = QApplication.screenAt(r.center())
@@ -1323,35 +1446,46 @@ def _emit_region_from_global_rect(r: QRect, signal):
     ratio        = screen.devicePixelRatio()
     logical_geom = screen.geometry()
 
-    # Offset inside this screen (logical px)
+    # Offset of selection inside the owning screen (logical px)
     local_x = r.x() - logical_geom.x()
     local_y = r.y() - logical_geom.y()
 
-    # Convert to physical px
+    # Convert offset + size to physical px
     phys_local_x = int(local_x * ratio)
     phys_local_y = int(local_y * ratio)
     phys_w       = int(r.width()  * ratio)
     phys_h       = int(r.height() * ratio)
 
-    # Default (fallback) — may be wrong on mixed-DPI setups, overridden below
-    final_x = int(r.x() * ratio)
-    final_y = int(r.y() * ratio)
+    # Safe fallback — physical origin of this Qt screen + local offset
+    final_x = int(logical_geom.x() * ratio) + phys_local_x
+    final_y = int(logical_geom.y() * ratio) + phys_local_y
 
     try:
-        with mss.mss() as sct:
-            # Sort both lists by top-left so indices match
-            qt_screens = sorted(QApplication.screens(),
-                                key=lambda s: (s.geometry().x(), s.geometry().y()))
-            mss_mons   = sorted(sct.monitors[1:],
-                                key=lambda m: (m["left"], m["top"]))
-            if screen in qt_screens:
-                idx = qt_screens.index(screen)
-                if idx < len(mss_mons):
-                    mon     = mss_mons[idx]
+        with mss.MSS() as sct:
+            qt_phys_x = round(logical_geom.x() * ratio)
+            qt_phys_y = round(logical_geom.y() * ratio)
+            mss_mons_sorted = sorted(sct.monitors[1:],
+                                     key=lambda m: (m["left"], m["top"]))
+            matched = False
+            for mon in mss_mons_sorted:
+                if (abs(mon["left"] - qt_phys_x) <= 2 and
+                        abs(mon["top"]  - qt_phys_y) <= 2):
+                    final_x = mon["left"] + phys_local_x
+                    final_y = mon["top"]  + phys_local_y
+                    matched = True
+                    break
+            if not matched:
+                qt_screens_sorted = sorted(
+                    QApplication.screens(),
+                    key=lambda s: (s.geometry().x(), s.geometry().y()))
+                screen_idx = qt_screens_sorted.index(screen) \
+                    if screen in qt_screens_sorted else 0
+                if screen_idx < len(mss_mons_sorted):
+                    mon = mss_mons_sorted[screen_idx]
                     final_x = mon["left"] + phys_local_x
                     final_y = mon["top"]  + phys_local_y
     except Exception as ex:
-        print(f"[PyshareX] monitor mapping error: {ex}")
+        print(f"[PyshareX] Monitor matching error: {ex}")
 
     signal.emit(final_x, final_y, phys_w, phys_h)
 
@@ -3555,7 +3689,7 @@ class EnhancedRegionSelector(QWidget):
         # then convert physical→logical.
         logical_x, logical_y, logical_w, logical_h = x, y, w, h
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 qt_screens = sorted(QApplication.screens(),
                                     key=lambda s: (s.geometry().x(), s.geometry().y()))
                 mss_mons   = sorted(sct.monitors[1:],
@@ -4243,7 +4377,7 @@ class EnhancedRegionSelector(QWidget):
         # Convert physical MSS coords → logical global Qt rect
         logical_x, logical_y, logical_w, logical_h = x, y, w, h
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 qt_screens = sorted(QApplication.screens(),
                                     key=lambda s: (s.geometry().x(), s.geometry().y()))
                 mss_mons   = sorted(sct.monitors[1:],
@@ -4304,7 +4438,7 @@ class EnhancedRegionSelector(QWidget):
         final_y      = phys_y
 
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 qt_screens = sorted(QApplication.screens(),
                                     key=lambda s: (s.geometry().x(), s.geometry().y()))
                 mss_mons   = sorted(sct.monitors[1:],
@@ -4336,7 +4470,7 @@ class EnhancedRegionSelector(QWidget):
         # ── 3. Grab screenshot (widget already hidden — real screen visible) ───
         base_img = None
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 shot     = sct.grab({"left": final_x, "top": final_y,
                                      "width": phys_w, "height": phys_h})
                 base_img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
@@ -4701,23 +4835,99 @@ class CaptureEngine:
                     "Falling back — try EasyOCR or Tesseract in Settings.")
         reader = _get_paddleocr_reader()
         if reader is None:
-            return "PaddleOCR failed to initialize."
+            detail = f"\n\nError: {_paddleocr_init_error}" if _paddleocr_init_error else ""
+            return (
+                f"PaddleOCR failed to initialize.{detail}\n\n"
+                "Possible fixes:\n"
+                "  • Upgrade: pip install --upgrade paddlepaddle paddleocr\n"
+                "  • Or switch to EasyOCR in Settings → OCR engine."
+            )
         try:
-            results = reader.ocr(image_path, cls=True)
-            lines = []
-            for block in (results or []):
-                if block is None:
-                    continue
-                for line in block:
-                    if line and len(line) >= 2:
-                        text_info = line[1]
-                        if isinstance(text_info, (list, tuple)) and text_info:
-                            lines.append(str(text_info[0]))
-                        elif isinstance(text_info, str):
-                            lines.append(text_info)
-            return "\n".join(lines)
+            # On Linux CPUs without AVX (e.g. VirtualBox), PaddlePaddle may
+            # raise SIGILL (Illegal instruction). Catch broad Exception — the
+            # signal itself can't be caught in Python, but init-time errors can.
+            import signal as _signal
+            if IS_LINUX:
+                # Set a 15-second alarm so a hanging paddle call doesn't freeze the app
+                _signal.alarm(15)
+            # PaddleOCR expects BGR numpy array (same as OpenCV).
+            # Passing a file path triggers the OneDNN loader crash on Windows,
+            # so we always convert to BGR array first.
+            img_input = image_path  # fallback if numpy unavailable
+            try:
+                import numpy as _np
+                import cv2 as _cv2
+                img_input = _cv2.imdecode(
+                    _np.fromfile(image_path, dtype=_np.uint8), _cv2.IMREAD_COLOR
+                )  # result is BGR uint8 — exactly what PaddleOCR expects
+            except Exception:
+                try:
+                    import numpy as _np
+                    from PIL import Image as _PILImage
+                    _pil = _PILImage.open(image_path).convert("RGB")
+                    # PIL gives RGB → flip to BGR for PaddleOCR
+                    img_input = _np.array(_pil)[:, :, ::-1].copy()
+                except Exception:
+                    pass  # last resort: raw path
+
+            # PaddleOCR 3.x uses .predict(); 2.x uses .ocr()
+            if _paddleocr_api_version == "v3":
+                result_obj = reader.predict(img_input)
+                lines = []
+                for item in (result_obj or []):
+                    # PaddleX OCRResult behaves like a dict — access rec_texts directly
+                    try:
+                        texts = item["rec_texts"]
+                        if isinstance(texts, (list, tuple)):
+                            lines.extend([str(t) for t in texts if t])
+                        elif isinstance(texts, str) and texts:
+                            lines.append(texts)
+                        continue
+                    except (KeyError, TypeError):
+                        pass
+                    # Fallback: attribute access
+                    texts = getattr(item, "rec_texts", None)
+                    if isinstance(texts, (list, tuple)):
+                        lines.extend([str(t) for t in texts if t])
+                    elif isinstance(texts, str) and texts:
+                        lines.append(texts)
+                    else:
+                        # Last resort: legacy list of (box, (text, score))
+                        try:
+                            for line in item:
+                                if line and len(line) >= 2:
+                                    text_info = line[1]
+                                    if isinstance(text_info, (list, tuple)) and text_info:
+                                        lines.append(str(text_info[0]))
+                                    elif isinstance(text_info, str):
+                                        lines.append(text_info)
+                        except Exception:
+                            pass
+                return "\n".join(lines)
+            else:
+                # PaddleOCR 2.x
+                results = reader.ocr(img_input, cls=True)
+                lines = []
+                for block in (results or []):
+                    if block is None:
+                        continue
+                    for line in block:
+                        if line and len(line) >= 2:
+                            text_info = line[1]
+                            if isinstance(text_info, (list, tuple)) and text_info:
+                                lines.append(str(text_info[0]))
+                            elif isinstance(text_info, str):
+                                lines.append(text_info)
+                return "\n".join(lines)
         except Exception as e:
             return f"PaddleOCR error: {e}"
+        finally:
+            try:
+                import signal as _signal
+                if IS_LINUX:
+                    _signal.alarm(0)  # cancel alarm
+            except Exception:
+                pass
 
     def _ocr_easyocr(self, image_path: str) -> str:
         if not EASYOCR_AVAILABLE:
@@ -5260,6 +5470,79 @@ class _HotkeyEdit(QWidget):
         super().closeEvent(e)
 
 
+class OcrProgressDialog(QWidget):
+    """Small non-blocking progress window shown while OCR/QR is running.
+    Uses QWidget (not QDialog) to guarantee it never blocks the event loop."""
+    def __init__(self, message="Running OCR…", parent=None):
+        super().__init__(None,
+                         Qt.WindowType.Window |
+                         Qt.WindowType.WindowStaysOnTopHint |
+                         Qt.WindowType.FramelessWindowHint |
+                         Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        frame = QFrame()
+        frame.setObjectName("OcrProgressFrame")
+        frame.setStyleSheet("""
+            QFrame#OcrProgressFrame {
+                background: #1e1e2e;
+                border: 1px solid #45475a;
+                border-radius: 12px;
+            }
+            QLabel { color: #cdd6f4; font-size: 13px; background: transparent; }
+            QLabel#title_lbl { font-size: 15px; font-weight: bold; color: #89b4fa; }
+        """)
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(28, 22, 28, 22)
+        inner.setSpacing(12)
+
+        title = QLabel("⏳ Processing…")
+        title.setObjectName("title_lbl")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        inner.addWidget(title)
+
+        self._msg_lbl = QLabel(message)
+        self._msg_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._msg_lbl.setWordWrap(True)
+        inner.addWidget(self._msg_lbl)
+
+        # Animated dots
+        self._dot_timer = QTimer(self)
+        self._dot_timer.setInterval(400)
+        self._dots = 0
+        self._base_msg = message
+        self._dot_timer.timeout.connect(self._tick)
+        self._dot_timer.start()
+
+        outer.addWidget(frame)
+        self.setFixedWidth(340)
+        self.adjustSize()
+
+        # Centre on primary screen
+        sg = QApplication.primaryScreen().availableGeometry()
+        self.move(sg.center() - self.rect().center())
+
+    def set_message(self, msg: str):
+        self._base_msg = msg
+        self._msg_lbl.setText(msg)
+
+    def _tick(self):
+        self._dots = (self._dots + 1) % 4
+        self._msg_lbl.setText(self._base_msg + "." * self._dots)
+
+    def closeEvent(self, e):
+        self._dot_timer.stop()
+        super().closeEvent(e)
+
+    def close(self):
+        self._dot_timer.stop()
+        super().close()
+
+
 class OcrResultDialog(QDialog):
     def __init__(self, text, parent=None):
         super().__init__(parent)
@@ -5497,26 +5780,153 @@ class CropOverlayItem(QGraphicsRectItem):
 #  IMAGE EDITOR COMPONENTS (FIXED)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class EmptyCanvasDialog(QDialog):
+    """Dialog for creating a blank canvas with a chosen or custom size."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Empty Canvas")
+        self.setFixedWidth(480)
+        self._aspect_locked = False
+        self._updating = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        TEMPLATES = ["1920x1080 px", "1280x720 px", "1024x1024 px"]
+
+        # ── Template section: radio on its own row, combobox below ────────────
+        self._rb_template = QRadioButton("Select Template")
+        layout.addWidget(self._rb_template)
+
+        self._cb_template = QComboBox()
+        self._cb_template.addItems(TEMPLATES)
+        self._cb_template.setEnabled(False)
+        self._cb_template.setFixedHeight(32)
+        cb_row = QHBoxLayout()
+        cb_row.setContentsMargins(28, 0, 0, 0)
+        cb_row.addWidget(self._cb_template)
+        layout.addLayout(cb_row)
+
+        layout.addSpacing(6)
+
+        # ── Custom section: radio on its own row, inputs below ────────────────
+        self._rb_custom = QRadioButton("Custom Size:")
+        self._rb_custom.setChecked(True)
+        layout.addWidget(self._rb_custom)
+
+        self._sp_w = QSpinBox()
+        self._sp_w.setRange(1, 16000)
+        self._sp_w.setValue(800)
+        self._sp_w.setSuffix(" px")
+        self._sp_w.setFixedHeight(32)
+        self._sp_w.setKeyboardTracking(True)
+        self._sp_w.lineEdit().setReadOnly(False)
+
+        self._btn_chain = QPushButton("🔗")
+        self._btn_chain.setCheckable(True)
+        self._btn_chain.setFixedSize(32, 32)
+        self._btn_chain.setToolTip("Lock aspect ratio")
+        self._btn_chain.setStyleSheet(
+            "QPushButton { border: 1px solid #555; border-radius: 6px; font-size: 18px; padding: 0px; }"
+            "QPushButton:checked { background: #4a9eff; border-color: #4a9eff; }"
+        )
+
+        self._sp_h = QSpinBox()
+        self._sp_h.setRange(1, 16000)
+        self._sp_h.setValue(600)
+        self._sp_h.setSuffix(" px")
+        self._sp_h.setFixedHeight(32)
+        self._sp_h.setKeyboardTracking(True)
+        self._sp_h.lineEdit().setReadOnly(False)
+
+        inputs_row = QHBoxLayout()
+        inputs_row.setContentsMargins(28, 0, 0, 0)
+        inputs_row.addWidget(QLabel("W:"))
+        inputs_row.addWidget(self._sp_w, 1)
+        inputs_row.addWidget(self._btn_chain)
+        inputs_row.addWidget(QLabel("H:"))
+        inputs_row.addWidget(self._sp_h, 1)
+        layout.addLayout(inputs_row)
+
+        layout.addSpacing(8)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton("Create")
+        btn_ok.setFixedHeight(32)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setFixedHeight(32)
+        btn_ok.setDefault(True)
+        btn_box.addStretch()
+        btn_box.addWidget(btn_ok)
+        btn_box.addWidget(btn_cancel)
+        layout.addLayout(btn_box)
+
+        # ── Signals ───────────────────────────────────────────────────────────
+        self._rb_template.toggled.connect(self._on_mode_changed)
+        self._rb_custom.toggled.connect(self._on_mode_changed)
+        self._btn_chain.toggled.connect(self._on_chain_toggled)
+        self._sp_w.valueChanged.connect(self._on_w_changed)
+        self._sp_h.valueChanged.connect(self._on_h_changed)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _on_mode_changed(self):
+        template = self._rb_template.isChecked()
+        self._cb_template.setEnabled(template)
+        self._sp_w.setEnabled(not template)
+        self._sp_h.setEnabled(not template)
+        self._btn_chain.setEnabled(not template)
+
+    def _on_chain_toggled(self, locked):
+        self._aspect_locked = locked
+
+    def _on_w_changed(self, val):
+        if self._aspect_locked and not self._updating:
+            self._updating = True
+            self._sp_h.setValue(val)
+            self._updating = False
+
+    def _on_h_changed(self, val):
+        if self._aspect_locked and not self._updating:
+            self._updating = True
+            self._sp_w.setValue(val)
+            self._updating = False
+
+    def canvas_size(self):
+        """Return (width, height) based on current selection."""
+        if self._rb_template.isChecked():
+            text = self._cb_template.currentText()          # e.g. "1920x1080 px"
+            w, h = text.split(" ")[0].split("x")
+            return int(w), int(h)
+        return self._sp_w.value(), self._sp_h.value()
+
+
 class ImageEditorStartDialog(QDialog):
     def __init__(self, parent=None, default_dir=""):
         super().__init__(parent)
         self.setWindowTitle("Image Editor - Select Source")
-        self.setFixedSize(320, 180)
+        self.setFixedSize(320, 220)
         self.result_image = None
         self.default_dir = default_dir
-        
+
         layout = QVBoxLayout(self)
-        btn_file = QPushButton("📂 Open screenshot file")
+        btn_file      = QPushButton("📂 Open screenshot file")
         btn_clipboard = QPushButton("📋 Open screenshot from clipboard")
-        btn_web = QPushButton("🌐 Open image from web")
-        
+        btn_web       = QPushButton("🌐 Open image from web")
+        btn_empty     = QPushButton("⬜ Empty Canvas")
+
         btn_file.clicked.connect(self.open_file)
         btn_clipboard.clicked.connect(self.open_clipboard)
         btn_web.clicked.connect(self.open_web)
-        
+        btn_empty.clicked.connect(self.open_empty_canvas)
+
         layout.addWidget(btn_file)
         layout.addWidget(btn_clipboard)
         layout.addWidget(btn_web)
+        layout.addWidget(btn_empty)
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Image", self.default_dir, "Images (*.png *.jpg *.jpeg *.bmp)")
@@ -5542,9 +5952,19 @@ class ImageEditorStartDialog(QDialog):
                 if not pixmap.isNull():
                     self.result_image = pixmap
                     self.accept()
-                else: raise Exception("Invalid image")
+                else:
+                    raise Exception("Invalid image")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+    def open_empty_canvas(self):
+        dlg = EmptyCanvasDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            w, h = dlg.canvas_size()
+            img = QImage(w, h, QImage.Format.Format_ARGB32)
+            img.fill(Qt.GlobalColor.transparent)
+            self.result_image = QPixmap.fromImage(img)
+            self.accept()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ADVANCED IMAGE EDITOR COMPONENTS (WITH ZOOM, PAN, RESIZE & LIVE UPDATES)
@@ -7947,19 +8367,25 @@ class OcrQrToolboxDialog(QDialog):
         if w < 5 or h < 5:
             self.show(); return
 
+        mw = self.main_window
+        mw._prog_show_sig.emit("Capturing region…")
+
         def go():
             time.sleep(0.05)
-            path = self.main_window.engine.capture_region(x, y, w, h)
+            path = mw.engine.capture_region(x, y, w, h)
             if not path:
+                mw._prog_hide_sig.emit()
                 self._ocr_result_sig.emit("Failed to capture screen region.")
                 return
-            engine = self.main_window.config.get("ocr_engine", "paddleocr")
-            if engine == "paddleocr":
-                txt = self.main_window.engine._ocr_paddleocr(path)
-            elif engine == "easyocr":
-                txt = self.main_window.engine._ocr_easyocr(path)
+            engine_name = mw.config.get("ocr_engine", "paddleocr")
+            mw._prog_msg_sig.emit(f"Running {engine_name.upper()}…")
+            if engine_name == "paddleocr":
+                txt = mw.engine._ocr_paddleocr(path)
+            elif engine_name == "easyocr":
+                txt = mw.engine._ocr_easyocr(path)
             else:
-                txt = self.main_window.engine._ocr_tesseract(path)
+                txt = mw.engine._ocr_tesseract(path)
+            mw._prog_hide_sig.emit()
             self._ocr_result_sig.emit(txt)
 
         threading.Thread(target=go, daemon=True).start()
@@ -8071,6 +8497,9 @@ class MainWindow(QMainWindow):
     _notify_sig   = Signal(str, object)  # filepath — must run on main thread
     _ocr_done_sig = Signal(str, str)     # (tekst, tytul)
     _hotkey_sig   = Signal(str)          # method_name — dispatched from pynput thread
+    _prog_show_sig = Signal(str)         # show progress window with message
+    _prog_msg_sig  = Signal(str)         # update progress message
+    _prog_hide_sig = Signal()            # hide/close progress window
 
     def __init__(self, config: Config):
         super().__init__()
@@ -8089,6 +8518,10 @@ class MainWindow(QMainWindow):
         self._hkl        = None
         self._ocr_done_sig.connect(self._show_ocr)
         self._hotkey_sig.connect(self._dispatch_hotkey)
+        self._ocr_prog = None
+        self._prog_show_sig.connect(self._prog_show)
+        self._prog_msg_sig.connect(self._prog_msg)
+        self._prog_hide_sig.connect(self._prog_hide)
         self.last_rec_pixmap = None  # Tu będziemy trzymać miniaturkę
         self.setWindowTitle("PyshareX")
         self.setMinimumSize(780, 540)
@@ -9091,7 +9524,7 @@ class MainWindow(QMainWindow):
         self._bar = RecordingBar()
         # Robimy "zdjęcie" obszaru pod miniaturkę, zanim ruszy nagrywanie
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 # x, y, w, h to obszar fizyczny
                 mon = {"top": y, "left": x, "width": w, "height": h}
                 sct_img = sct.grab(mon)
@@ -9196,7 +9629,7 @@ class MainWindow(QMainWindow):
         self._gif_bar.stop_clicked.connect(self._stop_gif)
         self._gif_bar.abort_clicked.connect(self._abort_gif)
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 mon = {"top": y, "left": x, "width": w, "height": h}
                 sct_img = sct.grab(mon)
                 img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
@@ -9259,74 +9692,65 @@ class MainWindow(QMainWindow):
         self._sel.cancelled.connect(self.show_win)
 
     def _run_ocr(self, x, y, w, h):
-        # Sprawdzamy, czy obszar nie jest za mały (podobnie jak przy zwykłym screenshot'cie)
-        if w < 5 or h < 5: 
+        if w < 5 or h < 5:
             self.show_win()
             return
 
         self._status("⏳ Running OCR…")
+        self._prog_show_sig.emit("Capturing region…")
 
         def go():
-            # Używamy dokładnie takiego samego opóźnienia jak w klasycznym zrzucie (0.05s)
             time.sleep(0.05)
-            
-            # Bezpośrednio wywołujemy sprawdzoną i działającą metodę capture_region!
             path = self.engine.capture_region(x, y, w, h)
             if not path:
-                self._ocr_done_sig.emit("Nie udało się przechwycić ekranu.", "OCR Result")
+                self._prog_hide_sig.emit()
+                self._ocr_done_sig.emit("Failed to capture screen region.", "OCR Result")
                 return
-
-            # Mając już w 100% poprawny plik na dysku, wykonujemy na nim OCR
-            engine = self.config.get("ocr_engine", "paddleocr")
-            if engine == "paddleocr":
+            engine_name = self.config.get("ocr_engine", "paddleocr")
+            self._prog_msg_sig.emit(f"Running {engine_name.upper()}…")
+            if engine_name == "paddleocr":
                 txt = self.engine._ocr_paddleocr(path)
-            elif engine == "easyocr":
+            elif engine_name == "easyocr":
                 txt = self.engine._ocr_easyocr(path)
             else:
                 txt = self.engine._ocr_tesseract(path)
-
+            self._prog_hide_sig.emit()
             self._ocr_done_sig.emit(txt, "OCR Result")
 
         threading.Thread(target=go, daemon=True).start()
 
     def _run_qr(self, x, y, w, h):
-        if w < 5 or h < 5: 
+        if w < 5 or h < 5:
             self.show_win()
             return
 
         self._status("⏳ Scanning QR…")
+        self._prog_show_sig.emit("Capturing region…")
 
         def go():
             time.sleep(0.05)
-            
-            # Ponownie, używamy poprawnej metody capture_region
             path = self.engine.capture_region(x, y, w, h)
             if not path:
-                self._ocr_done_sig.emit("Nie udało się przechwycić ekranu.", "QR Code Result")
+                self._prog_hide_sig.emit()
+                self._ocr_done_sig.emit("Failed to capture screen region.", "QR Code Result")
                 return
-
             if not CV2_AVAILABLE:
-                self._ocr_done_sig.emit("Brak biblioteki OpenCV. (pip install opencv-python)", "QR Code Result")
+                self._prog_hide_sig.emit()
+                self._ocr_done_sig.emit("OpenCV not installed.\npip install opencv-python", "QR Code Result")
                 return
-                
+            self._prog_msg_sig.emit("Scanning QR code…")
             try:
                 import cv2
                 import numpy as np
-                
-                # Używamy cv2.imdecode z numpy - w przeciwieństwie do zwykłego cv2.imread, 
-                # to podejście bezbłędnie radzi sobie z polskimi znakami w ścieżkach Windowsa!
                 img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
                 detector = cv2.QRCodeDetector()
                 data, bbox, _ = detector.detectAndDecode(img)
-                
-                if data:
-                    result = data
-                else:
-                    result = "Nie wykryto kodu QR w zaznaczonym obszarze."
-                    
+                result = data if data else "No QR code detected in the selected region."
+                self._prog_hide_sig.emit()
                 self._ocr_done_sig.emit(result, "QR Code Result")
             except Exception as e:
-                self._ocr_done_sig.emit(f"Wystąpił błąd podczas dekodowania: {e}", "QR Code Result")
+                self._prog_hide_sig.emit()
+                self._ocr_done_sig.emit(f"QR decode error: {e}", "QR Code Result")
 
         threading.Thread(target=go, daemon=True).start()
     
@@ -9382,6 +9806,27 @@ class MainWindow(QMainWindow):
         # Powiadomienie (używa Twojej istniejącej metody powiadomień)
         self._on_notify(str(path), None)
     
+    def _prog_show(self, message: str):
+        """Create and show the progress widget on the main thread."""
+        if self._ocr_prog is not None:
+            try: self._ocr_prog.close()
+            except Exception: pass
+        self._ocr_prog = OcrProgressDialog(message)
+        self._ocr_prog.setStyleSheet(self.styleSheet())
+        self._ocr_prog.show()
+
+    def _prog_msg(self, message: str):
+        """Update progress message on the main thread."""
+        if self._ocr_prog is not None:
+            self._ocr_prog.set_message(message)
+
+    def _prog_hide(self):
+        """Close the progress widget on the main thread."""
+        if self._ocr_prog is not None:
+            try: self._ocr_prog.close()
+            except Exception: pass
+            self._ocr_prog = None
+
     def _show_ocr(self, txt, title="Result"):
         dlg = OcrResultDialog(txt, parent=None)
         dlg.setWindowTitle(title)
