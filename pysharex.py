@@ -1102,7 +1102,7 @@ def physical_to_logical_rect(phys_x, phys_y, phys_w, phys_h) -> QRect:
     from PySide6.QtCore import QRect
     
     # Sortujemy ekrany tak samo jak w RegionSelector, by indeksy się zgadzały
-    with mss.mss() as sct:
+    with mss.MSS() as sct:
         target_mon    = None
         target_screen = None
 
@@ -1386,7 +1386,7 @@ class RegionSelector(QWidget):
 
                 try:
                     import mss
-                    with mss.mss() as sct:
+                    with mss.MSS() as sct:
                         # Use _emit_region_from_global_rect logic — match by
                         # physical origin (geometry * ratio) not by list order,
                         # so all monitor layouts including mixed-DPI and 3+
@@ -1461,7 +1461,7 @@ def _emit_region_from_global_rect(r: QRect, signal):
     final_y = int(logical_geom.y() * ratio) + phys_local_y
 
     try:
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             qt_phys_x = round(logical_geom.x() * ratio)
             qt_phys_y = round(logical_geom.y() * ratio)
             mss_mons_sorted = sorted(sct.monitors[1:],
@@ -3689,7 +3689,7 @@ class EnhancedRegionSelector(QWidget):
         # then convert physical→logical.
         logical_x, logical_y, logical_w, logical_h = x, y, w, h
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 qt_screens = sorted(QApplication.screens(),
                                     key=lambda s: (s.geometry().x(), s.geometry().y()))
                 mss_mons   = sorted(sct.monitors[1:],
@@ -4377,7 +4377,7 @@ class EnhancedRegionSelector(QWidget):
         # Convert physical MSS coords → logical global Qt rect
         logical_x, logical_y, logical_w, logical_h = x, y, w, h
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 qt_screens = sorted(QApplication.screens(),
                                     key=lambda s: (s.geometry().x(), s.geometry().y()))
                 mss_mons   = sorted(sct.monitors[1:],
@@ -4438,7 +4438,7 @@ class EnhancedRegionSelector(QWidget):
         final_y      = phys_y
 
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 qt_screens = sorted(QApplication.screens(),
                                     key=lambda s: (s.geometry().x(), s.geometry().y()))
                 mss_mons   = sorted(sct.monitors[1:],
@@ -4470,7 +4470,7 @@ class EnhancedRegionSelector(QWidget):
         # ── 3. Grab screenshot (widget already hidden — real screen visible) ───
         base_img = None
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 shot     = sct.grab({"left": final_x, "top": final_y,
                                      "width": phys_w, "height": phys_h})
                 base_img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
@@ -9438,7 +9438,7 @@ class MainWindow(QMainWindow):
         self._bar = RecordingBar()
         # Robimy "zdjęcie" obszaru pod miniaturkę, zanim ruszy nagrywanie
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 # x, y, w, h to obszar fizyczny
                 mon = {"top": y, "left": x, "width": w, "height": h}
                 sct_img = sct.grab(mon)
@@ -9543,7 +9543,7 @@ class MainWindow(QMainWindow):
         self._gif_bar.stop_clicked.connect(self._stop_gif)
         self._gif_bar.abort_clicked.connect(self._abort_gif)
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 mon = {"top": y, "left": x, "width": w, "height": h}
                 sct_img = sct.grab(mon)
                 img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
