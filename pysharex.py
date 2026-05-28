@@ -160,6 +160,9 @@ def _get_paddleocr_reader():
         if _paddleocr_reader is None:
             _paddleocr_init_error = str(last_err)
             print(f"PaddleOCR init error: {last_err}")
+            if IS_LINUX:
+                print("[PyshareX] PaddleOCR may crash on Linux VMs or CPUs without AVX. "
+                      "Switch to EasyOCR in Settings → OCR engine.")
     return _paddleocr_reader
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -4840,6 +4843,13 @@ class CaptureEngine:
                 "  • Or switch to EasyOCR in Settings → OCR engine."
             )
         try:
+            # On Linux CPUs without AVX (e.g. VirtualBox), PaddlePaddle may
+            # raise SIGILL (Illegal instruction). Catch broad Exception — the
+            # signal itself can't be caught in Python, but init-time errors can.
+            import signal as _signal
+            if IS_LINUX:
+                # Set a 15-second alarm so a hanging paddle call doesn't freeze the app
+                _signal.alarm(15)
             # PaddleOCR expects BGR numpy array (same as OpenCV).
             # Passing a file path triggers the OneDNN loader crash on Windows,
             # so we always convert to BGR array first.
@@ -4911,6 +4921,13 @@ class CaptureEngine:
                 return "\n".join(lines)
         except Exception as e:
             return f"PaddleOCR error: {e}"
+        finally:
+            try:
+                import signal as _signal
+                if IS_LINUX:
+                    _signal.alarm(0)  # cancel alarm
+            except Exception:
+                pass
 
     def _ocr_easyocr(self, image_path: str) -> str:
         if not EASYOCR_AVAILABLE:
