@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu, QFileDialog, QDialog, QLineEdit,
     QComboBox, QCheckBox, QGroupBox, QScrollArea, QFrame,
     QMessageBox, QListWidget, QListWidgetItem,
-    QDialogButtonBox, QSpinBox, QTabWidget,
+    QDialogButtonBox, QSpinBox, QTabWidget, QRadioButton,
     QTextEdit, QSizePolicy, QStackedWidget, QColorDialog, QInputDialog,
     QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsRectItem,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem
@@ -1020,40 +1020,51 @@ def physical_to_logical_rect(phys_x, phys_y, phys_w, phys_h) -> QRect:
     from PySide6.QtCore import QRect
     
     # Sortujemy ekrany tak samo jak w RegionSelector, by indeksy się zgadzały
-    qt_screens = sorted(QApplication.screens(), key=lambda s: (s.geometry().x(), s.geometry().y()))
-    
     with mss.mss() as sct:
-        # Sortujemy monitory fizyczne
-        mss_mons = sorted(sct.monitors[1:], key=lambda m: (m["left"], m["top"]))
-        
+        target_mon    = None
         target_screen = None
-        target_mon = None
-        
-        # Znajdujemy, na którym monitorze fizycznym znajduje się punkt startowy
-        for q_scr, m_mon in zip(qt_screens, mss_mons):
-            if (m_mon["left"] <= phys_x < m_mon["left"] + m_mon["width"] and
-                m_mon["top"] <= phys_y < m_mon["top"] + m_mon["height"]):
-                target_screen = q_scr
-                target_mon = m_mon
-                break
-        
-        if not target_screen:
-            target_screen = QApplication.primaryScreen()
-            target_mon = mss_mons[0] if mss_mons else {"left": 0, "top": 0}
 
-        ratio = target_screen.devicePixelRatio()
+        # Find MSS monitor containing the physical point, then find the
+        # matching Qt screen by physical-origin comparison (not by index).
+        # This handles all layouts including portrait monitors (Case 1/3),
+        # mirrored variants, and 3+ monitor setups (Case 5).
+        for mon in sct.monitors[1:]:
+            if (mon["left"] <= phys_x < mon["left"] + mon["width"] and
+                    mon["top"]  <= phys_y < mon["top"]  + mon["height"]):
+                target_mon = mon
+                break
+
+        if target_mon is None:
+            # Point is outside all monitors — use primary as fallback
+            target_mon    = sct.monitors[1] if len(sct.monitors) > 1 else {"left": 0, "top": 0, "width": 1920, "height": 1080}
+            target_screen = QApplication.primaryScreen()
+
+        if target_screen is None:
+            # Match Qt screen whose physical origin equals target_mon's origin
+            for q_scr in QApplication.screens():
+                lg  = q_scr.geometry()
+                dpr = q_scr.devicePixelRatio()
+                qpx = round(lg.x() * dpr)
+                qpy = round(lg.y() * dpr)
+                if abs(qpx - target_mon["left"]) <= 2 and abs(qpy - target_mon["top"]) <= 2:
+                    target_screen = q_scr
+                    break
+
+        if target_screen is None:
+            target_screen = QApplication.primaryScreen()
+
+        ratio        = target_screen.devicePixelRatio()
         logical_geom = target_screen.geometry()
-        
-        # Obliczamy pozycję wewnątrz monitora (fizyczną) i zamieniamy na logiczną
+
+        # Physical offset inside the owning monitor → logical offset
         local_phys_x = phys_x - target_mon["left"]
         local_phys_y = phys_y - target_mon["top"]
-        
+
         local_log_x = local_phys_x / ratio
         local_log_y = local_phys_y / ratio
-        log_w = phys_w / ratio
-        log_h = phys_h / ratio
-        
-        # Dodajemy offset monitora w układzie Qt
+        log_w       = phys_w / ratio
+        log_h       = phys_h / ratio
+
         return QRect(
             int(logical_geom.x() + local_log_x),
             int(logical_geom.y() + local_log_y),
@@ -1266,38 +1277,49 @@ class RegionSelector(QWidget):
             r = QRect(self.global_start, self.global_end).normalized()
 
             if r.width() > 0 and r.height() > 0:
-                screen = QApplication.screenAt(r.center())
+                # Use topLeft for screen detection — more reliable than center
+                # when selection starts near a monitor boundary.
+                screen = QApplication.screenAt(r.topLeft())
+                if not screen:
+                    screen = QApplication.screenAt(r.center())
                 if not screen:
                     screen = QApplication.primaryScreen()
-                
-                ratio = screen.devicePixelRatio()
+
+                ratio        = screen.devicePixelRatio()
                 logical_geom = screen.geometry()
-                
+
+                # Offset of selection inside the owning screen (logical px)
                 local_x = r.x() - logical_geom.x()
                 local_y = r.y() - logical_geom.y()
-                
-                phys_w = int(r.width() * ratio)
-                phys_h = int(r.height() * ratio)
+
+                # Convert offset + size to physical px
                 phys_local_x = int(local_x * ratio)
                 phys_local_y = int(local_y * ratio)
-                
-                final_x = int(r.x() * ratio) 
-                final_y = int(r.y() * ratio)
-                
+                phys_w       = int(r.width()  * ratio)
+                phys_h       = int(r.height() * ratio)
+
+                # Safe fallback (used only when MSS matching fails)
+                final_x = int(logical_geom.x() * ratio) + phys_local_x
+                final_y = int(logical_geom.y() * ratio) + phys_local_y
+
                 try:
                     import mss
                     with mss.mss() as sct:
-                        qt_screens = sorted(QApplication.screens(), key=lambda s: (s.geometry().x(), s.geometry().y()))
-                        mss_mons = sorted(sct.monitors[1:], key=lambda m: (m["left"], m["top"]))
-                        
-                        if screen in qt_screens:
-                            screen_idx = qt_screens.index(screen)
-                            if screen_idx < len(mss_mons):
-                                target_mon = mss_mons[screen_idx]
-                                final_x = target_mon["left"] + phys_local_x
-                                final_y = target_mon["top"]  + phys_local_y
+                        # Match Qt screen → MSS monitor by comparing their
+                        # physical top-left origins, not by sort-order index.
+                        # This is robust for all layouts including Case 1/3
+                        # (portrait monitor on the left/right) and Case 5
+                        # (3+ monitors), as well as their mirrored variants.
+                        qt_phys_x = round(logical_geom.x() * ratio)
+                        qt_phys_y = round(logical_geom.y() * ratio)
+                        for mon in sct.monitors[1:]:
+                            if (abs(mon["left"] - qt_phys_x) <= 2 and
+                                    abs(mon["top"]  - qt_phys_y) <= 2):
+                                final_x = mon["left"] + phys_local_x
+                                final_y = mon["top"]  + phys_local_y
+                                break
                 except Exception as ex:
-                    print(f"[PyshareX] Błąd przy parowaniu monitorów: {ex}")
+                    print(f"[PyshareX] Monitor matching error: {ex}")
 
                 self.region_selected.emit(final_x, final_y, phys_w, phys_h)
 
@@ -1309,11 +1331,14 @@ class RegionSelector(QWidget):
 def _emit_region_from_global_rect(r: QRect, signal):
     """
     Convert a global-logical QRect to physical MSS coordinates and emit
-    region_selected(x, y, w, h).  Uses exactly the same logic as
-    RegionSelector.mouseReleaseEvent so multi-monitor behaviour is identical.
+    region_selected(x, y, w, h).
+
+    Matching strategy: compare the Qt screen's physical top-left origin
+    (geometry * devicePixelRatio) against each MSS monitor's left/top.
+    This works correctly for all monitor layouts shown in the reference
+    diagram (Cases 1–6) including portrait monitors, negative-coordinate
+    layouts, mirrored variants, and 3-monitor setups (Case 5).
     """
-    # Find screen under the rect's top-left corner (more reliable than center
-    # when the selection spans a monitor boundary).
     screen = QApplication.screenAt(r.topLeft())
     if not screen:
         screen = QApplication.screenAt(r.center())
@@ -1323,35 +1348,35 @@ def _emit_region_from_global_rect(r: QRect, signal):
     ratio        = screen.devicePixelRatio()
     logical_geom = screen.geometry()
 
-    # Offset inside this screen (logical px)
+    # Offset of selection inside the owning screen (logical px)
     local_x = r.x() - logical_geom.x()
     local_y = r.y() - logical_geom.y()
 
-    # Convert to physical px
+    # Convert offset + size to physical px
     phys_local_x = int(local_x * ratio)
     phys_local_y = int(local_y * ratio)
     phys_w       = int(r.width()  * ratio)
     phys_h       = int(r.height() * ratio)
 
-    # Default (fallback) — may be wrong on mixed-DPI setups, overridden below
-    final_x = int(r.x() * ratio)
-    final_y = int(r.y() * ratio)
+    # Safe fallback — physical origin of this Qt screen + local offset
+    final_x = int(logical_geom.x() * ratio) + phys_local_x
+    final_y = int(logical_geom.y() * ratio) + phys_local_y
 
     try:
         with mss.mss() as sct:
-            # Sort both lists by top-left so indices match
-            qt_screens = sorted(QApplication.screens(),
-                                key=lambda s: (s.geometry().x(), s.geometry().y()))
-            mss_mons   = sorted(sct.monitors[1:],
-                                key=lambda m: (m["left"], m["top"]))
-            if screen in qt_screens:
-                idx = qt_screens.index(screen)
-                if idx < len(mss_mons):
-                    mon     = mss_mons[idx]
+            # Match by physical origin instead of sort-order index so that
+            # any arrangement of monitors (including mirrored Case 1 / Case 3
+            # and mixed-DPI setups) is handled correctly.
+            qt_phys_x = round(logical_geom.x() * ratio)
+            qt_phys_y = round(logical_geom.y() * ratio)
+            for mon in sct.monitors[1:]:
+                if (abs(mon["left"] - qt_phys_x) <= 2 and
+                        abs(mon["top"]  - qt_phys_y) <= 2):
                     final_x = mon["left"] + phys_local_x
                     final_y = mon["top"]  + phys_local_y
+                    break
     except Exception as ex:
-        print(f"[PyshareX] monitor mapping error: {ex}")
+        print(f"[PyshareX] Monitor matching error: {ex}")
 
     signal.emit(final_x, final_y, phys_w, phys_h)
 
@@ -5497,26 +5522,153 @@ class CropOverlayItem(QGraphicsRectItem):
 #  IMAGE EDITOR COMPONENTS (FIXED)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class EmptyCanvasDialog(QDialog):
+    """Dialog for creating a blank canvas with a chosen or custom size."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Empty Canvas")
+        self.setFixedWidth(480)
+        self._aspect_locked = False
+        self._updating = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        TEMPLATES = ["1920x1080 px", "1280x720 px", "1024x1024 px"]
+
+        # ── Template section: radio on its own row, combobox below ────────────
+        self._rb_template = QRadioButton("Select Template")
+        layout.addWidget(self._rb_template)
+
+        self._cb_template = QComboBox()
+        self._cb_template.addItems(TEMPLATES)
+        self._cb_template.setEnabled(False)
+        self._cb_template.setFixedHeight(32)
+        cb_row = QHBoxLayout()
+        cb_row.setContentsMargins(28, 0, 0, 0)
+        cb_row.addWidget(self._cb_template)
+        layout.addLayout(cb_row)
+
+        layout.addSpacing(6)
+
+        # ── Custom section: radio on its own row, inputs below ────────────────
+        self._rb_custom = QRadioButton("Custom Size:")
+        self._rb_custom.setChecked(True)
+        layout.addWidget(self._rb_custom)
+
+        self._sp_w = QSpinBox()
+        self._sp_w.setRange(1, 16000)
+        self._sp_w.setValue(800)
+        self._sp_w.setSuffix(" px")
+        self._sp_w.setFixedHeight(32)
+        self._sp_w.setKeyboardTracking(True)
+        self._sp_w.lineEdit().setReadOnly(False)
+
+        self._btn_chain = QPushButton("🔗")
+        self._btn_chain.setCheckable(True)
+        self._btn_chain.setFixedSize(32, 32)
+        self._btn_chain.setToolTip("Lock aspect ratio")
+        self._btn_chain.setStyleSheet(
+            "QPushButton { border: 1px solid #555; border-radius: 6px; font-size: 18px; padding: 0px; }"
+            "QPushButton:checked { background: #4a9eff; border-color: #4a9eff; }"
+        )
+
+        self._sp_h = QSpinBox()
+        self._sp_h.setRange(1, 16000)
+        self._sp_h.setValue(600)
+        self._sp_h.setSuffix(" px")
+        self._sp_h.setFixedHeight(32)
+        self._sp_h.setKeyboardTracking(True)
+        self._sp_h.lineEdit().setReadOnly(False)
+
+        inputs_row = QHBoxLayout()
+        inputs_row.setContentsMargins(28, 0, 0, 0)
+        inputs_row.addWidget(QLabel("W:"))
+        inputs_row.addWidget(self._sp_w, 1)
+        inputs_row.addWidget(self._btn_chain)
+        inputs_row.addWidget(QLabel("H:"))
+        inputs_row.addWidget(self._sp_h, 1)
+        layout.addLayout(inputs_row)
+
+        layout.addSpacing(8)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton("Create")
+        btn_ok.setFixedHeight(32)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setFixedHeight(32)
+        btn_ok.setDefault(True)
+        btn_box.addStretch()
+        btn_box.addWidget(btn_ok)
+        btn_box.addWidget(btn_cancel)
+        layout.addLayout(btn_box)
+
+        # ── Signals ───────────────────────────────────────────────────────────
+        self._rb_template.toggled.connect(self._on_mode_changed)
+        self._rb_custom.toggled.connect(self._on_mode_changed)
+        self._btn_chain.toggled.connect(self._on_chain_toggled)
+        self._sp_w.valueChanged.connect(self._on_w_changed)
+        self._sp_h.valueChanged.connect(self._on_h_changed)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _on_mode_changed(self):
+        template = self._rb_template.isChecked()
+        self._cb_template.setEnabled(template)
+        self._sp_w.setEnabled(not template)
+        self._sp_h.setEnabled(not template)
+        self._btn_chain.setEnabled(not template)
+
+    def _on_chain_toggled(self, locked):
+        self._aspect_locked = locked
+
+    def _on_w_changed(self, val):
+        if self._aspect_locked and not self._updating:
+            self._updating = True
+            self._sp_h.setValue(val)
+            self._updating = False
+
+    def _on_h_changed(self, val):
+        if self._aspect_locked and not self._updating:
+            self._updating = True
+            self._sp_w.setValue(val)
+            self._updating = False
+
+    def canvas_size(self):
+        """Return (width, height) based on current selection."""
+        if self._rb_template.isChecked():
+            text = self._cb_template.currentText()          # e.g. "1920x1080 px"
+            w, h = text.split(" ")[0].split("x")
+            return int(w), int(h)
+        return self._sp_w.value(), self._sp_h.value()
+
+
 class ImageEditorStartDialog(QDialog):
     def __init__(self, parent=None, default_dir=""):
         super().__init__(parent)
         self.setWindowTitle("Image Editor - Select Source")
-        self.setFixedSize(320, 180)
+        self.setFixedSize(320, 220)
         self.result_image = None
         self.default_dir = default_dir
-        
+
         layout = QVBoxLayout(self)
-        btn_file = QPushButton("📂 Open screenshot file")
+        btn_file      = QPushButton("📂 Open screenshot file")
         btn_clipboard = QPushButton("📋 Open screenshot from clipboard")
-        btn_web = QPushButton("🌐 Open image from web")
-        
+        btn_web       = QPushButton("🌐 Open image from web")
+        btn_empty     = QPushButton("⬜ Empty Canvas")
+
         btn_file.clicked.connect(self.open_file)
         btn_clipboard.clicked.connect(self.open_clipboard)
         btn_web.clicked.connect(self.open_web)
-        
+        btn_empty.clicked.connect(self.open_empty_canvas)
+
         layout.addWidget(btn_file)
         layout.addWidget(btn_clipboard)
         layout.addWidget(btn_web)
+        layout.addWidget(btn_empty)
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Image", self.default_dir, "Images (*.png *.jpg *.jpeg *.bmp)")
@@ -5542,9 +5694,19 @@ class ImageEditorStartDialog(QDialog):
                 if not pixmap.isNull():
                     self.result_image = pixmap
                     self.accept()
-                else: raise Exception("Invalid image")
+                else:
+                    raise Exception("Invalid image")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+    def open_empty_canvas(self):
+        dlg = EmptyCanvasDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            w, h = dlg.canvas_size()
+            img = QImage(w, h, QImage.Format.Format_ARGB32)
+            img.fill(Qt.GlobalColor.transparent)
+            self.result_image = QPixmap.fromImage(img)
+            self.accept()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ADVANCED IMAGE EDITOR COMPONENTS (WITH ZOOM, PAN, RESIZE & LIVE UPDATES)
