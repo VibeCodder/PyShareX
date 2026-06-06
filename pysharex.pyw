@@ -1122,15 +1122,24 @@ def physical_to_logical_rect(phys_x, phys_y, phys_w, phys_h) -> QRect:
             target_screen = QApplication.primaryScreen()
 
         if target_screen is None:
-            # Match Qt screen whose physical origin equals target_mon's origin
+            # Match Qt screen whose physical origin equals target_mon's origin.
+            # Use a wider tolerance (8 px) to handle rounding differences in
+            # mixed-DPI setups with 3+ monitors where the center monitor's
+            # logical x * DPR may not land exactly on the MSS left value.
+            best_screen = None
+            best_dist   = 9999
             for q_scr in QApplication.screens():
                 lg  = q_scr.geometry()
                 dpr = q_scr.devicePixelRatio()
                 qpx = round(lg.x() * dpr)
                 qpy = round(lg.y() * dpr)
-                if abs(qpx - target_mon["left"]) <= 2 and abs(qpy - target_mon["top"]) <= 2:
-                    target_screen = q_scr
-                    break
+                dist = abs(qpx - target_mon["left"]) + abs(qpy - target_mon["top"])
+                if dist < best_dist:
+                    best_dist   = dist
+                    best_screen = q_scr
+            # Accept the closest match within 16 px to avoid picking a wrong monitor
+            if best_dist <= 16:
+                target_screen = best_screen
 
         if target_screen is None:
             target_screen = QApplication.primaryScreen()
@@ -1162,23 +1171,99 @@ class RecordingBorder(QWidget):
                          Qt.WindowType.WindowStaysOnTopHint |
                          Qt.WindowType.Tool |
                          Qt.WindowType.BypassWindowManagerHint)
-        
-        # PRZELICZENIE TUTAJ:
-        rect = physical_to_logical_rect(phys_x, phys_y, phys_w, phys_h)
-        
-        B = 5 # Zwiększamy margines bezpieczeństwa
+
+        # Convert physical MSS coords → logical Qt coords for window placement.
+        # We find the Qt screen whose physical origin is closest to (phys_x, phys_y)
+        # using a best-match search rather than exact equality, which avoids the
+        # "border appears on wrong monitor" bug in 3-monitor setups where rounding
+        # differences cause physical_to_logical_rect to pick the wrong screen.
+        rect = self._phys_to_logical(phys_x, phys_y, phys_w, phys_h)
+
+        B = 5  # border margin in logical px
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        # ... reszta atrybutów ...
-        
-        # Przesuwamy ramkę o 2-3 piksele na zewnątrz (odejmując od X/Y i dodając do W/H)
+
+        # Expand border slightly outside the recorded area
         self.setGeometry(rect.x() - B, rect.y() - B, rect.width() + B * 2, rect.height() + B * 2)
-        
+
         self._dash = 0
         t = QTimer(self)
         t.timeout.connect(self._tick)
         t.start(80)
         self._t = t
         self.show()
+
+    @staticmethod
+    def _phys_to_logical(phys_x, phys_y, phys_w, phys_h) -> QRect:
+        """Convert physical MSS pixel rect to logical Qt window coords.
+
+        On Windows with per-monitor DPI, Qt geometry().x() does NOT equal
+        mss_left / dpr — Qt uses its own logical coordinate space that does
+        not simply divide physical coords by a single ratio.
+
+        The only reliable approach: use QApplication.screenAt() which accepts
+        logical Qt coordinates. We find the primary screen's DPR and use it
+        to get a rough logical point, call screenAt() to find the right screen,
+        then use that screen's geometry + its true DPR (mss_w / qt_w) to
+        compute the final accurate logical rect.
+        """
+        try:
+            with mss.MSS() as sct:
+                mss_mons = sct.monitors[1:]
+
+                # Step 1: find the MSS monitor containing the physical point
+                owner_mon = None
+                for mon in mss_mons:
+                    if (mon["left"] <= phys_x < mon["left"] + mon["width"] and
+                            mon["top"]  <= phys_y < mon["top"]  + mon["height"]):
+                        owner_mon = mon
+                        break
+                if owner_mon is None:
+                    owner_mon = mss_mons[0] if mss_mons else {
+                        "left": 0, "top": 0, "width": 1920, "height": 1080}
+
+                # Step 2: find the primary screen's DPR to get a rough logical pt
+                primary = QApplication.primaryScreen()
+                primary_dpr = primary.devicePixelRatio() if primary else 1.0
+
+                # Step 3: convert physical point to a rough logical point using
+                # primary DPR, then ask Qt which screen owns that point
+                rough_lx = phys_x / primary_dpr
+                rough_ly = phys_y / primary_dpr
+                owner_qt = QApplication.screenAt(QPoint(int(rough_lx), int(rough_ly)))
+                if owner_qt is None:
+                    owner_qt = primary
+
+                # Step 4: compute true DPR for this specific monitor from sizes
+                lg = owner_qt.geometry()
+                if lg.width() > 0 and lg.height() > 0:
+                    true_dpr = (owner_mon["width"] / lg.width() +
+                                owner_mon["height"] / lg.height()) / 2.0
+                else:
+                    true_dpr = primary_dpr
+
+                # Step 5: local offset inside the monitor in physical px → logical
+                local_phys_x = phys_x - owner_mon["left"]
+                local_phys_y = phys_y - owner_mon["top"]
+                local_log_x  = local_phys_x / true_dpr
+                local_log_y  = local_phys_y / true_dpr
+                log_w        = phys_w / true_dpr
+                log_h        = phys_h / true_dpr
+
+                result = QRect(
+                    int(lg.x() + local_log_x),
+                    int(lg.y() + local_log_y),
+                    int(log_w),
+                    int(log_h)
+                )
+                print(f"[RecordingBorder] phys({phys_x},{phys_y},{phys_w},{phys_h})"
+                      f" own_mon=({owner_mon['left']},{owner_mon['top']})"
+                      f" qt_geo={lg} true_dpr={true_dpr:.3f}"
+                      f" → logical={result}")
+                return result
+
+        except Exception as e:
+            print(f"[RecordingBorder] coord conversion error: {e}")
+            return QRect(phys_x, phys_y, phys_w, phys_h)
 
     def _tick(self):
         self._dash = (self._dash + 2) % 20
@@ -1244,13 +1329,15 @@ class RecordingBar(QWidget):
     def start_display(self, region=None):
         self._et.start(); self._tt.start(500)
         if region:
+            # region is in physical MSS pixels — convert to logical Qt coords
+            # before calling move(), which works in logical pixels.
             rx, ry, rw, rh = region
-            # Position bar at bottom-center of the recorded region
-            bx = rx + rw // 2 - self.width() // 2
-            by = ry + rh - self.height() - 8
-            # Clamp to visible area
+            log_rect = RecordingBorder._phys_to_logical(rx, ry, rw, rh)
+            bx = log_rect.x() + log_rect.width() // 2 - self.width() // 2
+            by = log_rect.y() + log_rect.height() - self.height() - 8
+            # Clamp to the virtual desktop so bar stays fully visible
             sg = QApplication.primaryScreen().availableVirtualGeometry()
-            bx = max(sg.left(), min(bx, sg.right() - self.width()))
+            bx = max(sg.left(), min(bx, sg.right()  - self.width()))
             by = max(sg.top(),  min(by, sg.bottom() - self.height()))
             self.move(bx, by)
         else:
@@ -2864,6 +2951,7 @@ class EnhancedRegionSelector(QWidget):
     region_selected = Signal(int, int, int, int)
     cancelled       = Signal()
     _esc_sig        = Signal()  # emitted from pynput thread, handled on main thread
+    _close_sig      = Signal()  # emitted from background thread, closes overlay on main thread
 
     TOOL_DETECT    = "detect"
     TOOL_SELECT    = "select"
@@ -2964,6 +3052,7 @@ class EnhancedRegionSelector(QWidget):
         # the window isn't active yet at __init__ time, so ESC wouldn't fire
         # until the user clicked, which finally made Qt the active window).
         self._esc_sig.connect(self._esc_pressed)
+        self._close_sig.connect(self.close)
         QTimer.singleShot(150, self._activate_and_grab)
         QTimer.singleShot(80, self._update_detection_at_cursor)
 
@@ -3150,7 +3239,7 @@ class EnhancedRegionSelector(QWidget):
             QPushButton:hover   { background: #45475a; }
             QPushButton#captureBtn {
                 background: #1e6e1e; border: 2px solid #4caf50;
-                min-width: 80px; max-width: 80px; font-size: 13px;
+                min-width: 110px; max-width: 110px; font-size: 13px;
             }
             QPushButton#captureBtn:hover { background: #2e9e2e; }
             QPushButton#colorPickerBtn {
@@ -3298,13 +3387,45 @@ class EnhancedRegionSelector(QWidget):
 
         lay.addSpacing(6)
 
-        # ── 📷 Capture button (shown only in annotation / draw modes) ─────────
-        self._capture_btn = QPushButton("📷 Capture")
+        # ── 📷 Capture button — hover shows dropdown menu ─────────────────────
+        class _CaptureMenuBtn(QPushButton):
+            """Capture button that pops a dropdown on hover and on click."""
+            def __init__(self, owner, parent=None):
+                super().__init__("📷 Capture ▾", parent)
+                self._owner = owner
+
+            def _show_menu(self):
+                menu = QMenu(self)
+                menu.setStyleSheet("""
+                    QMenu {
+                        background: #1e1e2e; color: #cdd6f4;
+                        border: 1px solid #45475a; border-radius: 6px;
+                        padding: 4px 0px;
+                    }
+                    QMenu::item { padding: 6px 18px; font-size: 13px; }
+                    QMenu::item:selected { background: #313264; }
+                """)
+                menu.addAction("Region",          self._owner._capture_with_annotations)
+                menu.addAction("Current monitor", self._owner._capture_current_monitor)
+                menu.addAction("All monitors",    self._owner._capture_all_monitors)
+                # Show menu directly below the button
+                gpos = self.mapToGlobal(self.rect().bottomLeft())
+                menu.exec(gpos)
+
+            def enterEvent(self, event):
+                self._show_menu()
+                super().enterEvent(event)
+
+            def mousePressEvent(self, event):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._show_menu()
+                else:
+                    super().mousePressEvent(event)
+
+        self._capture_btn = _CaptureMenuBtn(self)
         self._capture_btn.setObjectName("captureBtn")
-        self._capture_btn.setToolTip(
-            "Capture the last detected / dragged region together with annotations")
-        self._capture_btn.clicked.connect(self._capture_with_annotations)
-        self._capture_btn.show()   # always visible — detection mode is disabled
+        self._capture_btn.setToolTip("Capture options")
+        self._capture_btn.show()
         lay.addWidget(self._capture_btn)
 
         bar.adjustSize()
@@ -3657,6 +3778,75 @@ class EnhancedRegionSelector(QWidget):
         self._current_tool = "_capture_select"
         self.grabKeyboard()
 
+    def _capture_current_monitor(self):
+        """Capture the monitor under the cursor with canvas annotations.
+        Hides toolbar + dim overlay, grabs via MSS (canvas still visible),
+        then closes the overlay and notifies the main window."""
+        self._toolbar.hide()
+        self._hide_bg = True
+        self.update()
+        QApplication.processEvents()
+
+        def _do():
+            time.sleep(0.15)   # let toolbar + dim layer repaint disappear
+            path = None
+            try:
+                cx, cy = QCursor.pos().x(), QCursor.pos().y()
+                with mss.MSS() as sct:
+                    target = sct.monitors[1]
+                    for m in sct.monitors[1:]:
+                        if (m["left"] <= cx < m["left"] + m["width"] and
+                                m["top"] <= cy < m["top"] + m["height"]):
+                            target = m
+                            break
+                    shot = sct.grab(target)
+                    img  = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                for _w in QApplication.topLevelWidgets():
+                    if hasattr(_w, "engine") and hasattr(_w.engine, "_save"):
+                        path = _w.engine._save(img, "monitor")
+                        break
+            except Exception as ex:
+                print(f"[PyshareX] capture_current_monitor error: {ex}")
+            self._close_sig.emit()
+            if path:
+                for _w in QApplication.topLevelWidgets():
+                    if hasattr(_w, "_notify_sig"):
+                        _w._notify_sig.emit(path, None)
+                        break
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _capture_all_monitors(self):
+        """Capture all monitors as one combined image with canvas annotations.
+        Hides toolbar + dim overlay, grabs via MSS (canvas still visible),
+        then closes the overlay and notifies the main window."""
+        self._toolbar.hide()
+        self._hide_bg = True
+        self.update()
+        QApplication.processEvents()
+
+        def _do():
+            time.sleep(0.15)   # let toolbar + dim layer repaint disappear
+            path = None
+            try:
+                with mss.MSS() as sct:
+                    shot = sct.grab(sct.monitors[0])  # index 0 = all monitors combined
+                    img  = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                for _w in QApplication.topLevelWidgets():
+                    if hasattr(_w, "engine") and hasattr(_w.engine, "_save"):
+                        path = _w.engine._save(img, "fullscreen")
+                        break
+            except Exception as ex:
+                print(f"[PyshareX] capture_all_monitors error: {ex}")
+            self._close_sig.emit()
+            if path:
+                for _w in QApplication.topLevelWidgets():
+                    if hasattr(_w, "_notify_sig"):
+                        _w._notify_sig.emit(path, None)
+                        break
+
+        threading.Thread(target=_do, daemon=True).start()
+
     def _open_sub_selector(self):
         """Unused — kept for compatibility."""
         pass
@@ -3732,7 +3922,9 @@ class EnhancedRegionSelector(QWidget):
         # ── Draw inline capture selection rectangle ────────────────────────────
         if (self._current_tool == "_capture_select" and
                 self._inline_start and self._inline_end):
-            r = QRect(self._inline_start, self._inline_end).normalized()
+            # _inline_start/end are in global Qt coords — convert to widget-local for painting
+            r = QRect(self.mapFromGlobal(self._inline_start),
+                      self.mapFromGlobal(self._inline_end)).normalized()
             p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
             p.fillRect(r, QColor(0, 0, 0, 1))
             p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
@@ -3774,8 +3966,8 @@ class EnhancedRegionSelector(QWidget):
 
         # ── Inline capture-selection mode ─────────────────────────────────────
         if self._current_tool == "_capture_select":
-            self._inline_start = lpos
-            self._inline_end   = lpos
+            self._inline_start = gpos   # global Qt coords — same as RegionSelector
+            self._inline_end   = gpos
             return
 
         # ── DETECT mode ───────────────────────────────────────────────────────
@@ -3851,7 +4043,7 @@ class EnhancedRegionSelector(QWidget):
         # ── Inline capture-selection mode ─────────────────────────────────────
         if self._current_tool == "_capture_select":
             if e.buttons() & Qt.MouseButton.LeftButton and self._inline_start is not None:
-                self._inline_end = lpos
+                self._inline_end = gpos   # global Qt coords — same as RegionSelector
                 self.update()
             return
 
@@ -3960,9 +4152,8 @@ class EnhancedRegionSelector(QWidget):
         # ── Inline capture-selection mode — finalize rect ─────────────────────
         if self._current_tool == "_capture_select":
             if self._inline_start and self._inline_end:
-                local_rect = QRect(self._inline_start, self._inline_end).normalized()
-                if local_rect.width() > 4 and local_rect.height() > 4:
-                    global_rect = local_rect.translated(self._geo.topLeft())
+                global_rect = QRect(self._inline_start, self._inline_end).normalized()
+                if global_rect.width() > 4 and global_rect.height() > 4:
                     self._current_tool = self._prev_tool
                     self._inline_selecting = False
                     self._inline_start = None
@@ -4401,27 +4592,26 @@ class EnhancedRegionSelector(QWidget):
 
     def _do_capture_global_rect(self, global_rect: QRect):
         """
-        Hide overlay completely, then after a short delay grab + composite + save.
-        The widget hides (not closes) first so MSS sees the real screen.
+        Hide toolbar and dark background, but KEEP the canvas visible so
+        ffmpeg captures the screen with annotation objects still showing.
+        The overlay itself stays open until the snapshot thread finishes.
         """
         self._last_detected_global = global_rect
         self._toolbar.hide()
-        self._hide_bg = True
+        self._hide_bg = True   # hides only the dark dimming layer (paintEvent)
         self.update()
-        self.hide()                        # hide so MSS sees real screen
         QApplication.processEvents()
-        QTimer.singleShot(200, lambda: self._grab_composite_and_close(global_rect))
+        # Small delay so the toolbar and dim-overlay repaint clears before
+        # ffmpeg opens the screen grabber.
+        QTimer.singleShot(150, lambda: self._grab_composite_and_close(global_rect))
 
     def _grab_composite_and_close(self, global_rect: QRect):
         """
-        Grab screenshot, composite annotations, save, notify — then close.
-        Widget is already hidden (not closed) so MSS sees the real screen.
-        All self.* access happens before close() to avoid use-after-free.
+        Launch ffmpeg snapshot thread — canvas stays visible so objects are
+        captured by ffmpeg.  The recording border shows during the grab.
+        Everything runs async via Qt signals; the main thread is never blocked.
         """
-        # ── 1. Collect everything from self while widget is alive ─────────────
-        captured_geo    = QRect(self._geo)
-        has_annotations = self._canvas.has_items()
-
+        # ── 1. Compute physical coords ────────────────────────────────────────
         screen = QApplication.screenAt(global_rect.topLeft())
         if not screen:
             screen = QApplication.screenAt(global_rect.center())
@@ -4452,103 +4642,129 @@ class EnhancedRegionSelector(QWidget):
         except Exception as ex:
             print(f"[PyshareX] monitor mapping error: {ex}")
 
-        # ── 2. Render annotation layer while canvas is still alive ────────────
-        ann_pixmap = None
-        if has_annotations:
-            logical_rect_f = QRectF(global_rect.translated(-captured_geo.topLeft()))
-            pw = max(1, int(logical_rect_f.width()))
-            ph = max(1, int(logical_rect_f.height()))
-            ann_pixmap = QPixmap(pw, ph)
-            ann_pixmap.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(ann_pixmap)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            self._canvas._scene.render(painter,
-                                       target=QRectF(ann_pixmap.rect()),
-                                       source=logical_rect_f)
-            painter.end()
-
-        # ── 3. Grab screenshot (widget already hidden — real screen visible) ───
-        base_img = None
+        # ── 2. Build output path ──────────────────────────────────────────────
+        snap_path = None
+        engine_ref = None
         try:
-            with mss.MSS() as sct:
-                shot     = sct.grab({"left": final_x, "top": final_y,
-                                     "width": phys_w, "height": phys_h})
-                base_img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+            for _w in QApplication.topLevelWidgets():
+                if hasattr(_w, "engine") and hasattr(_w.engine, "_fp"):
+                    engine_ref = _w.engine
+                    break
+            if engine_ref:
+                snap_path = engine_ref._fp("region")
+            else:
+                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                snap_path = str(Path(tempfile.gettempdir()) / f"region_{ts}.png")
         except Exception as ex:
-            print(f"[PyshareX] mss grab error: {ex}")
+            print(f"[PyshareX] snap path error: {ex}")
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            snap_path = str(Path(tempfile.gettempdir()) / f"region_{ts}.png")
+        snap_path = str(Path(snap_path).with_suffix(".png"))
 
-        # ── 4. Composite annotations onto screenshot ──────────────────────────
-        composited = base_img
-        if base_img and ann_pixmap and has_annotations:
-            try:
-                from PySide6.QtCore import QBuffer, QIODevice
-                qbuf = QBuffer()
-                qbuf.open(QIODevice.OpenModeFlag.WriteOnly)
-                ann_pixmap.save(qbuf, "PNG")
-                qbuf.close()
-                buf = io.BytesIO(qbuf.data().data())
-                buf.seek(0)
-            except Exception as ex:
-                print(f"[PyshareX] pixmap-to-bytes error: {ex}")
-                buf = None
-            try:
-                if buf is None:
-                    raise Exception("pixmap buffer empty")
-                ann_pil   = Image.open(buf).convert("RGBA")
-                ann_pil   = ann_pil.resize((phys_w, phys_h), Image.LANCZOS)
-                base_rgba = base_img.convert("RGBA")
-                base_rgba.paste(ann_pil, (0, 0), ann_pil)
-                composited = base_rgba.convert("RGB")
-            except Exception as ex:
-                print(f"[PyshareX] composite error: {ex}")
+        # ── 3. No pre-render needed — ffmpeg captures canvas objects directly ─
 
-        # ── 5. Save file and notify main window ───────────────────────────────
-        saved_path = None
-        if composited:
-            try:
-                engine = None
-                for w in QApplication.topLevelWidgets():
-                    if hasattr(w, "engine") and hasattr(w.engine, "_save"):
-                        engine = w.engine
-                        break
-                if engine:
-                    saved_path = engine._save(composited, "region")
-            except Exception as ex:
-                print(f"[PyshareX] save error: {ex}")
+        # ── 4. Launch ffmpeg snapshot — canvas visible during recording ───────
+        # RecordingBorder (green dashed frame) is shown via region_ready signal.
+        # The overlay is NOT hidden so canvas objects appear in the ffmpeg frame.
+        # After ffmpeg finishes, _on_snap_done / _on_snap_err fires on the main
+        # thread via Qt signal, then _finish_capture() completes the workflow.
+        border_ref = [None]
 
-        # ── 6. Close widget LAST — after all self.* access is done ────────────
-        self.close()
+        def _on_snap_region(x, y, w, h):
+            border_ref[0] = RecordingBorder(x, y, w, h)
 
-        # ── 7. Notify main window (after close — no self.* needed) ────────────
-        if saved_path:
+        def _on_snap_done(path):
+            if border_ref[0]:
+                border_ref[0].stop()
+                border_ref[0] = None
+            _finish_capture(path, None)
+
+        def _on_snap_err(msg):
+            if border_ref[0]:
+                border_ref[0].stop()
+                border_ref[0] = None
+            print(f"[PyshareX] ffmpeg snapshot failed ({msg}), falling back to MSS")
+            # MSS fallback — hide overlay first, grab, then finish
+            self.hide()
+            QApplication.processEvents()
             try:
-                for w in QApplication.topLevelWidgets():
-                    if hasattr(w, "_notify_sig"):
-                        if composited:
-                            # Store bytes in a local variable to prevent Garbage Collection 
-                            # before QPixmap reads the memory buffer
-                            raw_data = composited.tobytes()
-                            # Force deep copy to prevent Segmentation Fault
-                            qim   = QImage(raw_data,
-                                           composited.width, composited.height,
-                                           composited.width * 3,
-                                           QImage.Format.Format_RGB888).copy()
-                            thumb = QPixmap.fromImage(qim)
-                        else:
+                with mss.MSS() as sct:
+                    shot = sct.grab({"left": final_x, "top": final_y,
+                                     "width": phys_w, "height": phys_h})
+                    fallback_img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                    fallback_img.save(snap_path, "PNG")
+                    _finish_capture(snap_path, None)
+            except Exception as ex2:
+                print(f"[PyshareX] mss grab error: {ex2}")
+                _finish_capture(None, None)
+
+        def _finish_capture(path, _unused):
+            """Called on the main Qt thread after ffmpeg (or MSS fallback) finishes.
+            ffmpeg already captured the screen including all canvas objects, so
+            no compositing is needed — the PNG at `path` is the final image."""
+            # Release the thread reference — it has finished its work
+            self._snap_th = None
+
+            # ── 5. Save via engine._post (clipboard, explorer, etc.) ─────────
+            saved_path = None
+            if path and Path(path).exists():
+                try:
+                    engine = None
+                    for _w in QApplication.topLevelWidgets():
+                        if hasattr(_w, "engine") and hasattr(_w.engine, "_post"):
+                            engine = _w.engine
+                            break
+                    if engine:
+                        saved_path = engine._post(path)
+                    else:
+                        saved_path = path   # no engine — use path as-is
+                except Exception as ex:
+                    print(f"[PyshareX] save error: {ex}")
+
+            # ── 6. Close overlay ──────────────────────────────────────────────
+            self.close()
+
+            # ── 7. Notify main window ─────────────────────────────────────────
+            if saved_path:
+                try:
+                    for _w in QApplication.topLevelWidgets():
+                        if hasattr(_w, "_notify_sig"):
                             thumb = None
-                        w._notify_sig.emit(saved_path, thumb)
-                        # Restore main window only if it was visible before capture
-                        if getattr(w, '_win_was_visible', True):
-                            QTimer.singleShot(300, w.show_win)
-                        break
-            except Exception as ex:
-                print(f"[PyshareX] notify error: {ex}")
-        else:
-            # Fallback: tell main window to re-grab the region normally
-            try:
-                self.region_selected.emit(final_x, final_y, phys_w, phys_h)
-            except Exception:
-                pass
+                            try:
+                                pil_img  = Image.open(saved_path).convert("RGB")
+                                raw_data = pil_img.tobytes()
+                                qim  = QImage(raw_data,
+                                              pil_img.width, pil_img.height,
+                                              pil_img.width * 3,
+                                              QImage.Format.Format_RGB888).copy()
+                                thumb = QPixmap.fromImage(qim)
+                            except Exception:
+                                pass
+                            _w._notify_sig.emit(saved_path, thumb)
+                            if getattr(_w, '_win_was_visible', True):
+                                QTimer.singleShot(300, _w.show_win)
+                            break
+                except Exception as ex:
+                    print(f"[PyshareX] notify error: {ex}")
+            else:
+                try:
+                    self.region_selected.emit(final_x, final_y, phys_w, phys_h)
+                except Exception:
+                    pass
+
+        # Keep a strong reference on self so the QThread is not garbage-collected
+        # before it finishes.  _finish_capture() clears it once done.
+        self._snap_th = RecordingThread(
+            region        = (final_x, final_y, phys_w, phys_h),
+            output_path   = snap_path,
+            fps           = 1,
+            audio         = False,
+            snapshot_mode = True,
+        )
+        self._snap_th.region_ready.connect(_on_snap_region)
+        self._snap_th.finished.connect(_on_snap_done)
+        self._snap_th.error.connect(_on_snap_err)
+        self._snap_th.start()
 
     def _emit_and_close(self, global_rect: QRect):
         """Kept for compatibility — delegates to _grab_composite_and_close."""
@@ -4984,17 +5200,19 @@ class RecordingThread(QThread):
     region_ready = Signal(int, int, int, int)
 
     def __init__(self, region, output_path, fps=30, audio=False,
-                 gif_mode=False, gif_fps=10, gif_duration=5):
+                 gif_mode=False, gif_fps=10, gif_duration=5,
+                 snapshot_mode=False):
         super().__init__()
-        self.region      = region
-        self.output_path = output_path
-        self.fps         = fps
-        self.audio       = audio
-        self.gif_mode    = gif_mode
-        self.gif_fps     = gif_fps
-        self.gif_duration= gif_duration
-        self._stop       = threading.Event()
-        self._proc       = None
+        self.region        = region
+        self.output_path   = output_path
+        self.fps           = fps
+        self.audio         = audio
+        self.gif_mode      = gif_mode
+        self.gif_fps       = gif_fps
+        self.gif_duration  = gif_duration
+        self.snapshot_mode = snapshot_mode   # True = grab exactly 1 frame → PNG
+        self._stop         = threading.Event()
+        self._proc         = None
 
     def stop(self):
         self._stop.set()
@@ -5022,8 +5240,9 @@ class RecordingThread(QThread):
 
     def run(self):
         try:
-            if self.gif_mode: self._gif()
-            else:             self._video()
+            if self.gif_mode:      self._gif()
+            elif self.snapshot_mode: self._snapshot()
+            else:                  self._video()
         except Exception as e:
             self.error.emit(f"Unexpected error: {e}")
 
@@ -5104,6 +5323,92 @@ class RecordingThread(QThread):
         except Exception as e:
             self.error.emit(f"GIF save error: {e}")
 
+    def _snapshot(self):
+        """Grab exactly one frame from the screen region using ffmpeg and save
+        it as a PNG.  Uses the same gdigrab/x11grab input as _video() so the
+        capture path is identical — only the output differs (PNG, 1 frame)."""
+        try:
+            x, y, w, h = self._resolve_region()
+        except Exception as e:
+            self.error.emit(f"Screen error: {e}"); return
+
+        self.region_ready.emit(x, y, w, h)
+
+        errbuf = tempfile.TemporaryFile()
+        try:
+            if IS_WINDOWS:
+                try:
+                    with mss.MSS() as _sct:
+                        all_mons = _sct.monitors[1:]
+                        virt_x = min(m["left"] for m in all_mons)
+                        virt_y = min(m["top"]  for m in all_mons)
+                        virt_w = max(m["left"] + m["width"]  for m in all_mons) - virt_x
+                        virt_h = max(m["top"]  + m["height"] for m in all_mons) - virt_y
+                except Exception:
+                    virt_x, virt_y = 0, 0
+                    virt_w, virt_h = x + w + 100, y + h + 100
+                crop_x = x - virt_x
+                crop_y = y - virt_y
+                gw = w if w % 2 == 0 else w - 1
+                gh = h if h % 2 == 0 else h - 1
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f",          "gdigrab",
+                    "-framerate",  "1",
+                    "-rtbufsize",  "256M",
+                    "-draw_mouse", "0",
+                    "-offset_x",   str(virt_x), "-offset_y", str(virt_y),
+                    "-video_size", f"{virt_w}x{virt_h}",
+                    "-i",          "desktop",
+                    "-vframes",    "1",
+                    "-vf",         f"crop={gw}:{gh}:{crop_x}:{crop_y}",
+                    self.output_path,
+                ]
+            else:
+                disp = os.environ.get("DISPLAY", ":0")
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f",         "x11grab",
+                    "-framerate", "1",
+                    "-video_size", f"{w}x{h}",
+                    "-i",         f"{disp}+{x},{y}",
+                    "-vframes",   "1",
+                    self.output_path,
+                ]
+            print(f"[PyshareX] snapshot: {' '.join(cmd)}")
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=errbuf,
+                creationflags=_NO_WINDOW,
+            )
+            # ffmpeg exits by itself after -vframes 1; give it up to 10 s
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+        except FileNotFoundError:
+            errbuf.close()
+            self.error.emit("ffmpeg is not installed.\n"
+                            "Linux:   sudo apt install ffmpeg\n"
+                            "Windows: winget install ffmpeg  (or https://ffmpeg.org)")
+            return
+        except Exception as e:
+            errbuf.close()
+            self.error.emit(f"Cannot start ffmpeg: {e}")
+            return
+
+        errbuf.seek(0); errtext = errbuf.read().decode(errors="replace"); errbuf.close()
+
+        out = Path(self.output_path)
+        if out.exists() and out.stat().st_size > 64:
+            self.finished.emit(self.output_path)
+        else:
+            tail = "\n".join(errtext.strip().splitlines()[-12:])
+            self.error.emit(f"ffmpeg snapshot error:\n{tail}")
+
     def _video(self):
         try:
             x, y, w, h = self._resolve_region()
@@ -5113,16 +5418,32 @@ class RecordingThread(QThread):
         self.region_ready.emit(x, y, w, h)
 
         if IS_WINDOWS:
-            # gdigrab on a DPI-aware app uses LOGICAL pixel coordinates —
-            # same space as Qt / mss. No scaling needed.
+            # gdigrab does NOT support negative offset_x/offset_y (monitors to
+            # the left or above the primary). Fix: capture the entire virtual
+            # desktop and crop to the requested region with a video filter.
+            # The virtual desktop origin (min of all monitor lefts/tops) is used
+            # to shift the crop rect so it addresses the correct pixels.
             gw = w if w % 2 == 0 else w - 1
             gh = h if h % 2 == 0 else h - 1
+            try:
+                with mss.MSS() as _sct:
+                    all_mons = _sct.monitors[1:]
+                    virt_x = min(m["left"] for m in all_mons)
+                    virt_y = min(m["top"]  for m in all_mons)
+                    virt_w = max(m["left"] + m["width"]  for m in all_mons) - virt_x
+                    virt_h = max(m["top"]  + m["height"] for m in all_mons) - virt_y
+            except Exception:
+                virt_x, virt_y = 0, 0
+                virt_w, virt_h = x + w + 100, y + h + 100
+            # crop filter coords: origin relative to virtual desktop top-left
+            crop_x = x - virt_x
+            crop_y = y - virt_y
             vin = ["-f", "gdigrab",
                    "-framerate", str(self.fps),
                    "-rtbufsize", "256M",
                    "-draw_mouse", "1",
-                   "-offset_x", str(x), "-offset_y", str(y),
-                   "-video_size", f"{gw}x{gh}",
+                   "-offset_x", str(virt_x), "-offset_y", str(virt_y),
+                   "-video_size", f"{virt_w}x{virt_h}",
                    "-i", "desktop"]
             ain = ["-f", "dshow", "-i", "audio=Stereo Mix"] if self.audio else []
         else:
@@ -5136,7 +5457,14 @@ class RecordingThread(QThread):
         # MKV is robust against process kill; MP4 needs graceful close.
         tmp_mkv = self.output_path.replace(".mp4", ".tmp.mkv")
 
-        oops = [
+        if IS_WINDOWS:
+            # Crop the virtual-desktop capture down to the requested region.
+            # crop=w:h:x:y  (all in pixels relative to captured frame origin)
+            vf = ["-vf", f"crop={gw}:{gh}:{crop_x}:{crop_y}"]
+        else:
+            vf = []
+
+        oops = vf + [
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-crf", "23",
@@ -9542,8 +9870,10 @@ class MainWindow(QMainWindow):
         #self._bar.start_display(region=(x, y, w, h))
         self._bar.start_display() # Wywołaj bez regionu, żeby odpalić tylko timer
         
-        logical_rect = physical_to_logical_rect(x, y, w, h)
-        self._bar.move(logical_rect.x(), logical_rect.bottom() + 10)
+        border_rect = RecordingBorder._phys_to_logical(x, y, w, h)
+        bx = border_rect.x() + border_rect.width() // 2 - self._bar.width() // 2
+        by = border_rect.y() + border_rect.height() + 6
+        self._bar.move(bx, by)
         self._bar.show()
 
     def _stop_rec(self, abort=False):
