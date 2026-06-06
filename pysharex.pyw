@@ -872,10 +872,11 @@ class Config:
                             json.dump(d, fw, indent=2, ensure_ascii=False)
                     except Exception:
                         pass
-                # Auto-migrate: force paddleocr as default if not explicitly set to a known engine
+                # Auto-migrate: force a valid engine; prefer easyocr on Linux
+                # (PaddleOCR crashes with SIGILL on CPUs without AVX instructions)
                 valid_engines = {"paddleocr", "easyocr", "tesseract"}
                 if d.get("ocr_engine") not in valid_engines:
-                    d["ocr_engine"] = "paddleocr"
+                    d["ocr_engine"] = "easyocr" if IS_LINUX else "paddleocr"
                     try:
                         with open(self.path, "w", encoding="utf-8") as fw:
                             json.dump(d, fw, indent=2, ensure_ascii=False)
@@ -5049,6 +5050,15 @@ class CaptureEngine:
             return ("PaddleOCR is not installed.\n"
                     "Install with:  pip install paddlepaddle paddleocr\n"
                     "Falling back — try EasyOCR or Tesseract in Settings.")
+
+        # On Linux, PaddlePaddle crashes the entire process with SIGILL on CPUs
+        # that lack AVX instructions (common in VMs, older hardware).
+        # SIGILL cannot be caught by Python try/except — it kills the process.
+        # Safe solution: run PaddleOCR in an isolated subprocess so a crash
+        # there does not take down PyshareX.
+        if IS_LINUX:
+            return self._ocr_paddleocr_subprocess(image_path)
+
         reader = _get_paddleocr_reader()
         if reader is None:
             detail = f"\n\nError: {_paddleocr_init_error}" if _paddleocr_init_error else ""
@@ -5059,13 +5069,6 @@ class CaptureEngine:
                 "  • Or switch to EasyOCR in Settings → OCR engine."
             )
         try:
-            # On Linux CPUs without AVX (e.g. VirtualBox), PaddlePaddle may
-            # raise SIGILL (Illegal instruction). Catch broad Exception — the
-            # signal itself can't be caught in Python, but init-time errors can.
-            import signal as _signal
-            if IS_LINUX:
-                # Set a 15-second alarm so a hanging paddle call doesn't freeze the app
-                _signal.alarm(15)
             # PaddleOCR expects BGR numpy array (same as OpenCV).
             # Passing a file path triggers the OneDNN loader crash on Windows,
             # so we always convert to BGR array first.
@@ -5091,7 +5094,6 @@ class CaptureEngine:
                 result_obj = reader.predict(img_input)
                 lines = []
                 for item in (result_obj or []):
-                    # PaddleX OCRResult behaves like a dict — access rec_texts directly
                     try:
                         texts = item["rec_texts"]
                         if isinstance(texts, (list, tuple)):
@@ -5101,14 +5103,12 @@ class CaptureEngine:
                         continue
                     except (KeyError, TypeError):
                         pass
-                    # Fallback: attribute access
                     texts = getattr(item, "rec_texts", None)
                     if isinstance(texts, (list, tuple)):
                         lines.extend([str(t) for t in texts if t])
                     elif isinstance(texts, str) and texts:
                         lines.append(texts)
                     else:
-                        # Last resort: legacy list of (box, (text, score))
                         try:
                             for line in item:
                                 if line and len(line) >= 2:
@@ -5137,13 +5137,112 @@ class CaptureEngine:
                 return "\n".join(lines)
         except Exception as e:
             return f"PaddleOCR error: {e}"
-        finally:
+
+    def _ocr_paddleocr_subprocess(self, image_path: str) -> str:
+        """Run PaddleOCR in an isolated subprocess on Linux.
+        If PaddlePaddle raises SIGILL (no AVX), only the child process dies —
+        PyshareX keeps running and returns a clear error message."""
+        # Inline Python script passed via -c — no temp file needed.
+        script = r"""
+import sys, os, json
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("PADDLE_DISABLE_MKL", "1")
+os.environ.setdefault("FLAGS_onednn_cpu_enable", "0")
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+image_path = sys.argv[1]
+try:
+    from paddleocr import PaddleOCR
+    def _try_init(kwargs):
+        import copy
+        kw = copy.copy(kwargs)
+        removable = ["show_log", "use_angle_cls", "use_textline_orientation"]
+        tried = set()
+        while True:
             try:
-                import signal as _signal
-                if IS_LINUX:
-                    _signal.alarm(0)  # cancel alarm
-            except Exception:
+                return PaddleOCR(**kw)
+            except Exception as e:
+                msg = str(e)
+                removed = False
+                for p in removable:
+                    if p in kw and p not in tried and ("Unknown argument" in msg or p in msg):
+                        del kw[p]; tried.add(p); removed = True; break
+                if not removed:
+                    raise
+    reader = None
+    ver = None
+    for v, kw in [("v3", {"lang": "en", "show_log": False}),
+                  ("v2", {"use_angle_cls": True, "lang": "en", "show_log": False})]:
+        try:
+            reader = _try_init(kw); ver = v; break
+        except Exception:
+            continue
+    if reader is None:
+        print("ERROR: PaddleOCR init failed", file=sys.stderr); sys.exit(1)
+    try:
+        import numpy as _np, cv2 as _cv2
+        img = _cv2.imdecode(_np.fromfile(image_path, dtype=_np.uint8), _cv2.IMREAD_COLOR)
+    except Exception:
+        from PIL import Image as _PIL
+        import numpy as _np
+        _p = _PIL.open(image_path).convert("RGB")
+        img = _np.array(_p)[:, :, ::-1].copy()
+    lines = []
+    if ver == "v3":
+        for item in (reader.predict(img) or []):
+            try:
+                t = item["rec_texts"]
+                lines += [str(x) for x in (t if isinstance(t, (list,tuple)) else [t]) if x]
+                continue
+            except (KeyError, TypeError):
                 pass
+            t = getattr(item, "rec_texts", None)
+            if isinstance(t, (list, tuple)):
+                lines += [str(x) for x in t if x]
+            elif isinstance(t, str) and t:
+                lines.append(t)
+            else:
+                try:
+                    for ln in item:
+                        if ln and len(ln) >= 2:
+                            ti = ln[1]
+                            lines.append(str(ti[0]) if isinstance(ti, (list,tuple)) else str(ti))
+                except Exception:
+                    pass
+    else:
+        for block in (reader.ocr(img, cls=True) or []):
+            if not block: continue
+            for ln in block:
+                if ln and len(ln) >= 2:
+                    ti = ln[1]
+                    lines.append(str(ti[0]) if isinstance(ti, (list,tuple)) else str(ti))
+    print(json.dumps(lines))
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
+"""
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", script, image_path],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip().splitlines()
+                last_err = stderr[-1] if stderr else "unknown error"
+                # SIGILL shows as returncode -4 on Linux
+                if result.returncode in (-4, -6, -11):
+                    return (
+                        "PaddleOCR crashed (Illegal instruction — SIGILL).\n\n"
+                        "Your CPU does not support AVX instructions required by PaddlePaddle.\n"
+                        "Switch to EasyOCR in Settings → OCR engine:\n"
+                        "  pip install easyocr"
+                    )
+                return f"PaddleOCR subprocess error: {last_err}"
+            import json as _json
+            lines = _json.loads(result.stdout.strip())
+            return "\n".join(lines)
+        except subprocess.TimeoutExpired:
+            return "PaddleOCR timed out (>60s). Switch to EasyOCR in Settings."
+        except Exception as e:
+            return f"PaddleOCR subprocess launch error: {e}"
 
     def _ocr_easyocr(self, image_path: str) -> str:
         if not EASYOCR_AVAILABLE:
