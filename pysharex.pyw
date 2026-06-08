@@ -8976,10 +8976,10 @@ class MainWindow(QMainWindow):
         ico = QLabel("📸"); ico.setStyleSheet("font-size:22px;")
         ttl = QLabel("PyshareX")
         ttl.setStyleSheet("color:#89b4fa;font-size:18px;font-weight:bold;letter-spacing:1px;")
-        self._cap_btn = QPushButton("Capture Region")
-        self._cap_btn.setObjectName("cap_btn"); self._cap_btn.clicked.connect(self.act_region)
-        self._rec_btn = QPushButton("Record")
-        self._rec_btn.setObjectName("rec_btn"); self._rec_btn.clicked.connect(self.act_toggle_rec)
+        #self._cap_btn = QPushButton("Capture Region")
+        #self._cap_btn.setObjectName("cap_btn"); self._cap_btn.clicked.connect(self.act_region)
+        #self._rec_btn = QPushButton("Record")
+        #self._rec_btn.setObjectName("rec_btn"); self._rec_btn.clicked.connect(self.act_toggle_rec)
         quit_btn = QPushButton("⏻")
         quit_btn.setToolTip("Quit PyshareX")
         quit_btn.setFixedSize(32, 32)
@@ -9004,7 +9004,7 @@ class MainWindow(QMainWindow):
         )
         quit_btn.clicked.connect(self._quit)
         hl.addWidget(ico); hl.addWidget(ttl); hl.addStretch()
-        hl.addWidget(self._cap_btn); hl.addWidget(self._rec_btn); hl.addWidget(quit_btn)
+        hl.addWidget(quit_btn)
         root.addWidget(hdr)
 
         # Body
