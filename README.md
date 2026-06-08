@@ -1,4 +1,3 @@
-<img width="2878" height="738" alt="PyShareX#gh-dark-mode-only" src="https://github.com/user-attachments/assets/18a98e15-916a-4b39-a7d5-d4a5c8913176#gh-dark-mode-only"/>
 <img width="2878" height="738" alt="PyShareX#gh-light-mode-only" src="https://github.com/user-attachments/assets/df561e61-48b5-45d5-b9cd-c47e0bacbd2d#gh-light-mode-only"/>
 <br><br>
 
@@ -86,7 +85,8 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 - OCR/QR Toolbox recognizing text/QR code, creating QR in one window
 
 ## Main / Configuration Window
-<img width="993" height="722" alt="region_2026-05-10_15-39-15" src="https://github.com/user-attachments/assets/fb465778-9e0c-4634-907f-9245862d68b4" />
+<img width="977" height="721" alt="region_2026-06-08_22-51-13" src="https://github.com/user-attachments/assets/b6510a05-120f-40fc-af36-ed5b0747e163" />
+
 
 ## Capture Region with toolbar
 
