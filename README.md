@@ -1,5 +1,8 @@
 <img width="2878" height="738" alt="PyShareX#gh-light-mode-only" src="https://github.com/user-attachments/assets/df561e61-48b5-45d5-b9cd-c47e0bacbd2d#gh-light-mode-only"/>
-<br><br>
+
+<img width="2878" height="738" alt="PyShareX#gh-light-mode-only" src="https://github.com/user-attachments/assets/9882b791-d8e4-48fc-9752-4c86af35b3f5#gh-light-mode-only" />
+<img width="2878" height="738" alt="PyShareX#gh-dark-mode-only" src="https://github.com/user-attachments/assets/7a899b83-2bc4-401a-bfe5-6990f18c3c51#gh-dark-mode-only" />
+
 
 # PyShareX — Open-Source ShareX Alternative Made in Python
 
