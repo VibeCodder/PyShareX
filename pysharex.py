@@ -3349,7 +3349,7 @@ class EnhancedRegionSelector(QWidget):
 
         tools = [
             (self.TOOL_SELECT,    None,  "Select / move / resize annotations (Del to delete)"),
-            (self.TOOL_RECT,      "⬜",  "Draw rectangle annotation"),
+            (self.TOOL_RECT,      None,  "Draw rectangle annotation"),
             (self.TOOL_CIRCLE,    "⭕",  "Draw ellipse annotation"),
             (self.TOOL_HIGHLIGHT, "🟨",  "Draw highlight (semi-transparent yellow rectangle)"),
             (self.TOOL_FREEHAND,  "✏️",  "Freehand drawing"),
@@ -3369,6 +3369,9 @@ class EnhancedRegionSelector(QWidget):
             btn.clicked.connect(lambda _, t=tid: self._select_tool(t))
             if tid == self.TOOL_SELECT:
                 btn.setIcon(_svg_icon(_SVG_SELECT, 32))
+                btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_RECT:
+                btn.setIcon(_svg_icon(_SVG_RECT_TOOL, 32))
                 btn.setIconSize(QSize(28, 28))
             elif tid == self.TOOL_COLOR:
                 btn.setObjectName("colorPickerBtn")
@@ -7871,26 +7874,48 @@ class EditorCanvas(QGraphicsView):
             checker = self._get_checker_cache(w, h)
             painter.drawPixmap(bg_rect.topLeft(), checker)
         # ─────────────────────────────────────────────────────────────────────
-
-        # Dark overlay outside the image
-        path = QPainterPath()
-        path.setFillRule(Qt.FillRule.OddEvenFill)
-        path.addRect(QRectF(-500000, -500000, 1000000, 1000000))
-        path.addRect(bg_rect)
-        painter.fillPath(path, QColor(0, 0, 0, 120))
-
-        # Blue dashed border around the image
-        pen = QPen(QColor(137, 180, 250), 2, Qt.PenStyle.DashLine)
-        painter.setPen(pen)
-        painter.setBrush(Qt.GlobalColor.transparent)
-        painter.drawRect(bg_rect)
+        # NOTE: the "outside canvas" dark mask + border used to be drawn here,
+        # but drawBackground() always paints BEFORE scene items, so any
+        # floating image/annotation extending past the canvas edge was drawn
+        # on top of it and stayed fully visible — this is what made Crop look
+        # like it "left a piece uncropped" whenever several images were on
+        # the canvas (the exported file was actually fine; only the on-canvas
+        # preview was misleading). That mask now lives in drawForeground()
+        # below, where it is guaranteed to paint on top of every item.
 
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
         # Włączamy wysoką jakość rysowania, aby uniknąć rozmazania
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        
+
+        # ── Mask out everything outside the canvas bounds ──────────────────
+        # Drawn here (after all items) so floating images/annotations that
+        # extend past the current canvas edge — e.g. right after a crop, or
+        # while a pasted image hasn't been trimmed yet — are actually hidden
+        # from view instead of appearing as an "uncropped leftover".
+        #
+        # While the Crop tool overlay is active it already draws its own
+        # dark mask + border around the (possibly larger, expand-canvas)
+        # crop rectangle, so we skip this generic one to avoid re-darkening
+        # the region the user is previewing.
+        if not (getattr(self, 'crop_item', None) and self.crop_item.isVisible()):
+            bg_rect = self.bg_item.sceneBoundingRect() if hasattr(self, 'bg_item') and self.bg_item else self.scene.sceneRect()
+
+            # Dark overlay outside the image
+            mask_path = QPainterPath()
+            mask_path.setFillRule(Qt.FillRule.OddEvenFill)
+            mask_path.addRect(QRectF(-500000, -500000, 1000000, 1000000))
+            mask_path.addRect(bg_rect)
+            painter.fillPath(mask_path, QColor(0, 0, 0, 120))
+
+            # Blue dashed border around the image
+            pen = QPen(QColor(137, 180, 250), 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.drawRect(bg_rect)
+        # ─────────────────────────────────────────────────────────────────────
+
         for item in self.scene.selectedItems():
             if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, ResizablePixmapItem, FreehandItem)) and not isinstance(item, CropOverlayItem):
                 r = item.rect()
@@ -7963,7 +7988,7 @@ class ImageEditorWindow(QMainWindow):
             tbar.addWidget(self.btn_capture_region)
             tbar.addSpacing(8)
 
-        for n, i in [("Select", None), ("Crop", "📐"), ("Rectangle", "⬜"), ("Circle", "⭕"),
+        for n, i in [("Select", None), ("Crop", None), ("Rectangle", None), ("Circle", "⭕"),
                      ("Line", "📏"), ("Arrow", "➡️"), ("Highlight", "🟨"), ("Freehand", "✏️"),
                      ("Bubble", "💬"), ("Text", "T"), ("Marker", "📍"), ("Eraser", "🧹")]:
             b = QPushButton(); b.setCheckable(True)
@@ -7984,6 +8009,14 @@ class ImageEditorWindow(QMainWindow):
             if n == "Select":
                 b.setIcon(_svg_icon(_SVG_SELECT, 32))
                 b.setIconSize(QSize(32, 32))
+            elif n == "Crop":
+                b.setIcon(_svg_icon(_SVG_CROP, 32))
+                b.setIconSize(QSize(32, 32))
+                b.setToolTip("Crop")
+            elif n == "Rectangle":
+                b.setIcon(_svg_icon(_SVG_RECT_TOOL, 32))
+                b.setIconSize(QSize(32, 32))
+                b.setToolTip("Rectangle")
             else:
                 b.setText(i)
             b.clicked.connect(lambda ch, name=n: self.select_tool(name))
@@ -8004,6 +8037,13 @@ class ImageEditorWindow(QMainWindow):
         self.btn_import.setStyleSheet("background: #8e44ad; color: white; font-weight: bold; padding: 5px 10px;")
         self.btn_import.clicked.connect(self.import_image)
         tbar.addWidget(self.btn_import)
+
+        # Import obrazka bezpośrednio ze schowka systemowego na canvas
+        self.btn_import_clipboard = QPushButton("🖼️ Import from📋")
+        self.btn_import_clipboard.setToolTip("Import image from clipboard onto the canvas")
+        self.btn_import_clipboard.setStyleSheet("background: #8e44ad; color: white; font-weight: bold; padding: 5px 10px;")
+        self.btn_import_clipboard.clicked.connect(self.import_from_clipboard)
+        tbar.addWidget(self.btn_import_clipboard)
 
         # Save Buttons
         btn_save = QPushButton("💾 Save")
@@ -8110,11 +8150,21 @@ class ImageEditorWindow(QMainWindow):
         if name == "Crop":
             self.btn_apply_crop.show()
             self.canvas.scene.clearSelection()
-            
-            # Ustaw rozmiar sceny na twardo, aby odpowiadał wymiarom tła
+
             bg_rect = QRectF(self.canvas.bg_pixmap.rect())
-            self.canvas.scene.setSceneRect(bg_rect)
-            
+
+            # NOTE: sceneRect used to be hard-locked to bg_rect here ("Ustaw
+            # rozmiar sceny na twardo, aby odpowiadał wymiarom tła"). That
+            # shrinks the scrollable area down to exactly the image size, so
+            # QGraphicsView has nothing left to pan to — this is what made
+            # middle-mouse-button panning stop working while the Crop tool
+            # was active. The visual canvas-bounds mask is drawn
+            # independently in drawBackground/drawForeground and doesn't
+            # depend on sceneRect at all, so keep the same large free-pan
+            # rect used by every other tool instead.
+            self.canvas.scene.setSceneRect(
+                bg_rect.center().x() - 50000, bg_rect.center().y() - 50000, 100000, 100000)
+
             # Utwórz ramkę kadrującą na pełnym obszarze obrazu
             if not self.canvas.crop_item:
                 self.canvas.crop_item = CropOverlayItem(bg_rect)
@@ -8137,6 +8187,18 @@ class ImageEditorWindow(QMainWindow):
 
         crop_rect = self.canvas.crop_item.rect()
 
+        # Snap to whole pixels. The overlay rect comes from free-form mouse
+        # dragging and can end up with fractional (sub-pixel) coordinates.
+        # Rounding left/top/right/bottom independently (instead of e.g.
+        # rounding width separately from position) keeps both edges pixel-
+        # aligned with the source pixmap and with bg_item's future position,
+        # so this can't drift into a 1px uncropped sliver on later crops.
+        _l = round(crop_rect.left())
+        _t = round(crop_rect.top())
+        _r = round(crop_rect.right())
+        _b = round(crop_rect.bottom())
+        crop_rect = QRectF(_l, _t, _r - _l, _b - _t)
+
         # ── Annotation mode: save the crop region with annotations, don't crop the canvas ──
         if self._annotation_mode:
             self.canvas.scene.removeItem(self.canvas.crop_item)
@@ -8145,55 +8207,52 @@ class ImageEditorWindow(QMainWindow):
             self._finish_annotated_capture(crop_rect)
             return
 
-        # ── Normal editor mode: crop or expand the canvas ──────────────────────
+        # ── Normal editor mode: the dashed selection IS the new image
+        # boundary — always, exactly. Whether it's smaller than the current
+        # image on a side (crop), larger (expand), or smaller on one side
+        # and larger on another *at the same time*, the result must match
+        # the drawn rectangle precisely — no union/approximation.
+        #
+        # This replaces the old two-branch logic, which detected "expand"
+        # via bg_rect.contains(crop_rect) and then took
+        # bg_rect.united(crop_rect) as the new bounds. united() keeps
+        # whichever of the two rects is bigger on each side — so a
+        # selection that shrank the left edge while growing the right edge
+        # never actually cropped the left side at all (union keeps the
+        # old, larger extent), producing exactly the "still not properly
+        # cropped" behaviour that was reported.
+        #
+        # Instead: build a new canvas that is exactly crop_rect's size, and
+        # paint the old image into it at the correct offset. QPainter clips
+        # anything drawn outside the target pixmap automatically (= crop),
+        # and any area not covered by the old image is left transparent
+        # (= expand) — one code path, exact result, both directions at once.
         bg_rect = self.canvas.bg_item.sceneBoundingRect()
+        new_rect = crop_rect
 
-        # Detect if the crop rect extends beyond the current image (= expand canvas)
-        expand = not bg_rect.contains(crop_rect)
+        new_w = int(round(new_rect.width()))
+        new_h = int(round(new_rect.height()))
+        if new_w < 1 or new_h < 1:
+            return  # degenerate selection — nothing to apply
 
-        if expand:
-            # ── Expand Canvas mode ──────────────────────────────────────────────
-            # Union of current image and the crop rect gives the new canvas bounds
-            new_rect = bg_rect.united(crop_rect)
+        # Offset: where the old image's top-left lands inside the new canvas
+        dx = bg_rect.x() - new_rect.x()
+        dy = bg_rect.y() - new_rect.y()
 
-            # Offset: how much the image origin shifts inside the new canvas
-            dx = bg_rect.x() - new_rect.x()
-            dy = bg_rect.y() - new_rect.y()
+        new_pixmap = QPixmap(new_w, new_h)
+        new_pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(new_pixmap)
+        painter.drawPixmap(round(dx), round(dy), self.canvas.bg_pixmap)
+        painter.end()
 
-            # Create new transparent pixmap (ARGB) and paint old image into it
-            new_w = int(new_rect.width())
-            new_h = int(new_rect.height())
-            new_pixmap = QPixmap(new_w, new_h)
-            new_pixmap.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(new_pixmap)
-            painter.drawPixmap(int(dx), int(dy), self.canvas.bg_pixmap)
-            painter.end()
+        self.canvas.bg_pixmap = new_pixmap
+        self.canvas.bg_item.setPixmap(new_pixmap)
+        self.canvas.bg_item.setPos(new_rect.topLeft())
 
-            self.canvas.bg_pixmap = new_pixmap
-            self.canvas.bg_item.setPixmap(new_pixmap)
-            self.canvas.bg_item.setPos(new_rect.topLeft())
-
-            # Shift all annotations to match the new origin
-            for item in self.canvas.scene.items():
-                if item != self.canvas.bg_item and item != self.canvas.crop_item:
-                    item.setPos(item.pos().x() + dx, item.pos().y() + dy)
-
-        else:
-            # ── Crop mode (rectangle fully inside image) ────────────────────────
-            dx = crop_rect.x()
-            dy = crop_rect.y()
-
-            cropped_pixmap = self.canvas.bg_pixmap.copy(
-                crop_rect.translated(-bg_rect.topLeft()).toRect()
-            )
-            self.canvas.bg_pixmap = cropped_pixmap
-            self.canvas.bg_item.setPixmap(cropped_pixmap)
-            self.canvas.bg_item.setPos(crop_rect.topLeft())
-
-            # Shift all annotations so they stay aligned with the background
-            for item in self.canvas.scene.items():
-                if item != self.canvas.bg_item and item != self.canvas.crop_item:
-                    item.setPos(item.pos().x() - dx, item.pos().y() - dy)
+        # Shift all annotations / floating layers to match the new origin
+        for item in self.canvas.scene.items():
+            if item != self.canvas.bg_item and item != self.canvas.crop_item:
+                item.setPos(item.pos().x() + dx, item.pos().y() + dy)
 
         # Remove the crop overlay
         self.canvas.scene.removeItem(self.canvas.crop_item)
@@ -8512,8 +8571,36 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.scene.addItem(item)
                 self.canvas.is_dirty = True
                 self.select_tool("Select")
-    
-    
+
+    def import_from_clipboard(self):
+        """Import an image currently held in the system clipboard onto the canvas
+        as a new floating, resizable layer (mirrors import_image, but reads
+        from QApplication.clipboard() instead of a file dialog)."""
+        cb = QApplication.clipboard()
+
+        # QClipboard exposes images two ways depending on platform/source
+        # (screenshot tools usually populate .image(), some apps only set
+        # .pixmap()) — try both before giving up.
+        img = cb.image()
+        if not img.isNull():
+            pixmap = QPixmap.fromImage(img)
+        else:
+            pixmap = cb.pixmap()
+
+        if pixmap is None or pixmap.isNull():
+            QMessageBox.warning(self, "Clipboard Empty", "No image found in clipboard!")
+            return
+
+        item = ResizablePixmapItem(pixmap)
+
+        # Wyśrodkowanie na środku aktualnego widoku ekranu (jak w import_image)
+        view_center = self.canvas.mapToScene(self.canvas.viewport().rect().center())
+        item.setPos(view_center - item.boundingRect().center())
+
+        self.canvas.scene.addItem(item)
+        self.canvas.is_dirty = True
+        self.select_tool("Select")
+
     def _delete_selected(self):
         """Delete selected items (keyboard shortcut helper)."""
         for item in self.canvas.scene.selectedItems():
@@ -8598,7 +8685,8 @@ class ImageEditorWindow(QMainWindow):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.canvas.scene.render(p,
                                  target=QRectF(img.rect()),
-                                 source=crop_rect_scene)
+                                 source=crop_rect_scene,
+                                 aspectRatioMode=Qt.AspectRatioMode.IgnoreAspectRatio)
         p.end()
         self.save_callback(img)
         self.saved = True
@@ -8615,7 +8703,8 @@ class ImageEditorWindow(QMainWindow):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.canvas.scene.render(p,
                                  target=QRectF(img.rect()),
-                                 source=bg_rect)
+                                 source=bg_rect,
+                                 aspectRatioMode=Qt.AspectRatioMode.IgnoreAspectRatio)
         p.end()
         return img
 
@@ -10316,6 +10405,23 @@ def _svg_emoji_icon(svg_str: str, emoji: str, btn_w: int, btn_h: int) -> QIcon:
 # SVG source for the Select cursor tool
 _SVG_SELECT = """<svg width="77.068" height="77.068" version="1.1" viewBox="0 0 18.496 18.496" xmlns="http://www.w3.org/2000/svg">
  <path d="m3.8616 1.6312v15.048l3.9126-3.9126 3.0097 4.665 2.3325-1.5048-2.7242-4.3081 4.7557-0.35688z" fill="#fff" stroke="#000" stroke-width="1.5048"/>
+</svg>"""
+
+# SVG source for the Rectangle annotation tool — a plain square frame in
+# the same red as the "⭕" circle-tool emoji next to it, replacing the
+# "⬜" (white square) emoji which read as a filled white swatch rather
+# than a rectangle-drawing tool.
+_SVG_RECT_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+ <rect x="2.6" y="2.6" width="18.8" height="18.8" stroke="#ea3323" stroke-width="2.6"/>
+</svg>"""
+
+# SVG source for the Crop tool — classic two-corner "crop marks" glyph
+# (matches the universal crop-tool icon used by most photo editors),
+# replacing the previous generic "📐" ruler emoji which didn't read as
+# a crop action.
+_SVG_CROP = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+ <path d="M6 1v15a2 2 0 0 0 2 2h15" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+ <path d="M18 23V8a2 2 0 0 0-2-2H1" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>"""
 
 
