@@ -93,7 +93,8 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 
 ## Capture Region with toolbar
 
-<img width="1280" height="720" alt="2026-05-26 23-05-06 mp4_snapshot_07 20 000" src="https://github.com/user-attachments/assets/475be521-9dc0-446d-bc05-e7a1324f1fea" />
+<img width="1280" height="720" alt="598446750-475be521-9dc0-446d-bc05-e7a1324f1fea" src="https://github.com/user-attachments/assets/71456b26-ea5b-4442-9dec-3d0170ec87fa" />
+
 
 
 
@@ -107,7 +108,8 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 
 ## Image Editor
 
-<img width="1920" height="1020" alt="pythonw_tjdZQXCcZy" src="https://github.com/user-attachments/assets/90835aa5-9a6e-4afc-a80f-4a0167fce0d3" />
+<img width="1920" height="1020" alt="598416325-90835aa5-9a6e-4afc-a80f-4a0167fce0d3" src="https://github.com/user-attachments/assets/9cd4b28c-0fe7-4bbd-ab91-999c993c9580" />
+
 
 
 
