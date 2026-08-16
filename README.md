@@ -46,7 +46,7 @@ In windows it's better to make a shortcut "pythonw.exe <SCRIPT_PATH>"
 For the icon to be visible in the app, the .ico file must be inside "icons" folder and the "icons" folder must be in the same folder with .pyw script.
 
 ----
-### video recording/conversion/capture region with canvas (requires ffmpeg installed on the system)
+### video recording/conversion/capture region (one of the methods) with canvas (requires ffmpeg installed on the system)
 ffmpeg must be installed separately: 
 <br>
 
