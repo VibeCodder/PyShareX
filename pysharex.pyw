@@ -850,6 +850,11 @@ class Config:
             "record_audio":     False,
             "selected_monitor": 0,
             "ocr_engine": "paddleocr",
+            # Which engine "Capture Region" uses to grab the final screenshot:
+            #   "ffmpeg"   — original method (gdigrab/x11grab), requires ffmpeg
+            #   "standard" — new ffmpeg-free method (mss + PIL), DPI-aware
+            #                across monitors with different scaling
+            "region_capture_method": "standard",
         }
 
     def _load(self):
@@ -2939,6 +2944,81 @@ class _TextInputDialog(QDialog):
                 self.chk_hl.isChecked(), self.hl_pad.value(),
                 self.chk_ol.isChecked(), self.ol_width.value(), self.outline_color)
 
+class StandardRegionSnapshotThread(QThread):
+    """
+    Ffmpeg-free "Capture Region" grabber ("standard method").
+
+    Grabs the selection with a single mss call using ABSOLUTE PHYSICAL
+    desktop coordinates (the same (final_x, final_y, phys_w, phys_h) region
+    already computed for the ffmpeg method / its mss fallback). This is
+    deliberately NOT done by stitching together separate per-monitor grabs:
+    on Windows, when monitors use different DPI scaling, Qt's *logical*
+    coordinate space is not guaranteed to be contiguous between monitors
+    (there can be small gaps or overlaps versus the real physical layout).
+    Stitching per-screen slices using those logical offsets can therefore
+    leave a visible black gap where two monitors meet. A single grab in
+    absolute physical pixels sidesteps that entirely: mss reads real
+    framebuffer pixels directly, with no notion of "logical"/scaled
+    coordinates at all, so a region spanning several differently-scaled
+    monitors comes back as one continuous, gap-free image — exactly like
+    the ffmpeg method's virtual-desktop grab + crop, just without needing
+    ffmpeg installed.
+
+    Runs on a background QThread so the UI/overlay never blocks, mirroring
+    the signal contract of RecordingThread(snapshot_mode=True):
+      region_ready(x, y, w, h) — physical bounding box, for the recording border
+      finished(path)           — success, PNG written to `output_path`
+      error(msg)                — failure (caller falls back to a plain mss grab)
+    """
+    finished     = Signal(str)
+    error        = Signal(str)
+    region_ready = Signal(int, int, int, int)
+
+    def __init__(self, region, output_path: str):
+        super().__init__()
+        self.region      = region   # (x, y, w, h) in absolute physical pixels
+        self.output_path = output_path
+
+    def run(self):
+        try:
+            path = self._grab()
+        except Exception as e:
+            self.error.emit(f"Standard capture error: {e}")
+            return
+        if path:
+            self.finished.emit(path)
+        else:
+            self.error.emit("Standard capture produced no output.")
+
+    def _grab(self):
+        if not (MSS_AVAILABLE and PIL_AVAILABLE):
+            raise RuntimeError("mss / Pillow not available")
+
+        x, y, w, h = self.region
+        if w < 1 or h < 1:
+            raise RuntimeError("Empty selection")
+
+        with mss.MSS() as sct:
+            shot = sct.grab({"left": int(x), "top": int(y),
+                              "width": int(w), "height": int(h)})
+            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
+        # NOTE: region_ready (which draws the green dashed RecordingBorder)
+        # is intentionally emitted AFTER the pixel grab above, not before.
+        # Unlike the ffmpeg method — where a separate OS process does the
+        # real screen grab, unaffected by anything Qt renders — here the
+        # same process both grabs pixels via mss AND draws the border via
+        # Qt. Emitting the signal first could race the border's own
+        # on-screen paint against the mss grab and let the border sneak
+        # into the captured image. Emitting it after guarantees that can
+        # never happen; the border is then purely a brief post-capture
+        # visual confirmation before the overlay closes.
+        self.region_ready.emit(x, y, w, h)
+
+        img.save(self.output_path, "PNG")
+        return self.output_path
+
+
 class EnhancedRegionSelector(QWidget):
     """
     Advanced region capture overlay.
@@ -3041,6 +3121,19 @@ class EnhancedRegionSelector(QWidget):
         ty = screen_geo.y() - self._geo.y() + 8
         self._toolbar.move(tx, ty)
         self._toolbar.show()
+
+        # Open directly in "drag to select a region and capture it" mode —
+        # the same mode as the 📷 Capture ▾ → "Region" menu item — instead
+        # of defaulting to the red-rectangle annotation tool. Unlike that
+        # menu item, the toolbar stays visible here (this only sets the
+        # same internal state, without the toolbar.hide() that menu item
+        # normally does), so annotation tools are still reachable by simply
+        # clicking a toolbar button before dragging.
+        self._prev_tool        = self.TOOL_RECT
+        self._current_tool     = "_capture_select"
+        self._inline_selecting = True
+        self._inline_start     = None
+        self._inline_end       = None
 
         self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -3380,7 +3473,7 @@ class EnhancedRegionSelector(QWidget):
                 btn.setText(icon)
             lay.addWidget(btn)
             self._tool_btns[tid] = btn
-        self._tool_btns[self.TOOL_RECT].setChecked(True)
+        #self._tool_btns[self.TOOL_RECT].setChecked(True)
 
         # Color swatch
         self._color_preview = QLabel()
@@ -4616,20 +4709,24 @@ class EnhancedRegionSelector(QWidget):
         Everything runs async via Qt signals; the main thread is never blocked.
         """
         # ── 1. Compute physical coords ────────────────────────────────────────
-        screen = QApplication.screenAt(global_rect.topLeft())
-        if not screen:
-            screen = QApplication.screenAt(global_rect.center())
-        if not screen:
-            screen = QApplication.primaryScreen()
+        # The selection's top-left and bottom-right corners are converted to
+        # physical (mss) desktop pixels SEPARATELY, each using the DPI scale
+        # of whichever monitor actually owns that corner. A single shared
+        # ratio (e.g. always the start monitor's) would misjudge the width/
+        # height whenever the selection's other end sits on a differently
+        # scaled monitor — the region would come out too narrow/short (if
+        # the far monitor is scaled higher than the start one) or too wide/
+        # tall (if scaled lower), even though the start corner itself was
+        # positioned correctly.
+        start_screen = (QApplication.screenAt(global_rect.topLeft())
+                         or QApplication.screenAt(global_rect.center())
+                         or QApplication.primaryScreen())
+        end_screen = (QApplication.screenAt(global_rect.bottomRight())
+                      or start_screen)
 
-        ratio        = screen.devicePixelRatio()
-        logical_geom = screen.geometry()
-        phys_x       = int((global_rect.x() - logical_geom.x()) * ratio)
-        phys_y       = int((global_rect.y() - logical_geom.y()) * ratio)
-        phys_w       = max(1, int(global_rect.width()  * ratio))
-        phys_h       = max(1, int(global_rect.height() * ratio))
-        final_x      = phys_x
-        final_y      = phys_y
+        final_x, final_y = phys_x, phys_y = global_rect.x(), global_rect.y()
+        phys_w = max(1, global_rect.width())
+        phys_h = max(1, global_rect.height())
 
         try:
             with mss.MSS() as sct:
@@ -4637,12 +4734,28 @@ class EnhancedRegionSelector(QWidget):
                                     key=lambda s: (s.geometry().x(), s.geometry().y()))
                 mss_mons   = sorted(sct.monitors[1:],
                                     key=lambda m: (m["left"], m["top"]))
-                if screen in qt_screens:
-                    idx = qt_screens.index(screen)
-                    if idx < len(mss_mons):
-                        mon     = mss_mons[idx]
-                        final_x = mon["left"] + phys_x
-                        final_y = mon["top"]  + phys_y
+
+                def _mon_for(scr):
+                    if scr in qt_screens:
+                        idx = qt_screens.index(scr)
+                        if idx < len(mss_mons):
+                            return mss_mons[idx]
+                    return {"left": 0, "top": 0}
+
+                def _to_phys(x, y, scr):
+                    """Logical Qt point -> absolute physical desktop pixel,
+                    using scr's own DPI scale and mss monitor offset."""
+                    r   = scr.devicePixelRatio() or 1.0
+                    geo = scr.geometry()
+                    mon = _mon_for(scr)
+                    return (mon["left"] + round((x - geo.x()) * r),
+                            mon["top"]  + round((y - geo.y()) * r))
+
+                final_x, final_y = _to_phys(global_rect.x(), global_rect.y(), start_screen)
+                end_x, end_y = _to_phys(global_rect.x() + global_rect.width(),
+                                        global_rect.y() + global_rect.height(), end_screen)
+                phys_w = max(1, end_x - final_x)
+                phys_h = max(1, end_y - final_y)
         except Exception as ex:
             print(f"[PyshareX] monitor mapping error: {ex}")
 
@@ -4665,17 +4778,35 @@ class EnhancedRegionSelector(QWidget):
             snap_path = str(Path(tempfile.gettempdir()) / f"region_{ts}.png")
         snap_path = str(Path(snap_path).with_suffix(".png"))
 
-        # ── 3. No pre-render needed — ffmpeg captures canvas objects directly ─
+        # ── 2b. Which capture engine to use? ────────────────────────────────
+        # "ffmpeg"   — original method (gdigrab/x11grab)
+        # "standard" — new ffmpeg-free method (mss + PIL), DPI-aware across
+        #              monitors with different scaling. Chosen in
+        #              Settings → Capture region method.
+        capture_method = "ffmpeg"
+        try:
+            if engine_ref is not None:
+                capture_method = engine_ref.config.get("region_capture_method", "standard")
+        except Exception:
+            pass
 
-        # ── 4. Launch ffmpeg snapshot — canvas visible during recording ───────
+        # ── 3. No pre-render needed — the screen is grabbed directly, so any
+        #      canvas/annotation objects still on screen are captured as-is ──
+
+        # ── 4. Launch the snapshot thread — canvas visible during the grab ────
         # RecordingBorder (green dashed frame) is shown via region_ready signal.
-        # The overlay is NOT hidden so canvas objects appear in the ffmpeg frame.
-        # After ffmpeg finishes, _on_snap_done / _on_snap_err fires on the main
-        # thread via Qt signal, then _finish_capture() completes the workflow.
+        # The overlay is NOT hidden so canvas objects appear in the frame.
+        # After the thread finishes, _on_snap_done / _on_snap_err fires on the
+        # main thread via Qt signal, then _finish_capture() completes the flow.
         border_ref = [None]
 
         def _on_snap_region(x, y, w, h):
-            border_ref[0] = RecordingBorder(x, y, w, h)
+            # The recording border is only useful for the ffmpeg method,
+            # where the external process needs a moment to grab the frame.
+            # The standard (mss) method finishes essentially instantly, so
+            # showing the border there would just be an unnecessary flash.
+            if capture_method != "standard":
+                border_ref[0] = RecordingBorder(x, y, w, h)
 
         def _on_snap_done(path):
             if border_ref[0]:
@@ -4687,8 +4818,8 @@ class EnhancedRegionSelector(QWidget):
             if border_ref[0]:
                 border_ref[0].stop()
                 border_ref[0] = None
-            print(f"[PyshareX] ffmpeg snapshot failed ({msg}), falling back to MSS")
-            # MSS fallback — hide overlay first, grab, then finish
+            print(f"[PyshareX] {capture_method} snapshot failed ({msg}), falling back to plain MSS")
+            # Last-resort MSS fallback — hide overlay first, grab, then finish
             self.hide()
             QApplication.processEvents()
             try:
@@ -4758,13 +4889,19 @@ class EnhancedRegionSelector(QWidget):
 
         # Keep a strong reference on self so the QThread is not garbage-collected
         # before it finishes.  _finish_capture() clears it once done.
-        self._snap_th = RecordingThread(
-            region        = (final_x, final_y, phys_w, phys_h),
-            output_path   = snap_path,
-            fps           = 1,
-            audio         = False,
-            snapshot_mode = True,
-        )
+        if capture_method == "standard":
+            self._snap_th = StandardRegionSnapshotThread(
+                region      = (final_x, final_y, phys_w, phys_h),
+                output_path = snap_path,
+            )
+        else:
+            self._snap_th = RecordingThread(
+                region        = (final_x, final_y, phys_w, phys_h),
+                output_path   = snap_path,
+                fps           = 1,
+                audio         = False,
+                snapshot_mode = True,
+            )
         self._snap_th.region_ready.connect(_on_snap_region)
         self._snap_th.finished.connect(_on_snap_done)
         self._snap_th.error.connect(_on_snap_err)
@@ -9069,6 +9206,27 @@ class MainWindow(QMainWindow):
         #self._cap_btn.setObjectName("cap_btn"); self._cap_btn.clicked.connect(self.act_region)
         #self._rec_btn = QPushButton("Record")
         #self._rec_btn.setObjectName("rec_btn"); self._rec_btn.clicked.connect(self.act_toggle_rec)
+        self._save_settings_btn = QPushButton("💾 Save Settings")
+        self._save_settings_btn.setFixedHeight(32)
+        self._save_settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_settings_btn.setStyleSheet(
+            "QPushButton {"
+            "  background-color: #89b4fa;"
+            "  color: #1e1e2e;"
+            "  border: none;"
+            "  border-radius: 6px;"
+            "  font-weight: bold;"
+            "  padding: 0px 16px;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: #b4befe;"
+            "}"
+            "QPushButton:pressed {"
+            "  background-color: #74a1f5;"
+            "}"
+        )
+        self._save_settings_btn.clicked.connect(self._save_settings)
+        self._save_settings_btn.hide()  # only shown while the Settings tab is active
         quit_btn = QPushButton("⏻")
         quit_btn.setToolTip("Quit PyshareX")
         quit_btn.setFixedSize(32, 32)
@@ -9093,6 +9251,7 @@ class MainWindow(QMainWindow):
         )
         quit_btn.clicked.connect(self._quit)
         hl.addWidget(ico); hl.addWidget(ttl); hl.addStretch()
+        hl.addWidget(self._save_settings_btn)
         hl.addWidget(quit_btn)
         root.addWidget(hdr)
 
@@ -9201,10 +9360,6 @@ class MainWindow(QMainWindow):
         lbl.setStyleSheet("color:#89b4fa;font-size:15px;font-weight:bold;")
         lay.addWidget(lbl)
 
-        sv = QPushButton("💾 Save Settings"); sv.setObjectName("cap_btn")
-        sv.setFixedHeight(36); sv.clicked.connect(self._save_settings)
-        lay.addWidget(sv)
-
         # Folder
         fg = QGroupBox("Screenshots folder"); fl = QHBoxLayout(fg)
         self._fld = QLineEdit(self.config.get("save_folder", ""))
@@ -9232,6 +9387,32 @@ class MainWindow(QMainWindow):
         self._cur.setChecked(self.config.get("show_cursor", False)); col.addWidget(self._cur)
         lay.addWidget(cog)
 
+        # Capture Region method
+        from PySide6.QtWidgets import QButtonGroup
+        crg = QGroupBox("Capture Region method"); crl = QVBoxLayout(crg)
+        self._region_method_grp = QButtonGroup(crg)
+        self._rm_ffmpeg_rb = QRadioButton(
+            "FFmpeg method  (gdigrab / x11grab) — requires ffmpeg on PATH")
+        self._rm_standard_rb = QRadioButton(
+            "Standard method  (no ffmpeg needed) — DPI-aware across monitors with different scaling")
+        self._region_method_grp.addButton(self._rm_ffmpeg_rb, 0)
+        self._region_method_grp.addButton(self._rm_standard_rb, 1)
+        crl.addWidget(self._rm_ffmpeg_rb)
+        crl.addWidget(self._rm_standard_rb)
+        region_method = self.config.get("region_capture_method", "standard")
+        if region_method == "standard":
+            self._rm_standard_rb.setChecked(True)
+        else:
+            self._rm_ffmpeg_rb.setChecked(True)
+        rm_hint = QLabel(
+            "Applies to \"Capture region\". The standard method works without ffmpeg "
+            "installed and composes the screenshot correctly even when your monitors "
+            "use different scaling (e.g. 100% + 150%).")
+        rm_hint.setWordWrap(True)
+        rm_hint.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
+        crl.addWidget(rm_hint)
+        lay.addWidget(crg)
+
         # Selected monitor
         mg = QGroupBox("Selected monitor  (for 'Capture selected monitor')")
         ml = QHBoxLayout(mg)
@@ -9257,7 +9438,6 @@ class MainWindow(QMainWindow):
         # OCR engine
         ocr_g = QGroupBox("OCR Engine")
         ocr_l = QVBoxLayout(ocr_g)
-        from PySide6.QtWidgets import QRadioButton, QButtonGroup
         self._ocr_grp = QButtonGroup(ocr_g)
         self._ocr_paddleocr_rb = QRadioButton(
             "PaddleOCR  (pip install paddlepaddle paddleocr)  — recommended, best accuracy")
@@ -9479,6 +9659,7 @@ class MainWindow(QMainWindow):
     def _sel_sb(self, idx):
         for i, b in enumerate(self._sb_btns): b.setChecked(i == idx)
         self.stack.setCurrentIndex(idx)
+        self._save_settings_btn.setVisible(idx == 2)  # Settings tab only
 
     def _show_capture(self):  self._sel_sb(0)
     def _show_tools(self):    self._sel_sb(1)
@@ -9581,6 +9762,8 @@ class MainWindow(QMainWindow):
         self.config.data["gif_fps"]          = self._gfps.value()
         self.config.data["record_audio"]     = self._aud.isChecked()
         self.config.data["selected_monitor"] = self._mcb.currentData() or 0
+        self.config.data["region_capture_method"] = (
+            "standard" if self._region_method_grp.checkedId() == 1 else "ffmpeg")
         
         # Safely determine the active OCR engine using QButtonGroup ID
         engine_id = self._ocr_grp.checkedId()
