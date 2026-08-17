@@ -1301,8 +1301,7 @@ class RecordingBar(QWidget):
         super().__init__(None,
                          Qt.WindowType.Tool |
                          Qt.WindowType.FramelessWindowHint |
-                         Qt.WindowType.WindowStaysOnTopHint |
-                         Qt.WindowType.BypassWindowManagerHint)
+                         Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(286, 38)
@@ -5454,8 +5453,14 @@ class RecordingThread(QThread):
         self._proc         = None
 
     def stop(self):
+        # IMPORTANT: only set the flag here. This is called directly (not via
+        # a queued signal) from the GUI thread's button-click handler, so
+        # anything blocking here (like waiting on the ffmpeg process) would
+        # freeze the whole UI for several seconds. The actual graceful
+        # stop/kill of ffmpeg is handled exclusively inside run()'s own loop,
+        # which executes on this worker thread — calling _kill_ffmpeg() here
+        # too would also race with that same cleanup on the ffmpeg process.
         self._stop.set()
-        self._kill_ffmpeg()
 
     def _kill_ffmpeg(self):
         p = self._proc
@@ -10212,8 +10217,9 @@ class MainWindow(QMainWindow):
         self.rec_th.start()
 
         self.is_rec = True; self.rec_ind.show()
-        self._rec_btn.setText("⏹ Stop"); self._rec_btn.setProperty("rec", "1")
-        self._rec_btn.setStyle(self._rec_btn.style())
+        if hasattr(self, "_rec_btn"):
+            self._rec_btn.setText("⏹ Stop"); self._rec_btn.setProperty("rec", "1")
+            self._rec_btn.setStyle(self._rec_btn.style())
         self._status("🔴 Recording…")
 
     def _on_rec_region(self, x, y, w, h):
@@ -10249,8 +10255,9 @@ class MainWindow(QMainWindow):
 
     def _stop_rec(self, abort=False):
         self._abort = abort; self.is_rec = False; self.rec_ind.hide()
-        self._rec_btn.setText("Record"); self._rec_btn.setProperty("rec", "0")
-        self._rec_btn.setStyle(self._rec_btn.style())
+        if hasattr(self, "_rec_btn"):
+            self._rec_btn.setText("Record"); self._rec_btn.setProperty("rec", "0")
+            self._rec_btn.setStyle(self._rec_btn.style())
         if self._border: self._border.stop(); self._border = None
         if self._bar:    self._bar.stop_display(); self._bar = None
         self._status("⏹ Stopping…")
@@ -10258,8 +10265,9 @@ class MainWindow(QMainWindow):
 
     def _on_rec_done(self, path):
         self.is_rec = False; self.rec_ind.hide()
-        self._rec_btn.setText("Record"); self._rec_btn.setProperty("rec", "0")
-        self._rec_btn.setStyle(self._rec_btn.style())
+        if hasattr(self, "_rec_btn"):
+            self._rec_btn.setText("Record"); self._rec_btn.setProperty("rec", "0")
+            self._rec_btn.setStyle(self._rec_btn.style())
         self.rec_th = None
         if self._border: self._border.stop(); self._border = None
         if self._bar:    self._bar.stop_display(); self._bar = None
@@ -10272,8 +10280,9 @@ class MainWindow(QMainWindow):
 
     def _on_rec_err(self, msg):
         self.is_rec = False; self.rec_ind.hide()
-        self._rec_btn.setText("Record"); self._rec_btn.setProperty("rec", "0")
-        self._rec_btn.setStyle(self._rec_btn.style())
+        if hasattr(self, "_rec_btn"):
+            self._rec_btn.setText("Record"); self._rec_btn.setProperty("rec", "0")
+            self._rec_btn.setStyle(self._rec_btn.style())
         self.rec_th = None
         if self._border: self._border.stop(); self._border = None
         if self._bar:    self._bar.stop_display(); self._bar = None
