@@ -91,19 +91,100 @@ except ImportError:
     QRCODE_AVAILABLE = False
 
 _easyocr_reader   = None   # lazy singleton — first use initialises it
+_easyocr_reader_lang = None  # canonical lang code the cached reader was built for
 _paddleocr_reader = None   # lazy singleton — first use initialises it
+_paddleocr_reader_lang = None  # canonical lang code the cached reader was built for
 
 
+# ── OCR language support ────────────────────────────────────────────────
+# One canonical (ISO 639-1-ish) code per language, used in Settings and in
+# config storage. Each OCR backend has its own naming scheme, so we keep a
+# separate mapping per engine below rather than assuming they line up.
+OCR_LANGUAGES = [
+    ("English",    "en"),
+    ("Polski",     "pl"),
+    ("Deutsch",    "de"),
+    ("Français",   "fr"),
+    ("Español",    "es"),
+    ("Italiano",   "it"),
+    ("Português",  "pt"),
+    ("Русский",    "ru"),
+    ("Українська", "uk"),
+    ("Čeština",    "cs"),
+]
+OCR_LANGUAGE_CODES = {code for _, code in OCR_LANGUAGES}
+OCR_LANGUAGE_NAMES = {code: name for name, code in OCR_LANGUAGES}
 
 
+def _make_ocr_lang_grid(checked_codes, columns: int = 3):
+    """Build a QGridLayout of checkboxes covering OCR_LANGUAGES, with the
+    codes in `checked_codes` pre-checked. Returns (grid, {code: checkbox})
+    so callers can read back the selection later. Shared between the
+    Settings dialog and the OCR/QR Toolbox so both look/behave the same."""
+    grid = QGridLayout()
+    checked = set(checked_codes or [])
+    boxes = {}
+    for i, (name, code) in enumerate(OCR_LANGUAGES):
+        cb = QCheckBox(name)
+        cb.setChecked(code in checked)
+        boxes[code] = cb
+        grid.addWidget(cb, i // columns, i % columns)
+    return grid, boxes
 
-def _get_easyocr_reader():
-    global _easyocr_reader
-    if _easyocr_reader is None and EASYOCR_AVAILABLE:
+# PaddleOCR's classic (v2/v3 python package) `lang=` parameter. Mostly
+# matches the canonical code, except German which uses its English name.
+_PADDLE_LANG_MAP = {
+    "en": "en", "pl": "pl", "de": "german", "fr": "fr", "es": "es",
+    "it": "it", "pt": "pt", "ru": "ru", "uk": "uk", "cs": "cs",
+}
+
+# Tesseract uses 3-letter ISO 639-2/T codes and needs the matching
+# tessdata language pack installed (e.g. `tesseract-ocr-pol` on Debian/Ubuntu).
+_TESSERACT_LANG_MAP = {
+    "en": "eng", "pl": "pol", "de": "deu", "fr": "fra", "es": "spa",
+    "it": "ita", "pt": "por", "ru": "rus", "uk": "ukr", "cs": "ces",
+}
+
+# EasyOCR uses ISO 639-1 codes directly, same as our canonical codes.
+_EASYOCR_LANG_MAP = {code: code for _, code in OCR_LANGUAGES}
+
+
+def _paddle_lang(code: str) -> str:
+    return _PADDLE_LANG_MAP.get(code, code)
+
+
+def _tesseract_lang(code: str) -> str:
+    return _TESSERACT_LANG_MAP.get(code, code)
+
+
+def _easyocr_langs(codes) -> list:
+    """Map a list of canonical language codes to EasyOCR's codes, de-duped
+    and order-preserved. EasyOCR requires all languages in one Reader to
+    share a compatible character set (e.g. Latin-script languages can mix,
+    but Cyrillic can't mix with most Latin-only ones) — an incompatible
+    combination raises inside easyocr.Reader(), which callers should catch."""
+    if isinstance(codes, str):
+        codes = [codes]
+    out = []
+    for c in codes:
+        mapped = _EASYOCR_LANG_MAP.get(c, c)
+        if mapped not in out:
+            out.append(mapped)
+    return out or ["en"]
+
+
+def _get_easyocr_reader(lang_codes="pl"):
+    global _easyocr_reader, _easyocr_reader_lang
+    langs = _easyocr_langs(lang_codes)
+    key = tuple(langs)
+    if EASYOCR_AVAILABLE and (_easyocr_reader is None or _easyocr_reader_lang != key):
         try:
-            _easyocr_reader = _easyocr.Reader(["en", "pl"], gpu=False, verbose=False)
+            _easyocr_reader = _easyocr.Reader(langs, gpu=False, verbose=False)
+            _easyocr_reader_lang = key
         except Exception as e:
             print(f"EasyOCR init error: {e}")
+            _easyocr_reader = None
+            _easyocr_reader_lang = None
     return _easyocr_reader
 
 
@@ -111,9 +192,9 @@ def _get_easyocr_reader():
 _paddleocr_api_version = None   # "v3" | "v2" | None
 _paddleocr_init_error  = None   # last init error message, shown to user
 
-def _get_paddleocr_reader():
-    global _paddleocr_reader, _paddleocr_api_version, _paddleocr_init_error
-    if _paddleocr_reader is None and PADDLEOCR_AVAILABLE:
+def _get_paddleocr_reader(lang_code: str = "pl"):
+    global _paddleocr_reader, _paddleocr_reader_lang, _paddleocr_api_version, _paddleocr_init_error
+    if PADDLEOCR_AVAILABLE and (_paddleocr_reader is None or _paddleocr_reader_lang != lang_code):
         # Disable OneDNN/MKL-DNN — causes ConvertPirAttribute crash on Windows
         os.environ.setdefault("FLAGS_use_mkldnn", "0")
         os.environ.setdefault("PADDLE_DISABLE_MKL", "1")
@@ -144,14 +225,16 @@ def _get_paddleocr_reader():
                     if not removed:
                         raise  # nothing left to strip — real error
 
+        pl = _paddle_lang(lang_code)
         last_err = None
         for ver, kwargs in [
-            ("v3", {"lang": "en", "show_log": False}),
-            ("v2", {"use_angle_cls": True, "lang": "en", "show_log": False}),
+            ("v3", {"lang": pl, "show_log": False}),
+            ("v2", {"use_angle_cls": True, "lang": pl, "show_log": False}),
         ]:
             try:
                 inst = _try_init_paddle(kwargs)
                 _paddleocr_reader = inst
+                _paddleocr_reader_lang = lang_code
                 _paddleocr_api_version = ver
                 break
             except Exception as e:
@@ -164,6 +247,62 @@ def _get_paddleocr_reader():
                 print("[PyshareX] PaddleOCR may crash on Linux VMs or CPUs without AVX. "
                       "Switch to EasyOCR in Settings → OCR engine.")
     return _paddleocr_reader
+
+def _paddle_extract(result_obj, api_version):
+    """Extract (lines, avg_confidence) from a PaddleOCR result, for either
+    the v3 (.predict) or v2 (.ocr) API result shapes. Used to score results
+    from different language models against each other."""
+    lines, confs = [], []
+    if api_version == "v3":
+        for item in (result_obj or []):
+            texts, scores = None, None
+            try:
+                texts = item["rec_texts"]
+                scores = item.get("rec_scores")
+            except (KeyError, TypeError, AttributeError):
+                texts = getattr(item, "rec_texts", None)
+                scores = getattr(item, "rec_scores", None)
+            if isinstance(texts, (list, tuple)):
+                for i, t in enumerate(texts):
+                    if not t:
+                        continue
+                    lines.append(str(t))
+                    if scores and i < len(scores):
+                        try: confs.append(float(scores[i]))
+                        except Exception: pass
+            elif isinstance(texts, str) and texts:
+                lines.append(texts)
+            else:
+                try:
+                    for line in item:
+                        if line and len(line) >= 2:
+                            text_info = line[1]
+                            if isinstance(text_info, (list, tuple)) and text_info:
+                                lines.append(str(text_info[0]))
+                                if len(text_info) > 1:
+                                    try: confs.append(float(text_info[1]))
+                                    except Exception: pass
+                            elif isinstance(text_info, str):
+                                lines.append(text_info)
+                except Exception:
+                    pass
+    else:
+        for block in (result_obj or []):
+            if block is None:
+                continue
+            for line in block:
+                if line and len(line) >= 2:
+                    text_info = line[1]
+                    if isinstance(text_info, (list, tuple)) and text_info:
+                        lines.append(str(text_info[0]))
+                        if len(text_info) > 1:
+                            try: confs.append(float(text_info[1]))
+                            except Exception: pass
+                    elif isinstance(text_info, str):
+                        lines.append(text_info)
+    avg_conf = (sum(confs) / len(confs)) if confs else (0.3 if lines else 0.0)
+    return lines, avg_conf
+
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX   = platform.system() == "Linux"
@@ -850,6 +989,17 @@ class Config:
             "record_audio":     False,
             "selected_monitor": 0,
             "ocr_engine": "paddleocr",
+            # Canonical (ISO 639-1-ish) OCR language codes — see OCR_LANGUAGES
+            # near the top of the file. Each engine maps these to its own
+            # code scheme in _paddle_lang()/_tesseract_lang()/etc, and each
+            # engine combines multiple selected languages differently:
+            #   • Tesseract: recognizes all of them in one pass (-l a+b+c)
+            #   • EasyOCR:   recognizes all of them in one pass, but only if
+            #                they belong to a compatible character-set group
+            #   • PaddleOCR: can only load one language model at a time, so
+            #                we run each selected language separately and
+            #                keep whichever result has the highest confidence
+            "ocr_languages": ["pl"],
             # Which engine "Capture Region" uses to grab the final screenshot:
             #   "ffmpeg"   — original method (gdigrab/x11grab), requires ffmpeg
             #   "standard" — new ffmpeg-free method (mss + PIL), DPI-aware
@@ -887,6 +1037,24 @@ class Config:
                             json.dump(d, fw, indent=2, ensure_ascii=False)
                     except Exception:
                         pass
+                # Auto-migrate: convert legacy single "ocr_language" string
+                # into the new "ocr_languages" list, and make sure the list
+                # only contains codes we actually know about.
+                legacy_lang = d.get("ocr_language")
+                if "ocr_languages" not in d and legacy_lang in OCR_LANGUAGE_CODES:
+                    d["ocr_languages"] = [legacy_lang]
+                langs = d.get("ocr_languages")
+                if not isinstance(langs, list) or not langs:
+                    d["ocr_languages"] = ["pl"]
+                else:
+                    cleaned = [c for c in langs if c in OCR_LANGUAGE_CODES]
+                    d["ocr_languages"] = cleaned or ["pl"]
+                d.pop("ocr_language", None)
+                try:
+                    with open(self.path, "w", encoding="utf-8") as fw:
+                        json.dump(d, fw, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
                 return d
             except Exception:
                 pass
@@ -5177,14 +5345,19 @@ class CaptureEngine:
         path = self.capture_region(x, y, w, h)
         if not path: return ""
         engine = self.config.get("ocr_engine", "paddleocr")
+        lang_codes = self.config.get("ocr_languages", ["pl"])
         if engine == "paddleocr":
-            return self._ocr_paddleocr(path)
+            return self._ocr_paddleocr(path, lang_codes)
         elif engine == "easyocr":
-            return self._ocr_easyocr(path)
+            return self._ocr_easyocr(path, lang_codes)
         else:
-            return self._ocr_tesseract(path)
+            return self._ocr_tesseract(path, lang_codes)
 
-    def _ocr_paddleocr(self, image_path: str) -> str:
+    def _ocr_paddleocr(self, image_path: str, lang_codes=("pl",)) -> str:
+        if isinstance(lang_codes, str):
+            lang_codes = [lang_codes]
+        lang_codes = list(lang_codes) or ["pl"]
+
         if not PADDLEOCR_AVAILABLE:
             return ("PaddleOCR is not installed.\n"
                     "Install with:  pip install paddlepaddle paddleocr\n"
@@ -5196,91 +5369,71 @@ class CaptureEngine:
         # Safe solution: run PaddleOCR in an isolated subprocess so a crash
         # there does not take down PyshareX.
         if IS_LINUX:
-            return self._ocr_paddleocr_subprocess(image_path)
+            return self._ocr_paddleocr_subprocess(image_path, lang_codes)
 
-        reader = _get_paddleocr_reader()
-        if reader is None:
-            detail = f"\n\nError: {_paddleocr_init_error}" if _paddleocr_init_error else ""
+        # PaddleOCR expects BGR numpy array (same as OpenCV).
+        # Passing a file path triggers the OneDNN loader crash on Windows,
+        # so we always convert to BGR array first.
+        img_input = image_path  # fallback if numpy unavailable
+        try:
+            import numpy as _np
+            import cv2 as _cv2
+            img_input = _cv2.imdecode(
+                _np.fromfile(image_path, dtype=_np.uint8), _cv2.IMREAD_COLOR
+            )  # result is BGR uint8 — exactly what PaddleOCR expects
+        except Exception:
+            try:
+                import numpy as _np
+                from PIL import Image as _PILImage
+                _pil = _PILImage.open(image_path).convert("RGB")
+                # PIL gives RGB → flip to BGR for PaddleOCR
+                img_input = _np.array(_pil)[:, :, ::-1].copy()
+            except Exception:
+                pass  # last resort: raw path
+
+        # PaddleOCR can only load one language model at a time. With several
+        # languages selected, run each one and keep whichever result has the
+        # highest average recognition confidence.
+        best_lines, best_score, any_reader = [], -1.0, False
+        last_err = None
+        for code in lang_codes:
+            reader = _get_paddleocr_reader(code)
+            if reader is None:
+                last_err = _paddleocr_init_error
+                continue
+            any_reader = True
+            try:
+                if _paddleocr_api_version == "v3":
+                    result_obj = reader.predict(img_input)
+                else:
+                    result_obj = reader.ocr(img_input, cls=True)
+                lines, score = _paddle_extract(result_obj, _paddleocr_api_version)
+            except Exception as e:
+                last_err = str(e)
+                continue
+            if score > best_score or (score == best_score and len(lines) > len(best_lines)):
+                best_lines, best_score = lines, score
+
+        if not any_reader:
+            detail = f"\n\nError: {last_err}" if last_err else ""
             return (
                 f"PaddleOCR failed to initialize.{detail}\n\n"
                 "Possible fixes:\n"
                 "  • Upgrade: pip install --upgrade paddlepaddle paddleocr\n"
                 "  • Or switch to EasyOCR in Settings → OCR engine."
             )
-        try:
-            # PaddleOCR expects BGR numpy array (same as OpenCV).
-            # Passing a file path triggers the OneDNN loader crash on Windows,
-            # so we always convert to BGR array first.
-            img_input = image_path  # fallback if numpy unavailable
-            try:
-                import numpy as _np
-                import cv2 as _cv2
-                img_input = _cv2.imdecode(
-                    _np.fromfile(image_path, dtype=_np.uint8), _cv2.IMREAD_COLOR
-                )  # result is BGR uint8 — exactly what PaddleOCR expects
-            except Exception:
-                try:
-                    import numpy as _np
-                    from PIL import Image as _PILImage
-                    _pil = _PILImage.open(image_path).convert("RGB")
-                    # PIL gives RGB → flip to BGR for PaddleOCR
-                    img_input = _np.array(_pil)[:, :, ::-1].copy()
-                except Exception:
-                    pass  # last resort: raw path
+        return "\n".join(best_lines)
 
-            # PaddleOCR 3.x uses .predict(); 2.x uses .ocr()
-            if _paddleocr_api_version == "v3":
-                result_obj = reader.predict(img_input)
-                lines = []
-                for item in (result_obj or []):
-                    try:
-                        texts = item["rec_texts"]
-                        if isinstance(texts, (list, tuple)):
-                            lines.extend([str(t) for t in texts if t])
-                        elif isinstance(texts, str) and texts:
-                            lines.append(texts)
-                        continue
-                    except (KeyError, TypeError):
-                        pass
-                    texts = getattr(item, "rec_texts", None)
-                    if isinstance(texts, (list, tuple)):
-                        lines.extend([str(t) for t in texts if t])
-                    elif isinstance(texts, str) and texts:
-                        lines.append(texts)
-                    else:
-                        try:
-                            for line in item:
-                                if line and len(line) >= 2:
-                                    text_info = line[1]
-                                    if isinstance(text_info, (list, tuple)) and text_info:
-                                        lines.append(str(text_info[0]))
-                                    elif isinstance(text_info, str):
-                                        lines.append(text_info)
-                        except Exception:
-                            pass
-                return "\n".join(lines)
-            else:
-                # PaddleOCR 2.x
-                results = reader.ocr(img_input, cls=True)
-                lines = []
-                for block in (results or []):
-                    if block is None:
-                        continue
-                    for line in block:
-                        if line and len(line) >= 2:
-                            text_info = line[1]
-                            if isinstance(text_info, (list, tuple)) and text_info:
-                                lines.append(str(text_info[0]))
-                            elif isinstance(text_info, str):
-                                lines.append(text_info)
-                return "\n".join(lines)
-        except Exception as e:
-            return f"PaddleOCR error: {e}"
-
-    def _ocr_paddleocr_subprocess(self, image_path: str) -> str:
+    def _ocr_paddleocr_subprocess(self, image_path: str, lang_codes=("pl",)) -> str:
         """Run PaddleOCR in an isolated subprocess on Linux.
         If PaddlePaddle raises SIGILL (no AVX), only the child process dies —
-        PyshareX keeps running and returns a clear error message."""
+        PyshareX keeps running and returns a clear error message.
+        Tries every selected language inside the one subprocess (to avoid
+        paying Python/paddle import cost per language) and keeps whichever
+        result has the highest average recognition confidence."""
+        if isinstance(lang_codes, str):
+            lang_codes = [lang_codes]
+        paddle_langs = ",".join(_paddle_lang(c) for c in (lang_codes or ["pl"]))
         # Inline Python script passed via -c — no temp file needed.
         script = r"""
 import sys, os, json
@@ -5289,6 +5442,7 @@ os.environ.setdefault("PADDLE_DISABLE_MKL", "1")
 os.environ.setdefault("FLAGS_onednn_cpu_enable", "0")
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
 image_path = sys.argv[1]
+paddle_langs = sys.argv[2].split(",")
 try:
     from paddleocr import PaddleOCR
     def _try_init(kwargs):
@@ -5307,16 +5461,56 @@ try:
                         del kw[p]; tried.add(p); removed = True; break
                 if not removed:
                     raise
-    reader = None
-    ver = None
-    for v, kw in [("v3", {"lang": "en", "show_log": False}),
-                  ("v2", {"use_angle_cls": True, "lang": "en", "show_log": False})]:
-        try:
-            reader = _try_init(kw); ver = v; break
-        except Exception:
-            continue
-    if reader is None:
-        print("ERROR: PaddleOCR init failed", file=sys.stderr); sys.exit(1)
+
+    def _extract(result_obj, ver):
+        lines, confs = [], []
+        if ver == "v3":
+            for item in (result_obj or []):
+                texts, scores = None, None
+                try:
+                    texts = item["rec_texts"]; scores = item.get("rec_scores")
+                except (KeyError, TypeError, AttributeError):
+                    texts = getattr(item, "rec_texts", None)
+                    scores = getattr(item, "rec_scores", None)
+                if isinstance(texts, (list, tuple)):
+                    for i, t in enumerate(texts):
+                        if not t: continue
+                        lines.append(str(t))
+                        if scores and i < len(scores):
+                            try: confs.append(float(scores[i]))
+                            except Exception: pass
+                elif isinstance(texts, str) and texts:
+                    lines.append(texts)
+                else:
+                    try:
+                        for ln in item:
+                            if ln and len(ln) >= 2:
+                                ti = ln[1]
+                                if isinstance(ti, (list, tuple)) and ti:
+                                    lines.append(str(ti[0]))
+                                    if len(ti) > 1:
+                                        try: confs.append(float(ti[1]))
+                                        except Exception: pass
+                                elif isinstance(ti, str):
+                                    lines.append(ti)
+                    except Exception:
+                        pass
+        else:
+            for block in (result_obj or []):
+                if not block: continue
+                for ln in block:
+                    if ln and len(ln) >= 2:
+                        ti = ln[1]
+                        if isinstance(ti, (list, tuple)) and ti:
+                            lines.append(str(ti[0]))
+                            if len(ti) > 1:
+                                try: confs.append(float(ti[1]))
+                                except Exception: pass
+                        elif isinstance(ti, str):
+                            lines.append(ti)
+        avg = (sum(confs) / len(confs)) if confs else (0.3 if lines else 0.0)
+        return lines, avg
+
     try:
         import numpy as _np, cv2 as _cv2
         img = _cv2.imdecode(_np.fromfile(image_path, dtype=_np.uint8), _cv2.IMREAD_COLOR)
@@ -5325,43 +5519,39 @@ try:
         import numpy as _np
         _p = _PIL.open(image_path).convert("RGB")
         img = _np.array(_p)[:, :, ::-1].copy()
-    lines = []
-    if ver == "v3":
-        for item in (reader.predict(img) or []):
+
+    best_lines, best_score = [], -1.0
+    init_errors = []
+    for lang in paddle_langs:
+        reader, ver = None, None
+        for v, kw in [("v3", {"lang": lang, "show_log": False}),
+                      ("v2", {"use_angle_cls": True, "lang": lang, "show_log": False})]:
             try:
-                t = item["rec_texts"]
-                lines += [str(x) for x in (t if isinstance(t, (list,tuple)) else [t]) if x]
+                reader = _try_init(kw); ver = v; break
+            except Exception as e:
+                init_errors.append(f"{lang}: {e}")
                 continue
-            except (KeyError, TypeError):
-                pass
-            t = getattr(item, "rec_texts", None)
-            if isinstance(t, (list, tuple)):
-                lines += [str(x) for x in t if x]
-            elif isinstance(t, str) and t:
-                lines.append(t)
-            else:
-                try:
-                    for ln in item:
-                        if ln and len(ln) >= 2:
-                            ti = ln[1]
-                            lines.append(str(ti[0]) if isinstance(ti, (list,tuple)) else str(ti))
-                except Exception:
-                    pass
-    else:
-        for block in (reader.ocr(img, cls=True) or []):
-            if not block: continue
-            for ln in block:
-                if ln and len(ln) >= 2:
-                    ti = ln[1]
-                    lines.append(str(ti[0]) if isinstance(ti, (list,tuple)) else str(ti))
-    print(json.dumps(lines))
+        if reader is None:
+            continue
+        try:
+            result_obj = reader.predict(img) if ver == "v3" else reader.ocr(img, cls=True)
+            lines, score = _extract(result_obj, ver)
+        except Exception as e:
+            init_errors.append(f"{lang}: {e}")
+            continue
+        if score > best_score or (score == best_score and len(lines) > len(best_lines)):
+            best_lines, best_score = lines, score
+
+    if not best_lines and init_errors:
+        print("ERROR: " + " | ".join(init_errors), file=sys.stderr); sys.exit(1)
+    print(json.dumps(best_lines))
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
 """
         try:
             result = subprocess.run(
-                [sys.executable, "-c", script, image_path],
-                capture_output=True, text=True, timeout=60,
+                [sys.executable, "-c", script, image_path, paddle_langs],
+                capture_output=True, text=True, timeout=90,
             )
             if result.returncode != 0:
                 stderr = result.stderr.strip().splitlines()
@@ -5379,28 +5569,46 @@ except Exception as e:
             lines = _json.loads(result.stdout.strip())
             return "\n".join(lines)
         except subprocess.TimeoutExpired:
-            return "PaddleOCR timed out (>60s). Switch to EasyOCR in Settings."
+            return "PaddleOCR timed out (>90s). Try fewer languages, or switch to EasyOCR in Settings."
         except Exception as e:
             return f"PaddleOCR subprocess launch error: {e}"
 
-    def _ocr_easyocr(self, image_path: str) -> str:
+    def _ocr_easyocr(self, image_path: str, lang_codes=("pl",)) -> str:
+        if isinstance(lang_codes, str):
+            lang_codes = [lang_codes]
         if not EASYOCR_AVAILABLE:
             return ("EasyOCR is not installed.\n"
                     "Install with:  pip install easyocr\n"
                     "Falling back — try Tesseract engine in Settings.")
-        reader = _get_easyocr_reader()
+        reader = _get_easyocr_reader(lang_codes)
         if reader is None:
-            return "EasyOCR failed to initialize."
+            return (
+                "EasyOCR failed to initialize for this language combination.\n"
+                "Some languages can't be mixed in one model — for example "
+                "Cyrillic (Russian, Ukrainian) can't be combined with most "
+                "Latin-only languages.\n"
+                "Try selecting fewer / more compatible languages in Settings."
+            )
         try:
             results = reader.readtext(image_path, detail=0, paragraph=True)
             return "\n".join(results)
         except Exception as e:
             return f"EasyOCR error: {e}"
 
-    def _ocr_tesseract(self, image_path: str) -> str:
+    def _ocr_tesseract(self, image_path: str, lang_codes=("pl",)) -> str:
+        if isinstance(lang_codes, str):
+            lang_codes = [lang_codes]
         try:
+            codes = []
+            for c in (lang_codes or ["pl"]):
+                tc = _tesseract_lang(c)
+                if tc not in codes:
+                    codes.append(tc)
+            if "eng" not in codes:
+                codes.append("eng")
+            lang_arg = "+".join(codes)
             r = subprocess.run(["tesseract", image_path, "stdout",
-                                 "-l", "pol+eng", "--psm", "3"],
+                                 "-l", lang_arg, "--psm", "3"],
                                 capture_output=True, text=True, timeout=30)
             return r.stdout.strip()
         except FileNotFoundError:
@@ -8874,12 +9082,22 @@ class OcrQrToolboxDialog(QDialog):
         self.main_window = main_window
         self._qr_pixmap  = None
         self._sel        = None
+        self._toolbox_langs = list(main_window.config.get("ocr_languages", ["pl"])) or ["pl"]
         self.setWindowTitle("OCR / QR Toolbox")
         self.setMinimumSize(720, 480)
         self.setWindowFlags(Qt.WindowType.Window)
         self._ocr_result_sig.connect(self._on_ocr_result)
         self._qr_result_sig.connect(self._on_qr_result)
         self._build()
+
+    def showEvent(self, event):
+        """Every time this window becomes visible (first open, or coming
+        back after region selection / being reopened), re-sync the language
+        selection with the config — it may have changed elsewhere (e.g. the
+        Settings page) while this dialog existed but wasn't visible."""
+        super().showEvent(event)
+        self._toolbox_langs = list(self.main_window.config.get("ocr_languages", ["pl"])) or ["pl"]
+        self._update_lang_btn_text()
 
     # ── UI ──────────────────────────────────────────────────────────────────
 
@@ -8900,8 +9118,15 @@ class OcrQrToolboxDialog(QDialog):
         btn_scan_qr.setMinimumHeight(36)
         btn_scan_qr.clicked.connect(self._scan_qr)
 
+        self._lang_btn = QPushButton()
+        self._lang_btn.setMinimumHeight(36)
+        self._lang_btn.setToolTip("Choose which language(s) OCR should recognize")
+        self._lang_btn.clicked.connect(self._pick_languages)
+        self._update_lang_btn_text()
+
         top_bar.addWidget(btn_scan_text)
         top_bar.addWidget(btn_scan_qr)
+        top_bar.addWidget(self._lang_btn)
         top_bar.addStretch()
         layout.addLayout(top_bar)
 
@@ -9010,6 +9235,53 @@ class OcrQrToolboxDialog(QDialog):
         else:
             self.qr_label.hide()
 
+    # ── OCR language picker ─────────────────────────────────────────────────
+
+    def _update_lang_btn_text(self):
+        names = [OCR_LANGUAGE_NAMES.get(c, c) for c in self._toolbox_langs] or ["Polski"]
+        label = ", ".join(names)
+        if len(label) > 24:
+            label = f"{len(self._toolbox_langs)} languages"
+        self._lang_btn.setText(f"🌐  {label}")
+
+    def _pick_languages(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("OCR recognition language(s)")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Select one or more languages to recognize:"))
+        grid, boxes = _make_ocr_lang_grid(self._toolbox_langs)
+        lay.addLayout(grid)
+        hint = QLabel(
+            "Tesseract/EasyOCR recognize the selected languages together in one pass "
+            "(EasyOCR requires compatible character sets). PaddleOCR checks each "
+            "language separately and keeps the most confident result."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size:11px; color:#a6adc8;")
+        lay.addWidget(hint)
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        cancel_btn.clicked.connect(dlg.reject)
+        ok_btn.clicked.connect(dlg.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(ok_btn)
+        lay.addLayout(btn_row)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            selected = [code for code, cb in boxes.items() if cb.isChecked()]
+            self._toolbox_langs = selected or ["pl"]
+            self._update_lang_btn_text()
+            # Keep in sync with Settings so both places show the same choice.
+            self.main_window.config.data["ocr_languages"] = self._toolbox_langs
+            self.main_window.config.save()
+            # Push the change to the Settings page immediately, in case it's
+            # the currently visible tab — otherwise its checkboxes would
+            # stay stale until the user switches tabs and back.
+            if hasattr(self.main_window, "_refresh_ocr_settings_ui"):
+                self.main_window._refresh_ocr_settings_ui()
+
     # ── Scan region → OCR ───────────────────────────────────────────────────
 
     def _scan_text(self):
@@ -9036,13 +9308,14 @@ class OcrQrToolboxDialog(QDialog):
                 self._ocr_result_sig.emit("Failed to capture screen region.")
                 return
             engine_name = mw.config.get("ocr_engine", "paddleocr")
+            lang_codes = self._toolbox_langs
             mw._prog_msg_sig.emit(f"Running {engine_name.upper()}…")
             if engine_name == "paddleocr":
-                txt = mw.engine._ocr_paddleocr(path)
+                txt = mw.engine._ocr_paddleocr(path, lang_codes)
             elif engine_name == "easyocr":
-                txt = mw.engine._ocr_easyocr(path)
+                txt = mw.engine._ocr_easyocr(path, lang_codes)
             else:
-                txt = mw.engine._ocr_tesseract(path)
+                txt = mw.engine._ocr_tesseract(path, lang_codes)
             mw._prog_hide_sig.emit()
             self._ocr_result_sig.emit(txt)
 
@@ -9476,6 +9749,26 @@ class MainWindow(QMainWindow):
         ocr_status_lbl = QLabel(easyocr_status)
         ocr_status_lbl.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
         ocr_l.addWidget(ocr_status_lbl)
+
+        # OCR language(s) — multi-select, since Tesseract/EasyOCR can
+        # recognize several languages in one pass, and PaddleOCR tries each
+        # selected language separately and keeps the best-confidence result.
+        ocr_l.addWidget(QLabel("Recognition language(s):"))
+        cur_langs = self.config.get("ocr_languages", ["pl"])
+        lang_grid, self._ocr_lang_cbs = _make_ocr_lang_grid(cur_langs)
+        ocr_l.addLayout(lang_grid)
+        lang_hint = QLabel(
+            "Wybierz jeden lub więcej języków tekstu do rozpoznawania. Tesseract i EasyOCR "
+            "rozpoznają wybrane języki w jednym przebiegu (EasyOCR wymaga, by były ze sobą "
+            "kompatybilne, np. nie łączy cyrylicy z alfabetem łacińskim). PaddleOCR sprawdza "
+            "każdy wybrany język osobno i zwraca wynik z najwyższą pewnością — więcej "
+            "języków = wolniejsze skanowanie. Tesseract wymaga doinstalowania odpowiedniego "
+            "pakietu językowego (np. tesseract-ocr-pol)."
+        )
+        lang_hint.setWordWrap(True)
+        lang_hint.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
+        ocr_l.addWidget(lang_hint)
+
         lay.addWidget(ocr_g)
 
         # After capture
@@ -9668,7 +9961,25 @@ class MainWindow(QMainWindow):
 
     def _show_capture(self):  self._sel_sb(0)
     def _show_tools(self):    self._sel_sb(1)
-    def _show_settings(self): self._sel_sb(2)
+
+    def _refresh_ocr_settings_ui(self):
+        """Re-sync the OCR engine/language widgets in Settings with the
+        current config, in case they were changed elsewhere (e.g. the
+        OCR/QR Toolbox's own language picker)."""
+        cur_langs = set(self.config.get("ocr_languages", ["pl"]))
+        for code, cb in self._ocr_lang_cbs.items():
+            cb.setChecked(code in cur_langs)
+        engine = self.config.get("ocr_engine", "paddleocr")
+        if engine == "easyocr":
+            self._ocr_easyocr_rb.setChecked(True)
+        elif engine == "tesseract":
+            self._ocr_tesseract_rb.setChecked(True)
+        else:
+            self._ocr_paddleocr_rb.setChecked(True)
+
+    def _show_settings(self):
+        self._refresh_ocr_settings_ui()
+        self._sel_sb(2)
     def _show_history(self):
         self._sel_sb(3); self._refresh_hist()
 
@@ -9780,12 +10091,20 @@ class MainWindow(QMainWindow):
             ocr_engine = "paddleocr"
             
         self.config.data["ocr_engine"]       = ocr_engine
+        selected_langs = [code for code, cb in self._ocr_lang_cbs.items() if cb.isChecked()]
+        self.config.data["ocr_languages"]    = selected_langs or ["pl"]
         self.config.data["after_capture"]    = {k: cb.isChecked() for k, cb in self._ac.items()}
         self.config.data["notifications"]    = {k: cb.isChecked() for k, cb in self._nc.items()}
         
         # Perform a single, safe disk write operation
         self.config.save()
         self._status("✅ Settings saved")
+
+        # If the OCR/QR Toolbox is open, push the new language selection to
+        # it immediately instead of waiting for it to be reopened.
+        if getattr(self, "_toolbox_dlg", None) is not None:
+            self._toolbox_dlg._toolbox_langs = list(self.config.get("ocr_languages", ["pl"])) or ["pl"]
+            self._toolbox_dlg._update_lang_btn_text()
 
     # ════════════════════════════════════════
     #  HISTORY
@@ -10008,12 +10327,13 @@ class MainWindow(QMainWindow):
         if after.get("ocr_recognize"):
             def do_auto_ocr():
                 engine = self.config.get("ocr_engine", "paddleocr")
+                lang_codes = self.config.get("ocr_languages", ["pl"])
                 if engine == "paddleocr":
-                    txt = self.engine._ocr_paddleocr(path)
+                    txt = self.engine._ocr_paddleocr(path, lang_codes)
                 elif engine == "easyocr":
-                    txt = self.engine._ocr_easyocr(path)
+                    txt = self.engine._ocr_easyocr(path, lang_codes)
                 else:
-                    txt = self.engine._ocr_tesseract(path)
+                    txt = self.engine._ocr_tesseract(path, lang_codes)
                 self._ocr_done_sig.emit(txt, "OCR Result")
             threading.Thread(target=do_auto_ocr, daemon=True).start()
 
@@ -10417,13 +10737,14 @@ class MainWindow(QMainWindow):
                 self._ocr_done_sig.emit("Failed to capture screen region.", "OCR Result")
                 return
             engine_name = self.config.get("ocr_engine", "paddleocr")
+            lang_codes = self.config.get("ocr_languages", ["pl"])
             self._prog_msg_sig.emit(f"Running {engine_name.upper()}…")
             if engine_name == "paddleocr":
-                txt = self.engine._ocr_paddleocr(path)
+                txt = self.engine._ocr_paddleocr(path, lang_codes)
             elif engine_name == "easyocr":
-                txt = self.engine._ocr_easyocr(path)
+                txt = self.engine._ocr_easyocr(path, lang_codes)
             else:
-                txt = self.engine._ocr_tesseract(path)
+                txt = self.engine._ocr_tesseract(path, lang_codes)
             self._prog_hide_sig.emit()
             self._ocr_done_sig.emit(txt, "OCR Result")
 
