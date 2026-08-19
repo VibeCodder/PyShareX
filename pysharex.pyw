@@ -1228,8 +1228,8 @@ def notify(config: Config, filepath: str, pixmap=None):
         threading.Thread(target=_play_beep, daemon=True).start()
 
     p = Path(filepath)
-    title = "Zadanie ukończone"
-    msg = f"Obraz zapisany w:\n{p.name}" # Formatowanie jak w ShareX
+    title = "Task completed"
+    msg = f"Image saved to:\n{p.name}" # Formatted like ShareX
     
     if pixmap is None:
         p = Path(filepath)
@@ -5079,6 +5079,15 @@ class EnhancedRegionSelector(QWidget):
         self._grab_composite_and_close(global_rect)
 
 
+def _month_folder(base_folder) -> Path:
+    """Return the subfolder for the current year/month (e.g. '.../PyshareX/2026-08'),
+    creating it (and its parent) if needed. All captures are organised this way so a
+    new folder appears automatically at the start of every month."""
+    f = Path(base_folder) / datetime.now().strftime("%Y-%m")
+    f.mkdir(parents=True, exist_ok=True)
+    return f
+
+
 # ─────────────────────────────────────────────
 #  CAPTURE ENGINE
 # ─────────────────────────────────────────────
@@ -5088,7 +5097,7 @@ class CaptureEngine:
         self.config = config
 
     def _folder(self):
-        f = Path(self.config.get("save_folder")); f.mkdir(parents=True, exist_ok=True); return f
+        return _month_folder(self.config.get("save_folder"))
 
     def _fp(self, prefix):
         ext = self.config.get("image_format", "png")
@@ -5622,7 +5631,7 @@ except Exception as e:
         if not path: return ""
         
         if not CV2_AVAILABLE:
-            return "Brak biblioteki OpenCV. Zainstaluj ją poleceniem:\npip install opencv-python"
+            return "OpenCV library not found. Install it with:\npip install opencv-python"
             
         try:
             import cv2
@@ -5632,9 +5641,9 @@ except Exception as e:
             
             if data:
                 return data
-            return "Nie wykryto kodu QR w zaznaczonym obszarze."
+            return "No QR code detected in the selected area."
         except Exception as e:
-            return f"Wystąpił błąd podczas dekodowania: {e}"
+            return f"An error occurred while decoding: {e}"
 
 # ─────────────────────────────────────────────
 #  RECORDING THREAD
@@ -9639,10 +9648,15 @@ class MainWindow(QMainWindow):
         lay.addWidget(lbl)
 
         # Folder
-        fg = QGroupBox("Screenshots folder"); fl = QHBoxLayout(fg)
+        fg = QGroupBox("Screenshots folder"); fgl = QVBoxLayout(fg)
+        fl = QHBoxLayout()
         self._fld = QLineEdit(self.config.get("save_folder", ""))
         br = QPushButton("Browse…"); br.clicked.connect(self._browse)
-        fl.addWidget(self._fld); fl.addWidget(br); lay.addWidget(fg)
+        fl.addWidget(self._fld); fl.addWidget(br); fgl.addLayout(fl)
+        fg_hint = QLabel("A subfolder is created automatically for each month (e.g. 2026-08) and captures are saved there.")
+        fg_hint.setStyleSheet("color:#7f849c;font-size:11px;"); fg_hint.setWordWrap(True)
+        fgl.addWidget(fg_hint)
+        lay.addWidget(fg)
 
         # Format
         fmg = QGroupBox("Image format"); fml = QHBoxLayout(fmg)
@@ -9758,12 +9772,12 @@ class MainWindow(QMainWindow):
         lang_grid, self._ocr_lang_cbs = _make_ocr_lang_grid(cur_langs)
         ocr_l.addLayout(lang_grid)
         lang_hint = QLabel(
-            "Wybierz jeden lub więcej języków tekstu do rozpoznawania. Tesseract i EasyOCR "
-            "rozpoznają wybrane języki w jednym przebiegu (EasyOCR wymaga, by były ze sobą "
-            "kompatybilne, np. nie łączy cyrylicy z alfabetem łacińskim). PaddleOCR sprawdza "
-            "każdy wybrany język osobno i zwraca wynik z najwyższą pewnością — więcej "
-            "języków = wolniejsze skanowanie. Tesseract wymaga doinstalowania odpowiedniego "
-            "pakietu językowego (np. tesseract-ocr-pol)."
+            "Choose one or more languages to recognize. Tesseract and EasyOCR recognize "
+            "the selected languages in a single pass (EasyOCR requires them to be mutually "
+            "compatible, e.g. it won't combine Cyrillic with the Latin alphabet). PaddleOCR "
+            "checks each selected language separately and returns the highest-confidence "
+            "result — more languages means slower scanning. Tesseract requires the matching "
+            "language pack to be installed (e.g. tesseract-ocr-pol)."
         )
         lang_hint.setWordWrap(True)
         lang_hint.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
@@ -9811,13 +9825,17 @@ class MainWindow(QMainWindow):
         lbl = QLabel("📋 Screenshot History")
         lbl.setStyleSheet("color:#89b4fa;font-size:15px;font-weight:bold;")
         top.addWidget(lbl); top.addStretch()
-        ref = QPushButton("🔄"); ref.setFixedWidth(34); ref.setToolTip("Refresh")
+        ref = QPushButton(); ref.setIcon(_svg_icon(_SVG_REFRESH, 20)); ref.setIconSize(QSize(20, 20))
+        ref.setFixedWidth(34); ref.setToolTip("Refresh")
         ref.clicked.connect(self._refresh_hist); top.addWidget(ref)
         del_btn = QPushButton("🗑 Delete selected"); del_btn.setToolTip("Delete selected file from disk")
         del_btn.clicked.connect(self._hist_delete_selected); top.addWidget(del_btn)
-        clr_btn = QPushButton("✕ Clear all"); clr_btn.setToolTip("Delete ALL files in screenshots folder")
+        clr_btn = QPushButton("✕ Clear all"); clr_btn.setToolTip("Delete ALL files in the screenshots folder (across all month subfolders)")
         clr_btn.clicked.connect(self._hist_clear_all); top.addWidget(clr_btn)
         lay.addLayout(top)
+        hint = QLabel("Files are stored in monthly subfolders (e.g. 2026-08) — items from a month other than the current one are shown as \"YYYY-MM/filename\".")
+        hint.setStyleSheet("color:#7f849c;font-size:11px;"); hint.setWordWrap(True)
+        lay.addWidget(hint)
         self.hist_list = QListWidget()
         self.hist_list.doubleClicked.connect(self._open_hist)
         lay.addWidget(self.hist_list)
@@ -9840,10 +9858,11 @@ class MainWindow(QMainWindow):
     def _hist_clear_all(self):
         folder = Path(self.config.get("save_folder", ""))
         if not folder.exists(): return
-        files = list(folder.glob("*.*"))
+        # Files live in per-month subfolders (2026-07, 2026-08, …) — scan all of them.
+        files = [f for f in folder.rglob("*.*") if f.is_file()]
         if not files: return
         reply = QMessageBox.question(self, "Clear history",
-            f"Delete ALL {len(files)} files in {folder}?",
+            f"Delete ALL {len(files)} files in {folder} (all months)?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             errors = []
@@ -10110,13 +10129,30 @@ class MainWindow(QMainWindow):
     #  HISTORY
     # ════════════════════════════════════════
 
+    def _hist_label(self, f: Path, base: Path) -> str:
+        """Format a history entry, prefixing the month subfolder (e.g. '2026-08/')
+        whenever it isn't the current month, so older captures stay easy to spot."""
+        try:
+            rel = f.relative_to(base)
+        except ValueError:
+            rel = f.name
+        rel = str(rel).replace(os.sep, "/")
+        cur_month = datetime.now().strftime("%Y-%m")
+        if rel.startswith(cur_month + "/"):
+            rel = rel[len(cur_month) + 1:]
+        sz = f.stat().st_size
+        size_txt = f"{sz//1024 if sz>=1024 else sz}{'KB' if sz>=1024 else 'B'}"
+        return f"📄 {rel}   {size_txt}"
+
     def _refresh_hist(self):
         self.hist_list.clear()
-        folder = Path(self.config.get("save_folder", ""))
-        if not folder.exists(): return
-        for f in sorted(folder.glob("*.*"), key=lambda x: x.stat().st_mtime, reverse=True)[:200]:
-            sz = f.stat().st_size
-            item = QListWidgetItem(f"📄 {f.name}   {sz//1024 if sz>=1024 else sz}{'KB' if sz>=1024 else 'B'}")
+        base = Path(self.config.get("save_folder", ""))
+        if not base.exists(): return
+        # Screenshots/recordings now live in per-month subfolders (2026-07, 2026-08, …)
+        # so gather them recursively across all months, most recent first.
+        files = [f for f in base.rglob("*.*") if f.is_file()]
+        for f in sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)[:200]:
+            item = QListWidgetItem(self._hist_label(f, base))
             item.setData(Qt.ItemDataRole.UserRole, str(f))
             self.hist_list.addItem(item)
 
@@ -10130,8 +10166,8 @@ class MainWindow(QMainWindow):
     def _add_hist(self, path):
         p = Path(path)
         if not p.exists(): return
-        sz = p.stat().st_size
-        item = QListWidgetItem(f"📄 {p.name}   {sz//1024 if sz>=1024 else sz}{'KB' if sz>=1024 else 'B'}")
+        base = Path(self.config.get("save_folder", ""))
+        item = QListWidgetItem(self._hist_label(p, base))
         item.setData(Qt.ItemDataRole.UserRole, path)
         self.hist_list.insertItem(0, item)
 
@@ -10153,10 +10189,9 @@ class MainWindow(QMainWindow):
         e.ignore(); self.hide()   # no tray notification
 
     def _open_folder(self):
-        f = self.config.get("save_folder", "")
-        Path(f).mkdir(parents=True, exist_ok=True)
-        if IS_WINDOWS: os.startfile(f)
-        else: _popen(["xdg-open", f])
+        f = _month_folder(self.config.get("save_folder", ""))
+        if IS_WINDOWS: os.startfile(str(f))
+        else: _popen(["xdg-open", str(f)])
 
     def _quit(self):
         self._hotkeys_stop()
@@ -10353,9 +10388,9 @@ class MainWindow(QMainWindow):
                     if data:
                         self._ocr_done_sig.emit(data, "QR Code Result")
                     else:
-                        self._ocr_done_sig.emit("Nie wykryto kodu QR w zrobionym screenie.", "QR Code Result")
+                        self._ocr_done_sig.emit("No QR code detected in the captured screenshot.", "QR Code Result")
                 except Exception as e:
-                    self._ocr_done_sig.emit(f"Wystąpił błąd podczas dekodowania: {e}", "QR Code Result")
+                    self._ocr_done_sig.emit(f"An error occurred while decoding: {e}", "QR Code Result")
             threading.Thread(target=do_auto_qr, daemon=True).start()
 
         # 3. Sprawdzenie czy użytkownik chce otworzyć edytor
@@ -10366,7 +10401,7 @@ class MainWindow(QMainWindow):
             
             if pixmap:
                 # Otwieramy okno edytora
-                self.editor = ImageEditorWindow(pixmap, self.save_edited_image, self.config.get("save_folder", ""), self)
+                self.editor = ImageEditorWindow(pixmap, self.save_edited_image, str(_month_folder(self.config.get("save_folder", ""))), self)
                 self.editor.show()
 
     def _done(self, path, label="Screenshot"):
@@ -10445,7 +10480,7 @@ class MainWindow(QMainWindow):
             self.engine.capture_fullscreen(), "Full screen"), daemon=True).start()
 
     def act_scrolling(self):
-        self._status("Zaznacz obszar do przewijania (Scrolling capture)…")
+        self._status("Select area for scrolling capture…")
         self.hide()
         QTimer.singleShot(160, self._do_scroll_region)
 
@@ -10460,7 +10495,7 @@ class MainWindow(QMainWindow):
             self.show_win()
             return
 
-        self._status("Scrolling capture — przewijanie…")
+        self._status("Scrolling capture — scrolling…")
 
         def do():
             time.sleep(0.05)
@@ -10525,7 +10560,7 @@ class MainWindow(QMainWindow):
             except Exception: pass
             self.rec_th = None
 
-        folder = Path(self.config.get("save_folder", ".")); folder.mkdir(parents=True, exist_ok=True)
+        folder = _month_folder(self.config.get("save_folder", "."))
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         fp = str(folder / f"video_{ts}.mp4")
 
@@ -10640,7 +10675,7 @@ class MainWindow(QMainWindow):
     def _launch_gif(self, region):
         if self.gif_th and self.gif_th.isRunning():
             return  # already recording
-        folder = Path(self.config.get("save_folder", ".")); folder.mkdir(parents=True, exist_ok=True)
+        folder = _month_folder(self.config.get("save_folder", "."))
         ts  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         fp  = str(folder / f"gif_{ts}.gif")
         fps = self.config.get("gif_fps", 10)
@@ -10804,7 +10839,7 @@ class MainWindow(QMainWindow):
     def open_image_editor(self):
         """Launches the Image Editor workflow."""
         # Pobranie folderu zapisu z konfiguracji
-        screenshot_dir = self.config.get("save_folder", str(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)))
+        screenshot_dir = str(_month_folder(self.config.get("save_folder", str(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)))))
         
         start_dlg = ImageEditorStartDialog(self, default_dir=screenshot_dir)
         if start_dlg.exec() == QDialog.DialogCode.Accepted:
@@ -10826,9 +10861,8 @@ class MainWindow(QMainWindow):
     
     
     def save_edited_image(self, qimage):
-        """Saves the output from the editor to the screenshots folder."""
-        save_dir = Path(self.config.get("save_folder", "screenshots"))
-        save_dir.mkdir(parents=True, exist_ok=True)
+        """Saves the output from the editor to the current month's screenshots folder."""
+        save_dir = _month_folder(self.config.get("save_folder", "screenshots"))
         
         filename = f"edited_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
         path = save_dir / filename
@@ -10914,6 +10948,14 @@ def _svg_emoji_icon(svg_str: str, emoji: str, btn_w: int, btn_h: int) -> QIcon:
                      emoji)
     painter.end()
     return QIcon(pm)
+
+# SVG source for the History "Refresh" button - a clean circular-arrow glyph,
+# replacing the previous "refresh" emoji which rendered as a broken/tofu glyph
+# in the app's custom font (see the History screenshot) instead of a real icon.
+_SVG_REFRESH = """<svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+ <path d="M20.5 11.5A8.5 8.5 0 1 1 18.2 6" stroke="#89b4fa" stroke-width="2.3" stroke-linecap="round" fill="none"/>
+ <path d="M20.7 4.8v6.2h-6.2" stroke="#89b4fa" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>"""
 
 # SVG source for the Select cursor tool
 _SVG_SELECT = """<svg width="77.068" height="77.068" version="1.1" viewBox="0 0 18.496 18.496" xmlns="http://www.w3.org/2000/svg">
