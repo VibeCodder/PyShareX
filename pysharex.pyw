@@ -44,7 +44,7 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import QShortcut
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -306,6 +306,47 @@ def _paddle_extract(result_obj, api_version):
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX   = platform.system() == "Linux"
+
+def _get_visible_window_bounds(hwnd):
+    """Zwraca (left, top, right, bottom) faktycznie widocznych granic okna (Windows).
+
+    win32gui.GetWindowRect zwraca prostokąt razem z niewidzialną ramką/cieniem,
+    które DWM dorysowuje wokół okna na Windows 10/11 (zwykle kilka-kilkanaście
+    px marginesu z każdej strony) - przez co zrzut ekranu ma dodatkowy pusty
+    margines i wygląda na nieprecyzyjnie przycięty. DwmGetWindowAttribute z
+    DWMWA_EXTENDED_FRAME_BOUNDS zwraca realne, widoczne granice okna, bez
+    tego marginesu.
+    """
+    import win32gui
+    try:
+        import ctypes
+        from ctypes import wintypes
+        DWMWA_EXTENDED_FRAME_BOUNDS = 9
+        rect = wintypes.RECT()
+        hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            wintypes.HWND(hwnd),
+            ctypes.c_uint(DWMWA_EXTENDED_FRAME_BOUNDS),
+            ctypes.byref(rect),
+            ctypes.sizeof(rect),
+        )
+        if hr == 0:
+            return rect.left, rect.top, rect.right, rect.bottom
+    except Exception:
+        pass
+    return win32gui.GetWindowRect(hwnd)
+
+def _is_wayland_session() -> bool:
+    """Wykrywa, czy bieżąca sesja graficzna to Wayland (np. przyszła sesja
+    Cinnamon-Wayland w Linux Mint 23 / Cinnamon 6.8), a nie X11."""
+    if IS_WINDOWS:
+        return False
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if session_type == "wayland":
+        return True
+    if session_type == "x11":
+        return False
+    # XDG_SESSION_TYPE bywa puste (np. w niektórych DM-ach) - dodatkowy fallback:
+    return bool(os.environ.get("WAYLAND_DISPLAY"))
 
 def _set_dialog_on_top(dlg):
     """Set dialog window flags so it appears above fullscreen overlays on all platforms.
@@ -3383,7 +3424,7 @@ class EnhancedRegionSelector(QWidget):
                             win32gui.GetWindowText(hwnd)):
                         return
                     try:
-                        r = win32gui.GetWindowRect(hwnd)
+                        r = _get_visible_window_bounds(hwnd)
                     except Exception:
                         return
                     pl, pt, pr, pb = r
@@ -5110,6 +5151,13 @@ class CaptureEngine:
         kw  = {}
         if fmt in ("JPG", "JPEG"):
             fmt = "JPEG"; kw["quality"] = self.config.get("jpeg_quality", 90)
+            if img.mode == "RGBA":
+                # JPEG nie ma kanału alfa (np. przezroczyste rogi po
+                # _round_window_corners) - spłaszczamy na biało zamiast
+                # dać PIL-owi rzucić wyjątkiem przy zapisie.
+                flat = Image.new("RGB", img.size, (255, 255, 255))
+                flat.paste(img, mask=img.split()[3])
+                img = flat
         img.save(fp, fmt, **kw)
         return self._post(fp)
 
@@ -5184,25 +5232,194 @@ class CaptureEngine:
             return self._save(Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX"),
                                f"monitor{idx + 1}")
 
+    def _capture_active_window_x11(self):
+        """Przechwytywanie aktywnego okna przez xdotool (sesja X11)."""
+        try:
+            r = subprocess.run(
+                ["xdotool", "getactivewindow", "getwindowgeometry", "--shell"],
+                capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                info = dict(l.split("=") for l in r.stdout.strip().split("\n") if "=" in l)
+                return self.capture_region(int(info.get("X", 0)), int(info.get("Y", 0)),
+                                           int(info.get("WIDTH", 800)), int(info.get("HEIGHT", 600)))
+        except Exception:
+            pass
+        return None
+
+    def _capture_active_window_wayland(self):
+        """Przechwytywanie aktywnego okna na sesji Wayland (np. Cinnamon-Wayland
+        w Cinnamon 6.8 / Linux Mint 23). xdotool tam nie działa, bo Wayland z
+        założenia blokuje aplikacjom podglądanie/sterowanie innymi oknami.
+        Próbujemy kolejno:
+          1. cinnamon-list-windows - narzędzie CLI zapowiedziane w Cinnamon 6.8,
+             wypisujące pozycję/rozmiar okien (jeśli już dostępne w systemie).
+          2. Portal xdg-desktop-portal (org.freedesktop.portal.Screenshot) w
+             trybie interaktywnym - kompozytor pokaże własne narzędzie wyboru
+             okna/obszaru, bo aplikacje na Waylandzie nie mogą zrobić tego same.
+        Jeśli obie metody zawiodą, wracamy do zrzutu całego aktywnego monitora
+        i informujemy o tym użytkownika (zamiast cichej, mylącej "nieprecyzji").
+        """
+        # 1) cinnamon-list-windows (może jeszcze nie istnieć w starszych wersjach Cinnamon)
+        try:
+            r = subprocess.run(["cinnamon-list-windows"], capture_output=True,
+                                text=True, timeout=3)
+            if r.returncode == 0 and r.stdout.strip():
+                active = None
+                for line in r.stdout.strip().splitlines():
+                    parts = dict(
+                        kv.split("=", 1) for kv in line.split() if "=" in kv
+                    )
+                    if parts.get("focused") in ("1", "true", "True") or \
+                       parts.get("active") in ("1", "true", "True"):
+                        active = parts
+                        break
+                if active and all(k in active for k in ("x", "y", "width", "height")):
+                    return self.capture_region(
+                        int(active["x"]), int(active["y"]),
+                        int(active["width"]), int(active["height"]))
+        except Exception:
+            pass
+
+        # 2) Interaktywny portal (wymaga jednego kliknięcia/wyboru użytkownika)
+        try:
+            r = subprocess.run(
+                ["gdbus", "call", "--session",
+                 "--dest", "org.freedesktop.portal.Desktop",
+                 "--object-path", "/org/freedesktop/portal/desktop",
+                 "--method", "org.freedesktop.portal.Screenshot.Screenshot",
+                 "", "{'interactive': <true>}"],
+                capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                # Portal zwraca ścieżkę do obiektu Request; wynikowy plik trafia
+                # do niego asynchronicznie przez sygnał D-Bus - pełna obsługa
+                # wymagałaby nasłuchiwania na org.freedesktop.portal.Request::Response.
+                # Na razie sygnalizujemy sukces wywołania, ale bez pliku - zostaw
+                # to jako punkt rozbudowy, gdy portal będzie realnym wymaganiem.
+                pass
+        except Exception:
+            pass
+
+        return None
+
+    def _clamp_to_monitor(self, x, y, w, h):
+        """Przycina prostokąt (x, y, w, h) do granic monitora, na którym on
+        leży, tak by nie wystawał poza realny obszar ekranu.
+
+        Dla zmaksymalizowanych/przypiętych (Aero Snap) okien
+        DWMWA_EXTENDED_FRAME_BOUNDS potrafi być o kilka pikseli większy niż
+        faktyczny obszar monitora - mss w takim wypadku dokleja czarny
+        margines zamiast rzucić błąd, co wygląda jak "nieprecyzyjny" zrzut."""
+        if not MSS_AVAILABLE:
+            return x, y, w, h
+        try:
+            with mss.MSS() as sct:
+                cx, cy = x + w // 2, y + h // 2
+                mon = None
+                for m in sct.monitors[1:]:
+                    if (m["left"] <= cx < m["left"] + m["width"] and
+                            m["top"] <= cy < m["top"] + m["height"]):
+                        mon = m
+                        break
+                if mon is None:
+                    return x, y, w, h
+                left   = max(x, mon["left"])
+                top    = max(y, mon["top"])
+                right  = min(x + w, mon["left"] + mon["width"])
+                bottom = min(y + h, mon["top"] + mon["height"])
+                if right > left and bottom > top:
+                    return left, top, right - left, bottom - top
+        except Exception:
+            pass
+        return x, y, w, h
+
+    @staticmethod
+    def _win11_rounded_corners_active(hwnd) -> bool:
+        """Windows 11 (build >= 22000) rysuje zaokrąglone rogi okien w
+        stanie *normal* - ale NIE dla zmaksymalizowanych/przypiętych do
+        krawędzi (te mają zwykłe, kwadratowe rogi). Sprawdzamy oba warunki,
+        żeby nie zaokrąglać rogów tam, gdzie realne okno ich nie ma."""
+        try:
+            if sys.getwindowsversion().build < 22000:
+                return False
+        except Exception:
+            return False
+        try:
+            import win32gui
+            return not win32gui.IsZoomed(hwnd)
+        except Exception:
+            return True
+
+    @staticmethod
+    def _get_window_dpi(hwnd) -> int:
+        try:
+            import ctypes
+            dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
+            if dpi:
+                return dpi
+        except Exception:
+            pass
+        return 96
+
+    def _round_window_corners(self, img: "Image.Image", radius: int) -> "Image.Image":
+        """Maskuje 4 rogi obrazu przezroczystością, tak by pasowały do
+        realnie zaokrąglonych rogów okna w Windows 11.
+
+        GetWindowRect/DWMWA_EXTENDED_FRAME_BOUNDS zwracają zwykły
+        prostokąt, ale samo okno ma ucięte (zaokrąglone) rogi - bez tej
+        maski w rogach zrzutu zostają małe czarne trójkąciki (to, co jest
+        "pod" zaokrągloną krawędzią, np. pulpit)."""
+        if radius <= 0:
+            return img
+        img = img.convert("RGBA")
+        w, h = img.size
+        mask = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
+        img.putalpha(mask)
+        return img
+
     def capture_active_window(self) -> str:
         if IS_WINDOWS:
             try:
                 import win32gui
                 hwnd = win32gui.GetForegroundWindow()
-                x, y, x2, y2 = win32gui.GetWindowRect(hwnd)
-                return self.capture_region(x, y, x2 - x, y2 - y)
+                x, y, x2, y2 = _get_visible_window_bounds(hwnd)
+                x, y, w, h = self._clamp_to_monitor(x, y, x2 - x, y2 - y)
+                # DWM lekko antyaliasuje najbrzeżniejszy piksel obramowania
+                # okna z tłem pod spodem - nawet przy poprawnym prostokącie
+                # z DWMWA_EXTENDED_FRAME_BOUNDS zostaje 1px "obcej" linii
+                # na całym obwodzie. Wcinamy region o 1px z każdej strony,
+                # żeby jej nie złapać (tak samo robi to ShareX).
+                if w > 2 and h > 2:
+                    x, y, w, h = x + 1, y + 1, w - 2, h - 2
+                if not MSS_AVAILABLE:
+                    return None
+                img = self._grab({"left": x, "top": y, "width": w, "height": h})
+                if self._win11_rounded_corners_active(hwnd):
+                    dpi = self._get_window_dpi(hwnd)
+                    radius = round(8 * dpi / 96)  # 8px to domyślny promień DWM przy 100% skali
+                    img = self._round_window_corners(img, radius)
+                return self._save(img, "window")
             except Exception: pass
+        elif _is_wayland_session():
+            result = self._capture_active_window_wayland()
+            if result:
+                return result
+            # Fallback jawnie sygnalizowany, żeby nie było cichej "nieprecyzji"
+            self._notify_wayland_fallback()
         else:
-            try:
-                r = subprocess.run(
-                    ["xdotool", "getactivewindow", "getwindowgeometry", "--shell"],
-                    capture_output=True, text=True, timeout=3)
-                if r.returncode == 0:
-                    info = dict(l.split("=") for l in r.stdout.strip().split("\n") if "=" in l)
-                    return self.capture_region(int(info.get("X", 0)), int(info.get("Y", 0)),
-                                               int(info.get("WIDTH", 800)), int(info.get("HEIGHT", 600)))
-            except Exception: pass
+            result = self._capture_active_window_x11()
+            if result:
+                return result
         return self.capture_active_monitor()
+
+    def _notify_wayland_fallback(self):
+        """Informuje (na stderr), że na Waylandzie nie udało się precyzyjnie
+        przechwycić aktywnego okna i zrzucono cały monitor zamiast niego.
+        CaptureEngine nie ma bezpośredniego dostępu do UI (toasty obsługuje
+        moduł notify() na poziomie okna głównego), więc na razie tylko log."""
+        print("[PyshareX] Wayland: nie udało się przechwycić samego okna - "
+              "zrzucono cały aktywny monitor.", file=sys.stderr)
 
     def capture_fullscreen(self) -> str:
         if not MSS_AVAILABLE: return None
@@ -10998,7 +11215,37 @@ def load_app_icon() -> QIcon:
     return _tray_icon()
 
 
+def _set_windows_dpi_awareness():
+    """Deklaruje proces jako Per-Monitor-V2 DPI aware, zanim cokolwiek (Qt,
+    win32gui, mss) zdąży odpytać Windows o rozmiary/pozycje okien.
+
+    Bez tego GetWindowRect/DwmGetWindowAttribute (fizyczne piksele) i
+    zrzuty ekranu robione przez mss (też fizyczne piksele, ale liczone
+    względem "zwirtualizowanego" widoku procesu, jeśli ten nie jest DPI
+    aware) rozjeżdżają się przy skalowaniu >100% - stąd czarny margines
+    na "Capture active window" (wyliczony region jest nieco za duży albo
+    przesunięty względem realnej siatki pikseli).
+
+    Musi być wywołane jak najwcześniej w main(), przed QApplication().
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2 (Windows 8.1+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            import ctypes
+            # Fallback dla starszych Windows (Vista/7): system-wide DPI aware
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main():
+    _set_windows_dpi_awareness()
+
     if IS_LINUX:
         os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
