@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu, QFileDialog, QDialog, QLineEdit,
     QComboBox, QCheckBox, QGroupBox, QScrollArea, QFrame,
     QMessageBox, QListWidget, QListWidgetItem,
-    QDialogButtonBox, QSpinBox, QTabWidget, QRadioButton,
+    QDialogButtonBox, QSpinBox, QTabWidget, QRadioButton, QButtonGroup,
     QTextEdit, QSizePolicy, QStackedWidget, QColorDialog, QInputDialog,
     QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsRectItem,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem
@@ -1897,8 +1897,9 @@ class _OverlayCanvas(QGraphicsView):
         self._scene.addItem(item)
         return item
 
-    def add_arrow(self, line: QLineF, color: QColor, width: int):
+    def add_arrow(self, line: QLineF, color: QColor, width: int, head_style: str = 'single'):
         item = ArrowItem(line, self)
+        item.head_style = head_style
         self._apply_props(item, color, width)
         self._scene.addItem(item)
         return item
@@ -2313,8 +2314,21 @@ class HighlightRectItem(QGraphicsRectItem):
 
 
 class ArrowItem(QGraphicsLineItem):
-    """Line with an arrowhead at p2."""
+    """Line (optionally curved) with an arrowhead at one or both ends, or no head at all.
+
+    Handles when selected:
+      - p1 / p2:  white-fill / blue-border circles at the two endpoints.
+      - bend:     yellow-fill / dark-border circle at the curve's control point
+                  (starts at the midpoint) — drag it to bend the arrow into a curve,
+                  the same way a curve's break/control point works.
+      - width:    black-fill / white-outline circle sitting between p1 and the
+                  center of the arrow — drag it vertically to change stroke width.
+    """
     ARROW_BASE_SIZE = 14  # base arrow size at pen width=1
+    HEAD_SINGLE   = 'single'          # head at p2 (end) only
+    HEAD_SINGLE_START = 'single_start'  # head at p1 (start) only — the other side
+    HEAD_DOUBLE   = 'double'          # head at both ends
+    HEAD_NONE     = 'none'
 
     def __init__(self, line, canvas=None):
         super().__init__(line)
@@ -2323,54 +2337,195 @@ class ArrowItem(QGraphicsLineItem):
                       QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
                       QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.active_handle = None
+        self.head_style = self.HEAD_SINGLE
+        # Offset of the curve's control point relative to the p1-p2 midpoint,
+        # in item-local coordinates. (0, 0) == perfectly straight line.
+        self._bend = QPointF(0.0, 0.0)
+
+    # ------------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------------
+    def _control_point(self):
+        """The bend handle's position — this is a true break/kink point:
+        the curve is built so it actually passes through this point (see
+        _bezier_control_point), not just gets pulled toward it."""
+        p1, p2 = self.line().p1(), self.line().p2()
+        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+        bend = getattr(self, '_bend', QPointF(0.0, 0.0))
+        return QPointF(mid.x() + bend.x(), mid.y() + bend.y())
+
+    def _bezier_control_point(self):
+        """The actual quadratic-bezier control point used to draw the curve.
+
+        A quadratic bezier does NOT pass through its control point — at
+        t=0.5 it only reaches halfway there (0.25*p1 + 0.5*C + 0.25*p2).
+        That mismatch is what made the yellow bend handle look 'detached'
+        from the drawn curve, especially on a big bend. To make the curve
+        pass exactly through the handle position Q, mirror Q through the
+        p1-p2 midpoint: C = 2*Q - mid.
+        """
+        p1, p2 = self.line().p1(), self.line().p2()
+        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+        q = self._control_point()
+        return QPointF(2 * q.x() - mid.x(), 2 * q.y() - mid.y())
+
+    def _build_path(self):
+        """Quadratic bezier path from p1 to p2 that passes through the
+        bend/break point at its midpoint."""
+        p1, p2 = self.line().p1(), self.line().p2()
+        path = QPainterPath(p1)
+        path.quadTo(self._bezier_control_point(), p2)
+        return path
+
+    def _width_handle_pos(self):
+        """Position of the thickness handle: 1/4 of the way along the curve
+        from p1 toward the center."""
+        path = self._build_path()
+        if path.length() <= 0:
+            return self.line().p1()
+        return path.pointAtPercent(0.25)
 
     def boundingRect(self):
         extra = (self.pen().width() + self._arrow_size() + 30) / (self.canvas.transform().m11() if self.canvas else 1)
-        return super().boundingRect().adjusted(-extra, -extra, extra, extra)
+        r = super().boundingRect().adjusted(-extra, -extra, extra, extra)
+        # Include both the handle's own position and the real (further-out)
+        # bezier control point, since the curve is bounded by the convex
+        # hull of p1 / bezier-control / p2, not by the handle position alone.
+        for pt in (self._control_point(), self._bezier_control_point()):
+            r = r.united(QRectF(pt.x() - extra, pt.y() - extra, extra * 2, extra * 2))
+        return r
 
     def _arrow_size(self):
         """Arrow head size scales with pen width."""
         w = max(1, self.pen().width())
         return self.ARROW_BASE_SIZE + (w - 1) * 3
 
-    def _arrow_head_points(self):
-        line = self.line()
-        if line.length() < 1:
-            return []
-        angle = math.atan2(-line.dy(), line.dx())
+    def _head_length(self):
+        """Distance from the arrowhead's tip back to its flat base — shared
+        by the triangle geometry and by the shaft-cut clip below, so the two
+        always agree on exactly where the head's base sits."""
+        return self._arrow_size() * 1.15
+
+    def _head_triangle(self, tip, angle_rad):
+        """Return the two base points of an arrowhead triangle whose point is
+        at *tip*, facing along *angle_rad* (standard math convention, radians).
+
+        Length and half-width are set independently (instead of deriving
+        both from one sweep angle) so the head comes out as a blocky,
+        flat-backed triangle — length roughly equal to width — matching a
+        classic arrow-icon silhouette rather than a thin, wide sliver."""
         sz = self._arrow_size()
-        # Tip is exactly at p2
-        tip = line.p2()
-        p_left  = QPointF(tip.x() + sz * math.cos(angle + math.pi * 0.75),
-                          tip.y() - sz * math.sin(angle + math.pi * 0.75))
-        p_right = QPointF(tip.x() + sz * math.cos(angle - math.pi * 0.75),
-                          tip.y() - sz * math.sin(angle - math.pi * 0.75))
-        # Shorten the line so it ends at the base of the arrow, not the tip
-        arrow_len = sz * math.cos(math.pi * 0.25)
-        line_end = QPointF(tip.x() + arrow_len * math.cos(angle + math.pi),
-                           tip.y() - arrow_len * math.sin(angle + math.pi))
-        return [tip, p_left, p_right, line_end]
+        length = self._head_length()
+        half_width = sz * 0.62
+        fwd = QPointF(math.cos(angle_rad), -math.sin(angle_rad))
+        back = QPointF(tip.x() - length * fwd.x(), tip.y() - length * fwd.y())
+        perp = QPointF(-fwd.y(), fwd.x())
+        p_left  = QPointF(back.x() + half_width * perp.x(), back.y() + half_width * perp.y())
+        p_right = QPointF(back.x() - half_width * perp.x(), back.y() - half_width * perp.y())
+        return p_left, p_right
+
+    def _shaft_paint_path(self, path):
+        """The actual path used to stroke the shaft: the same curve as
+        *path*, but shortened by the arrowhead's length at whichever
+        end(s) have a head — so the shaft simply never reaches into the
+        head's zone, rather than being drawn there and then patched up.
+
+        First attempt at this used a straight guillotine clip (a flat cut
+        line positioned via the tip's tangent direction). That works for
+        straight or gently-bent arrows, but falls apart once the bend
+        gets sharp: the cut line is derived from the tangent *at the
+        tip*, projected backward in a straight line, while the curve
+        itself may hook back through a completely different area of the
+        canvas over that same stretch. On a tight hook, the straight cut
+        can end up slicing through the wrong part of the curve entirely
+        — chopping out a visible chunk of shaft instead of just the bit
+        behind the head — which is exactly the "head looks torn away
+        from the line" glitch this caused.
+
+        Fix: don't approximate with a straight line at all — walk the
+        correct arc-length distance back *along the curve itself* using
+        Qt's own arc-length parametrization (percentAtLength +
+        pointAtPercent, which are defined consistently with each other
+        regardless of how sharply the path bends), then rebuild that
+        trimmed span as a sampled polyline. This follows the actual
+        curve shape no matter how tightly it's hooked."""
+        total_len = path.length()
+        if total_len <= 0:
+            return None
+
+        head_style = getattr(self, 'head_style', self.HEAD_SINGLE)
+        length = self._head_length()
+
+        t_start, t_end = 0.0, 1.0
+        if head_style in (self.HEAD_SINGLE_START, self.HEAD_DOUBLE) and total_len > length:
+            t_start = path.percentAtLength(length)
+        if head_style in (self.HEAD_SINGLE, self.HEAD_DOUBLE) and total_len > length:
+            t_end = path.percentAtLength(total_len - length)
+        if t_end <= t_start:
+            # The arrow is shorter than its head(s) — no shaft left to draw
+            # (the head triangle itself is drawn separately regardless).
+            return None
+
+        # Sample the trimmed span as a polyline. Step count scales with
+        # the fraction of the curve being drawn, so a full-length arrow
+        # still gets a smooth curve while a mostly-clipped sliver doesn't
+        # waste samples.
+        steps = max(2, int(24 * (t_end - t_start)) + 2)
+        shaft = QPainterPath()
+        for i in range(steps + 1):
+            t = t_start + (t_end - t_start) * (i / steps)
+            pt = path.pointAtPercent(t)
+            if i == 0:
+                shaft.moveTo(pt)
+            else:
+                shaft.lineTo(pt)
+        return shaft
 
     def paint(self, painter, option, widget=None):
-        pts = self._arrow_head_points()
-        # Draw line only up to the arrow base (not overlapping the head)
-        if pts:
-            shortened = QLineF(self.line().p1(), pts[3])
-            painter.setPen(self.pen())
-            painter.drawLine(shortened)
-        else:
-            painter.setPen(self.pen())
-            painter.drawLine(self.line())
-        pts = self._arrow_head_points()
-        if len(pts) >= 3:
-            path = QPainterPath()
-            path.moveTo(pts[0])
-            path.lineTo(pts[1])
-            path.lineTo(pts[2])
-            path.closeSubpath()
+        path = self._build_path()
+
+        # Draw the shaft (straight or curved), trimmed short of any head
+        # end (see _shaft_paint_path) so it never has to be patched up
+        # after the fact. IMPORTANT: force a flat cap — Qt's default pen
+        # cap is SquareCap, which extends the stroke by half the pen
+        # width *past* whichever endpoint it's drawn to; FlatCap ends the
+        # stroke exactly there instead.
+        shaft_pen = QPen(self.pen())
+        shaft_pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(shaft_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        shaft_path = self._shaft_paint_path(path)
+        if shaft_path is not None:
+            painter.drawPath(shaft_path)
+
+        # Draw arrowhead(s) on top, per the selected head style
+        head_style = getattr(self, 'head_style', self.HEAD_SINGLE)
+        draw_head_p2 = head_style in (self.HEAD_SINGLE, self.HEAD_DOUBLE)
+        draw_head_p1 = head_style in (self.HEAD_SINGLE_START, self.HEAD_DOUBLE)
+        if (draw_head_p2 or draw_head_p1) and path.length() > 0:
             painter.setBrush(QBrush(self.pen().color()))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawPath(path)
+
+            if draw_head_p2:
+                # Head at p2 — faces the direction the curve arrives at p2
+                angle2 = math.radians(path.angleAtPercent(1.0))
+                tip2 = self.line().p2()
+                pl, pr = self._head_triangle(tip2, angle2)
+                head_path = QPainterPath()
+                head_path.moveTo(tip2); head_path.lineTo(pl); head_path.lineTo(pr)
+                head_path.closeSubpath()
+                painter.drawPath(head_path)
+
+            if draw_head_p1:
+                # Head at p1 — faces opposite the direction the curve leaves p1
+                angle1 = math.radians(path.angleAtPercent(0.0)) + math.pi
+                tip1 = self.line().p1()
+                pl, pr = self._head_triangle(tip1, angle1)
+                head_path = QPainterPath()
+                head_path.moveTo(tip1); head_path.lineTo(pl); head_path.lineTo(pr)
+                head_path.closeSubpath()
+                painter.drawPath(head_path)
+
         if self.isSelected():
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             # Handle size: 16px screen-space, scale-independent
@@ -2382,12 +2537,14 @@ class ArrowItem(QGraphicsLineItem):
             painter.drawEllipse(self.line().p1(), r, r)
             # p2 endpoint handle — white fill, blue border
             painter.drawEllipse(self.line().p2(), r, r)
-            # Width handle at midpoint — yellow fill, dark border
-            mid = QPointF((self.line().p1().x() + self.line().p2().x()) / 2,
-                          (self.line().p1().y() + self.line().p2().y()) / 2)
+            # Bend/curve control handle — yellow fill, dark border
             painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
             painter.setPen(QPen(QColor(60, 60, 60), 2.0))
-            painter.drawEllipse(mid, r, r)
+            painter.drawEllipse(self._control_point(), r, r)
+            # Width (thickness) handle — black fill, white outline
+            painter.setBrush(QBrush(Qt.GlobalColor.black))
+            painter.setPen(QPen(Qt.GlobalColor.white, 2.0))
+            painter.drawEllipse(self._width_handle_pos(), r, r)
 
     def _handle_hit_radius(self):
         """Hit-test radius for endpoint/width handles, in item-local coords.
@@ -2396,23 +2553,21 @@ class ArrowItem(QGraphicsLineItem):
 
     def shape(self):
         """Override shape() so Qt's scene hit-testing covers the full handle surfaces,
-        not just the thin line geometry. Includes a fat stroke along the line body
-        plus circular regions at p1, p2, and the midpoint (width handle)."""
+        not just the thin line geometry. Includes a fat stroke along the curve body
+        plus circular regions at p1, p2, the bend control point, and the width handle."""
         r = self._handle_hit_radius()
-        line = self.line()
-        p1, p2 = line.p1(), line.p2()
-        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+        path = self._build_path()
+        p1, p2 = self.line().p1(), self.line().p2()
+        ctrl = self._control_point()
+        whandle = self._width_handle_pos()
 
-        # Fat stroke along the line body
-        body = QPainterPath()
-        body.moveTo(p1)
-        body.lineTo(p2)
+        # Fat stroke along the curve body
         stroker = QPainterPathStroker()
         stroker.setWidth(max(self.pen().width() + 4, r * 2))
-        result = stroker.createStroke(body)
+        result = stroker.createStroke(path)
 
         # Add circular hit zones for each handle
-        for pt in (p1, p2, mid):
+        for pt in (p1, p2, ctrl, whandle):
             circle = QPainterPath()
             circle.addEllipse(pt, r, r)
             result = result.united(circle)
@@ -2422,42 +2577,52 @@ class ArrowItem(QGraphicsLineItem):
     def mousePressEvent(self, event):
         p = event.pos()
         p1, p2 = self.line().p1(), self.line().p2()
-        # Use true Euclidean distance (not manhattanLength) for accurate circular hit zones
+        ctrl = self._control_point()
+        whandle = self._width_handle_pos()
         r = self._handle_hit_radius()
 
-        if math.hypot(p.x() - p1.x(), p.y() - p1.y()) <= r:
-            self.active_handle = 'p1'
-            event.accept()
-        elif math.hypot(p.x() - p2.x(), p.y() - p2.y()) <= r:
-            self.active_handle = 'p2'
-            event.accept()
-        else:
-            mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
-            if math.hypot(p.x() - mid.x(), p.y() - mid.y()) <= r:
-                self.active_handle = 'width'
+        # Pick the closest handle within the hit radius (checked in priority
+        # order: endpoints first, then the width handle, then the bend point,
+        # since the width handle sits close to p1).
+        candidates = [
+            ('p1', p1),
+            ('p2', p2),
+            ('width', whandle),
+            ('bend', ctrl),
+        ]
+        best_name, best_d = None, r
+        for name, pt in candidates:
+            d = math.hypot(p.x() - pt.x(), p.y() - pt.y())
+            if d <= best_d:
+                best_name, best_d = name, d
+
+        if best_name:
+            self.active_handle = best_name
+            if best_name == 'width':
                 self._width_drag_start_pos = p
                 self._width_drag_start_w = self.pen().width()
-                event.accept()
-            else:
-                self.active_handle = None
-                super().mousePressEvent(event)
+            event.accept()
+        else:
+            self.active_handle = None
+            super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if getattr(self, 'active_handle', None) in ('p1', 'p2'):
+        handle = getattr(self, 'active_handle', None)
+        if handle in ('p1', 'p2'):
             self.prepareGeometryChange()
             line = self.line()
             new_pos = event.pos()
 
             # 45-degree angle snapping constraint
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                anchor = line.p2() if self.active_handle == 'p1' else line.p1()
+                anchor = line.p2() if handle == 'p1' else line.p1()
                 dx, dy = new_pos.x() - anchor.x(), new_pos.y() - anchor.y()
                 snapped_angle = round(math.degrees(math.atan2(dy, dx)) / 45) * 45
                 d = math.hypot(dx, dy)
                 new_pos = QPointF(anchor.x() + d * math.cos(math.radians(snapped_angle)),
                                   anchor.y() + d * math.sin(math.radians(snapped_angle)))
 
-            if self.active_handle == 'p1':
+            if handle == 'p1':
                 line.setP1(new_pos)
             else:
                 line.setP2(new_pos)
@@ -2465,7 +2630,16 @@ class ArrowItem(QGraphicsLineItem):
             self.setLine(line)
             event.accept()
 
-        elif getattr(self, 'active_handle', None) == 'width':
+        elif handle == 'bend':
+            self.prepareGeometryChange()
+            p1, p2 = self.line().p1(), self.line().p2()
+            mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+            new_pos = event.pos()
+            self._bend = QPointF(new_pos.x() - mid.x(), new_pos.y() - mid.y())
+            self.update()
+            event.accept()
+
+        elif handle == 'width':
             line = self.line()
             if line.length() > 0:
                 start_pos = getattr(self, '_width_drag_start_pos', event.pos())
@@ -2496,6 +2670,193 @@ class ArrowItem(QGraphicsLineItem):
             event.accept()
         else:
             super().mouseReleaseEvent(event)
+
+
+class ArrowEditDialog(QDialog):
+    """Edit dialog for Arrow items — head style (single at end / single at
+    start / double / none), line width (spin box + slider, synced), and
+    color.
+
+    If *target_item* (an ArrowItem already on the canvas) is given, every
+    change made in the dialog — head style, width, color — is applied to
+    it immediately, live, so the user sees the arrow update on the canvas
+    as they interact with the dialog. Cancelling restores the item to
+    exactly the values it had when the dialog opened.
+    """
+    def __init__(self, current_width: int, current_color: QColor,
+                 current_head_style: str = 'single', parent=None,
+                 target_item=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Edit Arrow")
+        self._color = QColor(current_color)
+        self._target_item = target_item
+        self._positioned = False
+
+        # Snapshot of the original state, so Cancel can put it back exactly
+        # the way it was before any live-preview edits.
+        self._orig_width = current_width
+        self._orig_color = QColor(current_color)
+        self._orig_head  = current_head_style
+
+        lay = QVBoxLayout(self)
+
+        # ── Arrowhead style — radio buttons at the top ──────────────────────
+        lay.addWidget(QLabel("Arrowhead:"))
+        head_row = QHBoxLayout()
+        self.rb_single       = QRadioButton("➡️ One head")
+        self.rb_single_start = QRadioButton("⬅️ One head (other side)")
+        self.rb_double       = QRadioButton("↔️ Two heads")
+        self.rb_none         = QRadioButton("— No head")
+        self._head_group = QButtonGroup(self)
+        self._head_group.addButton(self.rb_single)
+        self._head_group.addButton(self.rb_single_start)
+        self._head_group.addButton(self.rb_double)
+        self._head_group.addButton(self.rb_none)
+        head_row.addWidget(self.rb_single)
+        head_row.addWidget(self.rb_single_start)
+        head_row.addWidget(self.rb_double)
+        head_row.addWidget(self.rb_none)
+        lay.addLayout(head_row)
+
+        if current_head_style == ArrowItem.HEAD_DOUBLE:
+            self.rb_double.setChecked(True)
+        elif current_head_style == ArrowItem.HEAD_NONE:
+            self.rb_none.setChecked(True)
+        elif current_head_style == ArrowItem.HEAD_SINGLE_START:
+            self.rb_single_start.setChecked(True)
+        else:
+            self.rb_single.setChecked(True)
+
+        self.rb_single.toggled.connect(self._apply_preview)
+        self.rb_single_start.toggled.connect(self._apply_preview)
+        self.rb_double.toggled.connect(self._apply_preview)
+        self.rb_none.toggled.connect(self._apply_preview)
+
+        # ── Line width: spin box + slider, kept in sync ─────────────────────
+        lay.addWidget(QLabel("Line width:"))
+        width_row = QHBoxLayout()
+        self.spin_width = QSpinBox()
+        self.spin_width.setRange(1, 100)
+        self.spin_width.setValue(current_width)
+        self.spin_width.setSuffix(" px")
+        self.slider_width = QSlider(Qt.Orientation.Horizontal)
+        self.slider_width.setRange(1, 100)
+        self.slider_width.setValue(current_width)
+        width_row.addWidget(self.slider_width)
+        width_row.addWidget(self.spin_width)
+        lay.addLayout(width_row)
+
+        self.spin_width.valueChanged.connect(self._on_spin_width_changed)
+        self.slider_width.valueChanged.connect(self._on_slider_width_changed)
+
+        # ── Color ────────────────────────────────────────────────────────
+        # Embedded inline instead of popping a separate "Select Color"
+        # window: the color dialog is a QWidget under the hood, so giving
+        # it plain Qt.Widget flags and dropping it into this dialog's own
+        # layout folds both windows into one. Its own OK/Cancel row is
+        # hidden (NoButtons) since this dialog's button box at the bottom
+        # already covers that, and every change previews live via
+        # currentColorChanged — same as the head-style / width controls.
+        lay.addWidget(QLabel("Line color:"))
+        self.color_dialog = QColorDialog(self._color, self)
+        self.color_dialog.setWindowFlags(Qt.WindowType.Widget)
+        self.color_dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        self.color_dialog.setOption(QColorDialog.ColorDialogOption.NoButtons, True)
+        self.color_dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
+        self.color_dialog.currentColorChanged.connect(self._on_color_changed)
+        lay.addWidget(self.color_dialog)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    # ------------------------------------------------------------------
+    # Live preview — push current dialog state onto the target item
+    # ------------------------------------------------------------------
+    def _apply_preview(self, *args):
+        if self._target_item is None:
+            return
+        item = self._target_item
+        pen = item.pen()
+        pen.setWidth(self.spin_width.value())
+        pen.setColor(self._color)
+        item.setPen(pen)
+        item.head_style = self.result_head_style()
+        item.prepareGeometryChange()
+        item.update()
+        if item.scene() is not None:
+            item.scene().update()
+
+    def _restore_original(self):
+        """Put the target item back exactly as it was before previewing."""
+        if self._target_item is None:
+            return
+        item = self._target_item
+        pen = item.pen()
+        pen.setWidth(self._orig_width)
+        pen.setColor(self._orig_color)
+        item.setPen(pen)
+        item.head_style = self._orig_head
+        item.prepareGeometryChange()
+        item.update()
+        if item.scene() is not None:
+            item.scene().update()
+
+    def reject(self):
+        self._restore_original()
+        super().reject()
+
+    # ------------------------------------------------------------------
+    # Show on whichever monitor is currently active, not wherever Qt
+    # would otherwise default to (which on multi-monitor setups can be
+    # the wrong screen entirely, since this dialog gets Qt.Window flags).
+    # ------------------------------------------------------------------
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._positioned:
+            self._positioned = True
+            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+            if screen is not None:
+                geo = screen.geometry()
+                size = self.sizeHint()
+                x = geo.x() + (geo.width() - size.width()) // 2
+                y = geo.y() + (geo.height() - size.height()) // 2
+                self.move(x, y)
+
+    def _on_spin_width_changed(self, value):
+        if self.slider_width.value() != value:
+            self.slider_width.blockSignals(True)
+            self.slider_width.setValue(value)
+            self.slider_width.blockSignals(False)
+        self._apply_preview()
+
+    def _on_slider_width_changed(self, value):
+        if self.spin_width.value() != value:
+            self.spin_width.blockSignals(True)
+            self.spin_width.setValue(value)
+            self.spin_width.blockSignals(False)
+        self._apply_preview()
+
+    def _on_color_changed(self, color: QColor):
+        c = QColor(color)
+        c.setAlpha(255)  # arrow lines are always opaque, same as before
+        self._color = c
+        self._apply_preview()
+
+    def result_head_style(self) -> str:
+        if self.rb_double.isChecked():
+            return ArrowItem.HEAD_DOUBLE
+        if self.rb_none.isChecked():
+            return ArrowItem.HEAD_NONE
+        if self.rb_single_start.isChecked():
+            return ArrowItem.HEAD_SINGLE_START
+        return ArrowItem.HEAD_SINGLE
+
+    def result_data(self):
+        """Returns (width, color, head_style)."""
+        return self.spin_width.value(), QColor(self._color), self.result_head_style()
 
 
 class TextBubbleItem(QGraphicsItem):
@@ -3284,6 +3645,8 @@ class EnhancedRegionSelector(QWidget):
         self._draw_color        = QColor(255, 0, 0)
         self._draw_width        = 3
         self._hide_bg           = False
+        # Arrow tool: default arrowhead style ('single' / 'double' / 'none')
+        self._arrow_head_style  = ArrowItem.HEAD_SINGLE
         # Freehand tool keeps its own independent color and width
         self._freehand_color    = QColor(255, 0, 0)
         self._freehand_width    = 3
@@ -3786,6 +4149,49 @@ class EnhancedRegionSelector(QWidget):
                             self.spin.setValue(new_width)
                             self.spin.blockSignals(False)
                 return
+            # In Arrow mode: always show the Arrow edit dialog (head style + width + color)
+            if self._current_tool == self.TOOL_ARROW:
+                selected = self._canvas._scene.selectedItems()
+                arrow_items = [i for i in selected if isinstance(i, ArrowItem)]
+                if arrow_items:
+                    item = arrow_items[0]
+                    dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
+                                          getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
+                                          target_item=item)
+                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                        new_width, new_color, new_head = dlg.result_data()
+                        pen = item.pen()
+                        pen.setWidth(new_width)
+                        pen.setColor(new_color)
+                        item.setPen(pen)
+                        item.head_style = new_head
+                        item.prepareGeometryChange()
+                        item.update()
+                        self._draw_width = new_width
+                        self._draw_color = QColor(new_color)
+                        self._arrow_head_style = new_head
+                        self._color_preview.setStyleSheet(
+                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
+                        if hasattr(self, 'spin'):
+                            self.spin.blockSignals(True)
+                            self.spin.setValue(new_width)
+                            self.spin.blockSignals(False)
+                else:
+                    # No arrow selected — edit default style/width/color for the Arrow tool
+                    dlg = ArrowEditDialog(self._draw_width, self._draw_color,
+                                          self._arrow_head_style, self)
+                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                        new_width, new_color, new_head = dlg.result_data()
+                        self._draw_width = new_width
+                        self._draw_color = QColor(new_color)
+                        self._arrow_head_style = new_head
+                        self._color_preview.setStyleSheet(
+                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
+                        if hasattr(self, 'spin'):
+                            self.spin.blockSignals(True)
+                            self.spin.setValue(new_width)
+                            self.spin.blockSignals(False)
+                return
             self._pick_color(); return
 
         # Reset drawing state when switching tools to avoid stale start position
@@ -3959,6 +4365,30 @@ class EnhancedRegionSelector(QWidget):
                 # Save into freehand-specific slots (independent from other tools)
                 self._freehand_width = new_width
                 self._freehand_color = QColor(new_color)
+                self._color_preview.setStyleSheet(
+                    f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
+                if hasattr(self, 'spin'):
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(new_width)
+                    self.spin.blockSignals(False)
+            return True
+
+        if isinstance(item, ArrowItem):
+            dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
+                                  getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
+                                  target_item=item)
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                new_width, new_color, new_head = dlg.result_data()
+                pen = item.pen()
+                pen.setWidth(new_width)
+                pen.setColor(new_color)
+                item.setPen(pen)
+                item.head_style = new_head
+                item.prepareGeometryChange()
+                item.update()
+                self._draw_width = new_width
+                self._draw_color = QColor(new_color)
+                self._arrow_head_style = new_head
                 self._color_preview.setStyleSheet(
                     f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
                 if hasattr(self, 'spin'):
@@ -4443,7 +4873,7 @@ class EnhancedRegionSelector(QWidget):
                         self._draw_start_scene.y() + dist * math.sin(math.radians(snapped)))
                 self._preview_item = self._canvas.add_arrow(
                     QLineF(self._draw_start_scene, end_pos),
-                    self._draw_color, self._draw_width)
+                    self._draw_color, self._draw_width, self._arrow_head_style)
 
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
@@ -4530,6 +4960,36 @@ class EnhancedRegionSelector(QWidget):
 
             elif isinstance(item, FreehandItem):
                 self._edit_freehand(item)
+
+            elif isinstance(item, ArrowItem):
+                self._edit_arrow(item)
+
+    def _edit_arrow(self, item):
+        """Open ArrowEditDialog for a selected ArrowItem — live-previews
+        head style / width / color onto the item as the dialog is used."""
+        dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
+                              getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
+                              target_item=item)
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            new_width, new_color, new_head = dlg.result_data()
+            pen = item.pen()
+            pen.setWidth(new_width)
+            pen.setColor(new_color)
+            item.setPen(pen)
+            item.head_style = new_head
+            item.prepareGeometryChange()
+            item.update()
+            self._draw_width = new_width
+            self._draw_color = QColor(new_color)
+            self._arrow_head_style = new_head
+            self._color_preview.setStyleSheet(
+                f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
+
+    def _straighten_arrow(self, item):
+        """Reset the bend/break point so the arrow is a straight line again."""
+        item.prepareGeometryChange()
+        item._bend = QPointF(0.0, 0.0)
+        item.update()
 
     def _edit_freehand(self, item):
         """Open FreehandEditDialog for a selected FreehandItem — same UI/logic as Image Editor."""
@@ -4671,6 +5131,21 @@ class EnhancedRegionSelector(QWidget):
                     self._duplicate_item_beside(item)
                 elif action == del_act:
                     self._canvas._scene.removeItem(item)
+            elif isinstance(item, ArrowItem):
+                edit_act = menu.addAction("✏️ Edit Arrow")
+                straighten_act = menu.addAction("📏 Straighten Arrow")
+                dup_act  = menu.addAction("⧉ Duplicate")
+                del_act  = menu.addAction("🗑️ Delete")
+                straighten_act.setEnabled(getattr(item, '_bend', QPointF(0.0, 0.0)) != QPointF(0.0, 0.0))
+                action = menu.exec(e.globalPos())
+                if action == edit_act:
+                    self._edit_arrow(item)
+                elif action == straighten_act:
+                    self._straighten_arrow(item)
+                elif action == dup_act:
+                    self._duplicate_item_beside(item)
+                elif action == del_act:
+                    self._canvas._scene.removeItem(item)
             else:
                 dup_act = menu.addAction("⧉ Duplicate")
                 del_act = menu.addAction("🗑️ Delete")
@@ -4788,6 +5263,8 @@ class EnhancedRegionSelector(QWidget):
         if isinstance(item, ArrowItem):
             dup = ArrowItem(QLineF(item.line()), self._canvas)
             dup.setPen(QPen(item.pen()))
+            dup.head_style = getattr(item, 'head_style', ArrowItem.HEAD_SINGLE)
+            dup._bend = QPointF(getattr(item, '_bend', QPointF(0.0, 0.0)))
             dup.setFlags(item.flags())
             dup.setPos(item.pos())
             return dup
@@ -7675,6 +8152,8 @@ class EditorCanvas(QGraphicsView):
         # Marker and Bubble tools each keep their own independent color
         self.marker_color = QColor(255, 0, 0, 255)
         self.bubble_color = QColor(255, 0, 0, 255)
+        # Arrow tool: default arrowhead style ('single' / 'double' / 'none')
+        self.arrow_head_style = ArrowItem.HEAD_SINGLE
         self._pan_start = None
         
         # Massive sceneRect allows infinite panning regardless of zoom
@@ -7769,6 +8248,8 @@ class EditorCanvas(QGraphicsView):
         if isinstance(item, ArrowItem):
             dup = ArrowItem(QLineF(item.line()), self)
             dup.setPen(QPen(item.pen()))
+            dup.head_style = getattr(item, 'head_style', ArrowItem.HEAD_SINGLE)
+            dup._bend = QPointF(getattr(item, '_bend', QPointF(0.0, 0.0)))
             dup.setFlags(item.flags())
             dup.setPos(item.pos())
             return dup
@@ -7854,6 +8335,7 @@ class EditorCanvas(QGraphicsView):
         elif self.current_tool == "Arrow":
             self.current_item = ArrowItem(
                 QLineF(self.start_point, self.start_point), self)
+            self.current_item.head_style = self.arrow_head_style
         elif self.current_tool == "Highlight":
             self._hl_item = HighlightRectItem()
             self._hl_item.setRect(QRectF(self.start_point, self.start_point))
@@ -8206,6 +8688,44 @@ class EditorCanvas(QGraphicsView):
             action = menu.exec(event.globalPos())
             if action == edit_act:
                 item._open_edit_dialog(event.globalPos())
+                self.is_dirty = True
+            elif action == dup_act:
+                dup = self._clone_item(item)
+                if dup:
+                    dup.setPos(item.pos() + QPointF(20, 20))
+                    self.scene.addItem(dup)
+                    self.is_dirty = True
+            elif action == del_act:
+                self.scene.removeItem(item)
+                self.is_dirty = True
+        elif isinstance(item, ArrowItem):
+            menu = QMenu(self)
+            edit_act = menu.addAction("✏️ Edit Arrow")
+            straighten_act = menu.addAction("📏 Straighten Arrow")
+            dup_act  = menu.addAction("⧉ Duplicate")
+            del_act  = menu.addAction("🗑️ Delete")
+            straighten_act.setEnabled(getattr(item, '_bend', QPointF(0.0, 0.0)) != QPointF(0.0, 0.0))
+            action = menu.exec(event.globalPos())
+            if action == edit_act:
+                dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
+                                      getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
+                                      target_item=item)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    new_width, new_color, new_head = dlg.result_data()
+                    pen = item.pen()
+                    pen.setWidth(new_width)
+                    pen.setColor(new_color)
+                    item.setPen(pen)
+                    item.head_style = new_head
+                    item.prepareGeometryChange()
+                    item.update()
+                self.is_dirty = True
+            elif action == straighten_act:
+                # Reset the bend/break point so the arrow is drawn as a
+                # perfectly straight line from p1 to p2 again.
+                item.prepareGeometryChange()
+                item._bend = QPointF(0.0, 0.0)
+                item.update()
                 self.is_dirty = True
             elif action == dup_act:
                 dup = self._clone_item(item)
@@ -8898,6 +9418,30 @@ class ImageEditorWindow(QMainWindow):
                     self.spin.blockSignals(False)
                     self.canvas.is_dirty = True
                 return
+            if isinstance(item, ArrowItem):
+                dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
+                                      getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
+                                      target_item=item)
+                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    new_width, new_color, new_head = dlg.result_data()
+                    pen = item.pen()
+                    pen.setWidth(new_width)
+                    pen.setColor(new_color)
+                    item.setPen(pen)
+                    item.head_style = new_head
+                    item.prepareGeometryChange()
+                    item.update()
+                    self.canvas.stroke_width = new_width
+                    self.canvas.stroke_color = new_color
+                    self.canvas.arrow_head_style = new_head
+                    self.spin.blockSignals(True)
+                    self.spin.setValue(new_width)
+                    self.spin.blockSignals(False)
+                    rgba = f"rgba({new_color.red()}, {new_color.green()}, {new_color.blue()}, {new_color.alphaF()})"
+                    self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
+                    self.canvas.is_dirty = True
+                return
             if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
                 self._edit_text_item(item)
                 return
@@ -8909,6 +9453,23 @@ class ImageEditorWindow(QMainWindow):
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self.canvas.highlight_tool_color = dlg.result_color()
                 self.canvas.is_dirty = True
+            return
+
+        # No arrow selected but the Arrow tool is active — edit its defaults
+        if not selected and self.canvas.current_tool == "Arrow":
+            dlg = ArrowEditDialog(self.canvas.stroke_width, self.canvas.stroke_color,
+                                  self.canvas.arrow_head_style, self)
+            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                new_width, new_color, new_head = dlg.result_data()
+                self.canvas.stroke_width = new_width
+                self.canvas.stroke_color = new_color
+                self.canvas.arrow_head_style = new_head
+                self.spin.blockSignals(True)
+                self.spin.setValue(new_width)
+                self.spin.blockSignals(False)
+                rgba = f"rgba({new_color.red()}, {new_color.green()}, {new_color.blue()}, {new_color.alphaF()})"
+                self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
             return
 
         # Pick the right source color for the current tool so the dialog opens
