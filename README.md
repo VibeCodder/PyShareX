@@ -92,7 +92,8 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 
 
 ## Capture Region with toolbar
-<img width="1920" height="1080" alt="Region_Capture_Preview_2026-09-09_23-20-10" src="https://github.com/user-attachments/assets/8c80d59d-95e3-4e52-b48c-fb6a885471fa" />
+<img width="1920" height="1080" alt="Region_Capture_Preview2_2026-09-09_23-20-10" src="https://github.com/user-attachments/assets/b978a323-6a61-4655-8d4a-21f2902f4053" />
+
 
 
 
