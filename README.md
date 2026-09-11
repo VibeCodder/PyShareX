@@ -4,7 +4,7 @@
 <img width="2878" height="738" alt="PyShareX#gh-dark-mode-only" src="https://github.com/user-attachments/assets/7a899b83-2bc4-401a-bfe5-6990f18c3c51#gh-dark-mode-only" />
 
 
-# PyShareX — Open-Source ShareX Alternative Made in Python
+# PyShareX — Open-Source ShareX alternative made in Python
 
 PyShareX is an open-source ShareX alternative written in Python for Linux and Windows.  
 It provides instant screenshot uploads, screenshot editor, video converter, text and QR recognition, clipboard automation and a fast productivity workflow.  
