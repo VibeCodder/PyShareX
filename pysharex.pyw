@@ -8148,6 +8148,15 @@ class EditorCanvas(QGraphicsView):
         self.resizing_item = None
         self.resize_handle = None # 'T', 'B', 'L', 'R', 'TL', 'TR', 'BL', 'BR'
         self.crop_item = None     # Referencja do aktywnej ramki kadrowania
+        self._rubber_band_active = False  # True while dragging an empty-space
+                                           # selection rectangle (Select tool)
+
+        # Rubber-band (marquee) multi-select: click+drag on empty canvas space
+        # with the Select tool selects every item the rectangle touches —
+        # same end result as Ctrl+clicking each one individually. Clicking
+        # directly on an item still just drags/selects it as before; Qt only
+        # starts the rubber band when the press lands on empty space.
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
 
         # ── Snapping (magnet) — enabled by default ──────────────────────────
         self.snap_enabled = True
@@ -8161,7 +8170,7 @@ class EditorCanvas(QGraphicsView):
         # Drawing Props
         self.stroke_color = QColor(255, 0, 0, 255)
         self.fill_color = QColor(255, 0, 0, 0)
-        self.stroke_width = 3
+        self.stroke_width = 5
         self.font_size = 40
         self.is_filled = False
         self.text_highlight_color = QColor(255, 255, 0, 255)
@@ -8432,6 +8441,12 @@ class EditorCanvas(QGraphicsView):
             if self.resizing_item:
                 self.start_point = scene_pos
                 return # Block regular selection/drawing
+            # If the press lands on empty canvas (or the background), Qt's
+            # RubberBandDrag will start a marquee-selection rectangle instead
+            # of moving anything — track that so mouseMoveEvent doesn't try
+            # to apply move-snapping to whatever happens to be selected.
+            clicked_item = self.itemAt(event.position().toPoint())
+            self._rubber_band_active = clicked_item is None or clicked_item is self.bg_item
             super().mousePressEvent(event)
             return
 
@@ -8520,6 +8535,7 @@ class EditorCanvas(QGraphicsView):
         if not self.current_item:
             super().mouseMoveEvent(event)
             if (self.current_tool == "Select" and not self.resizing_item
+                    and not self._rubber_band_active
                     and event.buttons() & Qt.MouseButton.LeftButton):
                 self._apply_move_snap()
             return
@@ -8570,6 +8586,7 @@ class EditorCanvas(QGraphicsView):
                 self.current_item.setLine(QLineF(self.start_point, end_pos))
 
     def mouseReleaseEvent(self, event):
+        self._rubber_band_active = False
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setCursor(Qt.CursorShape.ArrowCursor)
             self.update_cursor_by_handle(None)
@@ -8868,7 +8885,21 @@ class EditorCanvas(QGraphicsView):
 
     def get_handle_at(self, pos):
         """Returns (item, handle_name) if mouse is over a resize handle of a selected item."""
-        for item in self.scene.selectedItems():
+        selected = self.scene.selectedItems()
+
+        # With more than one item selected (e.g. several separate Freehand
+        # strokes making up a drawing, picked with the rubber-band or
+        # Ctrl+click), each one still draws its own full set of resize
+        # handles — those overlap into a cluster covering most of the
+        # group, so a plain click meant to select/move the group would
+        # often land on some other item's resize handle by accident and
+        # start resizing it instead. With a multi-selection, dragging
+        # should just move the whole group, so don't offer any resize
+        # handles at all until only one item is selected.
+        if len(selected) > 1:
+            return None, None
+
+        for item in selected:
 
             # TextBubbleItem has its own BR resize handle and cone handle
             if isinstance(item, TextBubbleItem):
@@ -9321,7 +9352,7 @@ class ImageEditorWindow(QMainWindow):
 
         for n, i in [("Select", None), ("Crop", None), ("Rectangle", None), ("Circle", "⭕"),
                      ("Line", "📏"), ("Arrow", "➡️"), ("Highlight", "🟨"), ("Freehand", "✏️"),
-                     ("Bubble", "💬"), ("Text", "T"), ("Marker", "📍"), ("Eraser", "🧹")]:
+                     ("Bubble", "💬"), ("Text", "T"), ("Marker", "📍"), ("Eraser", None)]:
             b = QPushButton(); b.setCheckable(True)
             b.setFixedSize(40, 40)
             b.setStyleSheet("""
@@ -9348,6 +9379,10 @@ class ImageEditorWindow(QMainWindow):
                 b.setIcon(_svg_icon(_SVG_RECT_TOOL, 32))
                 b.setIconSize(QSize(32, 32))
                 b.setToolTip("Rectangle")
+            elif n == "Eraser":
+                b.setIcon(_svg_icon(_SVG_ERASER, 32))
+                b.setIconSize(QSize(32, 32))
+                b.setToolTip("Eraser")
             else:
                 b.setText(i)
             b.clicked.connect(lambda ch, name=n: self.select_tool(name))
@@ -9410,7 +9445,7 @@ class ImageEditorWindow(QMainWindow):
         
         pbar.addWidget(QLabel("Size:"))
 
-        self.spin = QSpinBox(); self.spin.setRange(1, 200); self.spin.setValue(3)
+        self.spin = QSpinBox(); self.spin.setRange(1, 200); self.spin.setValue(5)
         self.spin.setToolTip("Font size for text tools / Stroke width for shape tools")
         self.spin.valueChanged.connect(self._on_size_spin_changed)
         pbar.addWidget(self.spin)
@@ -9418,7 +9453,7 @@ class ImageEditorWindow(QMainWindow):
         # Hidden legacy stroke spinner — kept so existing update_live_props references don't break
         self.lbl_stroke = QLabel()
         self.lbl_stroke.hide()
-        self.spin_stroke = QSpinBox(); self.spin_stroke.setRange(1, 100); self.spin_stroke.setValue(3)
+        self.spin_stroke = QSpinBox(); self.spin_stroke.setRange(1, 100); self.spin_stroke.setValue(5)
         self.spin_stroke.hide()
         self.spin_stroke.valueChanged.connect(self.update_live_props)
 
@@ -9514,6 +9549,12 @@ class ImageEditorWindow(QMainWindow):
     def select_tool(self, name):
         self.canvas.current_tool = name
         for n, b in self.btns.items(): b.setChecked(n == name)
+
+        # Rubber-band marquee selection only makes sense for the Select tool —
+        # everything else (drawing, crop, eraser...) handles its own dragging.
+        self.canvas.setDragMode(
+            QGraphicsView.DragMode.RubberBandDrag if name == "Select"
+            else QGraphicsView.DragMode.NoDrag)
 
         if name in ["Rectangle", "Circle"]:
             self.fill.show()
@@ -9906,6 +9947,15 @@ class ImageEditorWindow(QMainWindow):
                     self.spin.blockSignals(False)
                     self.canvas.stroke_width = width
                     self.spin_stroke.setValue(width)
+                return
+            elif isinstance(item, ResizablePixmapItem):
+                # Images inherit a pen() from QGraphicsRectItem but never
+                # actually draw with it (paint() just draws the pixmap), so
+                # its default width (1) is meaningless here. Reading it into
+                # stroke_width used to "stick" the pencil/shape tools at
+                # width 1 the moment any image on the canvas got selected
+                # (including right after importing or dropping one in).
+                # Leave the Size spinner and stroke_width alone for images.
                 return
             elif hasattr(item, 'pen') and callable(item.pen):
                 # Shape / line / arrow — read pen width
@@ -12047,6 +12097,77 @@ _SVG_RECT_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" 
 _SVG_CROP = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
  <path d="M6 1v15a2 2 0 0 0 2 2h15" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
  <path d="M18 23V8a2 2 0 0 0-2-2H1" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"""
+
+# SVG source for the Eraser tool — a classic angled eraser block split
+# evenly in half (pink top, white bottom) with a short white smudge/stroke
+# mark trailing below it, replacing the "🧹" broom emoji which read as a
+# cleaning/sweep icon rather than an eraser.
+_SVG_ERASER = """<svg width="32" height="32" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+ <defs
+     id="defs1">
+    <linearGradient
+       id="linearGradient4">
+      <stop
+         style="stop-color:#ffffff;stop-opacity:1;"
+         offset="0.5"
+         id="stop4" />
+      <stop
+         style="stop-color:#ef5da8;stop-opacity:1;"
+         offset="0.5"
+         id="stop5" />
+    </linearGradient>
+    <clipPath
+       id="eraserBodyClip">
+      <rect
+         x="4"
+         y="6"
+         width="16"
+         height="11"
+         rx="2.4000001"
+         id="rect1" />
+    </clipPath>
+    <linearGradient
+       xlink:href="#linearGradient4"
+       id="linearGradient5"
+       x1="3.3000021"
+       y1="11.499998"
+       x2="20.700001"
+       y2="11.499998"
+       gradientUnits="userSpaceOnUse" />
+  </defs>
+  <path
+     d="M 3,21.5 H 9"
+     stroke="#ffffff"
+     stroke-width="1.8"
+     stroke-linecap="round"
+     id="path1" />
+  <g
+     transform="rotate(-35,12,12)"
+     id="g4">
+    <rect
+       x="4"
+       y="6"
+       width="16"
+       height="11"
+       rx="2.4000001"
+       fill="#ffffff"
+       id="rect2"
+       style="display:none" />
+    <rect
+       x="4"
+       y="6"
+       width="16"
+       height="5.5"
+       fill="#ef5da8"
+       clip-path="url(#eraserBodyClip)"
+       id="rect3"
+       style="display:none" />
+    <path
+       id="rect4"
+       style="display:inline;fill:url(#linearGradient5);stroke:#1a1a1a;stroke-width:1.4"
+       d="M 6.4000001,6 H 17.6 C 18.9296,6 20,7.0704 20,8.4000001 V 14.6 C 20,15.9296 18.9296,17 17.6,17 H 6.4000001 C 5.0704,17 4,15.9296 4,14.6 V 8.4000001 C 4,7.0704 5.0704,6 6.4000001,6 Z" />
+  </g>
 </svg>"""
 
 
