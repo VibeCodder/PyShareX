@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QSpinBox, QTabWidget, QRadioButton, QButtonGroup,
     QTextEdit, QSizePolicy, QStackedWidget, QColorDialog, QInputDialog,
     QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsRectItem,
-    QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem
+    QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem,
+    QWidgetAction
 )
 from PySide6.QtCore import (
     QPointF, Qt, QThread, Signal, QTimer, QSize, QRect, QPoint,
@@ -7280,6 +7281,7 @@ class EmptyCanvasDialog(QDialog):
 
         # ── Template section: radio on its own row, combobox below ────────────
         self._rb_template = QRadioButton("Select Template")
+        self._rb_template.setChecked(True)
         layout.addWidget(self._rb_template)
 
         self._cb_template = QComboBox()
@@ -7295,7 +7297,6 @@ class EmptyCanvasDialog(QDialog):
 
         # ── Custom section: radio on its own row, inputs below ────────────────
         self._rb_custom = QRadioButton("Custom Size:")
-        self._rb_custom.setChecked(True)
         layout.addWidget(self._rb_custom)
 
         self._sp_w = QSpinBox()
@@ -7354,6 +7355,10 @@ class EmptyCanvasDialog(QDialog):
         self._sp_h.valueChanged.connect(self._on_h_changed)
         btn_ok.clicked.connect(self.accept)
         btn_cancel.clicked.connect(self.reject)
+
+        # Sync field states with the default-checked radio button
+        # (setChecked above was called before the toggled signals were connected).
+        self._on_mode_changed()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _on_mode_changed(self):
@@ -8124,7 +8129,10 @@ class EditorCanvas(QGraphicsView):
         
         # Enable keyboard focus for Delete key
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        
+
+        # Allow dropping image files / dragged web images straight onto the canvas
+        self.setAcceptDrops(True)
+
         self.bg_item = self.scene.addPixmap(pixmap)
         self.bg_item.setZValue(-100)
         self.bg_pixmap = pixmap
@@ -8140,6 +8148,15 @@ class EditorCanvas(QGraphicsView):
         self.resizing_item = None
         self.resize_handle = None # 'T', 'B', 'L', 'R', 'TL', 'TR', 'BL', 'BR'
         self.crop_item = None     # Referencja do aktywnej ramki kadrowania
+
+        # ── Snapping (magnet) — enabled by default ──────────────────────────
+        self.snap_enabled = True
+        self.snap_options = {
+            'half':    True,   # snap to canvas half (horizontal/vertical)
+            'images':  True,   # snap to edges/center of other images
+            'corners': True,   # snap to canvas corners
+            'scaling': True,   # snapping also applies while resizing objects
+        }
         
         # Drawing Props
         self.stroke_color = QColor(255, 0, 0, 255)
@@ -8289,6 +8306,105 @@ class EditorCanvas(QGraphicsView):
         else:
             super().wheelEvent(event)
 
+    # ── Drag & drop images onto the canvas ──────────────────────────────────
+    @staticmethod
+    def _is_image_path(path: str) -> bool:
+        return os.path.splitext(path)[1].lower() in (
+            '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.tif', '.tiff', '.ico')
+
+    def _drag_has_image(self, event) -> bool:
+        md = event.mimeData()
+        if md.hasImage():
+            return True
+        if md.hasUrls():
+            for url in md.urls():
+                if url.isLocalFile():
+                    if self._is_image_path(url.toLocalFile()):
+                        return True
+                else:
+                    # Remote URL (e.g. an image dragged out of a web browser) —
+                    # accept it here and validate/download on drop.
+                    return True
+        return False
+
+    def dragEnterEvent(self, event):
+        if self._drag_has_image(event):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._drag_has_image(event):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        drop_scene_pos = self.mapToScene(event.position().toPoint())
+        pixmaps = []
+
+        if md.hasUrls():
+            for url in md.urls():
+                pm = None
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    if self._is_image_path(path):
+                        pm = QPixmap(path)
+                else:
+                    # Dragged straight from a web page (no local file) — download it.
+                    try:
+                        req = urllib.request.Request(
+                            url.toString(), headers={"User-Agent": "Mozilla/5.0"})
+                        data = urllib.request.urlopen(req, timeout=6).read()
+                        pm = QPixmap()
+                        pm.loadFromData(data)
+                    except Exception as e:
+                        print(f"[PyshareX] drag&drop: failed to fetch {url.toString()}: {e}")
+                        pm = None
+                if pm is not None and not pm.isNull():
+                    pixmaps.append(pm)
+        elif md.hasImage():
+            img = md.imageData()
+            pm = QPixmap.fromImage(img) if img is not None else None
+            if pm is not None and not pm.isNull():
+                pixmaps.append(pm)
+
+        if not pixmaps:
+            event.ignore()
+            return
+
+        # Fan multiple dropped images out a little so they don't land exactly
+        # on top of one another.
+        offset = QPointF(0, 0)
+        for pm in pixmaps:
+            self._add_dropped_pixmap(pm, drop_scene_pos + offset)
+            offset += QPointF(24, 24)
+
+        event.acceptProposedAction()
+
+    def _add_dropped_pixmap(self, pixmap, center_scene_pos):
+        """Add a dropped/dragged-in image to the canvas as a movable,
+        resizable layer, centred on the drop position. Images bigger than
+        the canvas are scaled down (keeping aspect ratio) so a full-size
+        photo doesn't land mostly off-screen."""
+        bg_rect = self.bg_item.sceneBoundingRect()
+        max_w = max(bg_rect.width(), 200)
+        max_h = max(bg_rect.height(), 200)
+        if pixmap.width() > max_w or pixmap.height() > max_h:
+            pixmap = pixmap.scaled(
+                int(max_w), int(max_h),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+
+        item = ResizablePixmapItem(pixmap)
+        item.setPos(center_scene_pos.x() - pixmap.width() / 2,
+                    center_scene_pos.y() - pixmap.height() / 2)
+        self.scene.addItem(item)
+        self.scene.clearSelection()
+        item.setSelected(True)
+        self.is_dirty = True
+
     def mousePressEvent(self, event):
         self.setFocus() # Ensure canvas has focus for keyboard events
         scene_pos = self.mapToScene(event.position().toPoint())
@@ -8403,6 +8519,9 @@ class EditorCanvas(QGraphicsView):
 
         if not self.current_item:
             super().mouseMoveEvent(event)
+            if (self.current_tool == "Select" and not self.resizing_item
+                    and event.buttons() & Qt.MouseButton.LeftButton):
+                self._apply_move_snap()
             return
 
         # Regular Drawing
@@ -8860,6 +8979,8 @@ class EditorCanvas(QGraphicsView):
 
         # --- 2. OBSŁUGA SKALOWANIA Z ZACHOWANIEM OBROTU ---
         old_rect = item.rect()
+        if self.resize_handle != 'WIDTH':
+            pos = self._snap_resize_point(item, pos)
         local_pos = item.mapFromScene(pos)
         
         # Określamy punkt stały (przeciwległy do łapanego uchwytu), żeby figura nie "odfrunęła"
@@ -8928,6 +9049,116 @@ class EditorCanvas(QGraphicsView):
         new_scene_fixed = item.mapToScene(fixed_local)
         delta = old_scene_fixed - new_scene_fixed
         item.setPos(item.pos() + delta)
+
+    # ── Snapping (magnet) ──────────────────────────────────────────────────
+    def _snap_threshold(self):
+        """Snap threshold in screen pixels, converted to scene units."""
+        return 10 / max(self.transform().m11(), 0.0001)
+
+    @staticmethod
+    def _visual_scene_rect(item):
+        """Scene-space rect of an item's actual visible content.
+
+        Several annotation items (ResizablePixmapItem, ResizableRectItem,
+        ResizableEllipseItem, HighlightRectItem...) override boundingRect()
+        with extra padding — up to -50px on top — so their selection
+        handles and the rotate-handle icon above the shape don't get
+        clipped. That padded rect is correct for painting/hit-testing, but
+        using sceneBoundingRect() for snapping meant every snap comparison
+        was silently offset by that same padding: top-edge/corner snapping
+        was off by ~50 scene px (very noticeable), left/right/bottom by a
+        few px. Snapping must use the item's real geometry (rect()) instead.
+        """
+        if hasattr(item, 'rect'):
+            try:
+                return item.mapRectToScene(item.rect())
+            except Exception:
+                pass
+        return item.sceneBoundingRect()
+
+    def _collect_snap_targets(self, exclude_item=None):
+        """Returns (x_list, y_list) of scene coordinates to snap to,
+        based on the currently checked snap options."""
+        vt, ht = [], []
+        if not self.snap_enabled:
+            return vt, ht
+        bg = self.bg_item.sceneBoundingRect()
+        if self.snap_options.get('half'):
+            vt.append(bg.center().x())
+            ht.append(bg.center().y())
+        if self.snap_options.get('corners'):
+            vt += [bg.left(), bg.right()]
+            ht += [bg.top(), bg.bottom()]
+        if self.snap_options.get('images'):
+            for it in self.scene.items():
+                if isinstance(it, ResizablePixmapItem) and it is not exclude_item:
+                    r = self._visual_scene_rect(it)
+                    vt += [r.left(), r.center().x(), r.right()]
+                    ht += [r.top(), r.center().y(), r.bottom()]
+        return vt, ht
+
+    def _snap_move_delta(self, item):
+        """Computes a (dx, dy) correction so the moved item's edge/center
+        snaps to the nearest snap target."""
+        if not self.snap_enabled:
+            return 0.0, 0.0
+        vt, ht = self._collect_snap_targets(exclude_item=item)
+        threshold = self._snap_threshold()
+        r = self._visual_scene_rect(item)
+
+        best_dx, best_dx_abs = 0.0, threshold
+        for cand in (r.left(), r.center().x(), r.right()):
+            for t in vt:
+                d = t - cand
+                if abs(d) < best_dx_abs:
+                    best_dx_abs, best_dx = abs(d), d
+
+        best_dy, best_dy_abs = 0.0, threshold
+        for cand in (r.top(), r.center().y(), r.bottom()):
+            for t in ht:
+                d = t - cand
+                if abs(d) < best_dy_abs:
+                    best_dy_abs, best_dy = abs(d), d
+
+        return best_dx, best_dy
+
+    def _apply_move_snap(self):
+        """Called while dragging selected items with the Select tool."""
+        if not self.snap_enabled:
+            return
+        for it in self.scene.selectedItems():
+            if it in (self.bg_item, self.crop_item):
+                continue
+            # Snapping only applies to unrotated items — for rotated ones
+            # the edges aren't axis-aligned in scene space.
+            if getattr(it, 'rotation', lambda: 0)() != 0:
+                continue
+            dx, dy = self._snap_move_delta(it)
+            if dx or dy:
+                it.setPos(it.pos() + QPointF(dx, dy))
+
+    def _snap_resize_point(self, item, pos):
+        """Snaps the mouse point (in scene coordinates) used for resizing
+        to the nearest snap targets, based on the active handle."""
+        if not (self.snap_enabled and self.snap_options.get('scaling')):
+            return pos
+        if getattr(item, 'rotation', lambda: 0)() != 0:
+            return pos
+        handle = self.resize_handle or ''
+        vt, ht = self._collect_snap_targets(exclude_item=item)
+        threshold = self._snap_threshold()
+        x, y = pos.x(), pos.y()
+
+        if ('L' in handle or 'R' in handle) and vt:
+            best = min(vt, key=lambda t: abs(t - x))
+            if abs(best - x) < threshold:
+                x = best
+        if ('T' in handle or 'B' in handle) and ht:
+            best = min(ht, key=lambda t: abs(t - y))
+            if abs(best - y) < threshold:
+                y = best
+
+        return QPointF(x, y)
 
     def erase_at(self, pos):
         for item in self.scene.items(pos):
@@ -9068,6 +9299,10 @@ class ImageEditorWindow(QMainWindow):
         central = QWidget(); self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
+        # Canvas jest tworzona tutaj (przed toolbarem), żeby przyciski toolbara
+        # (np. magnes) mogły od razu odwoływać się do self.canvas.
+        self.canvas = EditorCanvas(pixmap)
+
         # Row 1: Tools
         tbar = QHBoxLayout()
         self.btns = {}
@@ -9117,7 +9352,10 @@ class ImageEditorWindow(QMainWindow):
                 b.setText(i)
             b.clicked.connect(lambda ch, name=n: self.select_tool(name))
             tbar.addWidget(b); self.btns[n] = b
-            
+
+        tbar.addSpacing(8)
+        self._build_magnet_button(tbar)
+
         tbar.addStretch()
         
         # Dedykowany przycisk zatwierdzenia przycięcia (widoczny tylko w trybie Crop)
@@ -9189,7 +9427,6 @@ class ImageEditorWindow(QMainWindow):
         pbar.addStretch()
         layout.addLayout(pbar)
 
-        self.canvas = EditorCanvas(pixmap)
         layout.addWidget(self.canvas)
         self.canvas.scene.selectionChanged.connect(self._sync_spin_from_selection)
         self.showMaximized()
@@ -9218,6 +9455,61 @@ class ImageEditorWindow(QMainWindow):
         _sc("Delete",       self._delete_selected)
         _sc("Ctrl+D",       self._duplicate_selected)
         _sc("Ctrl+A",       self._select_all)
+
+    def _build_magnet_button(self, tbar):
+        """Magnet button (toggle snapping on/off) + a dropdown checklist
+        with snap options. Snapping is enabled by default."""
+        self.btn_magnet = QPushButton("🧲")
+        self.btn_magnet.setCheckable(True)
+        self.btn_magnet.setChecked(True)
+        self.btn_magnet.setFixedSize(40, 40)
+        self.btn_magnet.setToolTip("Snap objects (click to toggle on/off\nand show options)")
+        self.btn_magnet.setStyleSheet("""
+            QPushButton {
+                font-size: 20px;
+                padding: 0px;
+                margin: 0px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+            }
+            QPushButton:checked {
+                background-color: #3498db;
+                color: white;
+            }
+        """)
+        tbar.addWidget(self.btn_magnet)
+
+        self.snap_menu = QMenu(self)
+        container = QWidget()
+        vbox = QVBoxLayout(container)
+        vbox.setContentsMargins(8, 6, 8, 6)
+        vbox.setSpacing(4)
+
+        self._snap_checks = {}
+        options = [
+            ('half',    "Snap to canvas half (horizontal & vertical)"),
+            ('images',  "Snap to other images"),
+            ('corners', "Snap to corners"),
+            ('scaling', "Snap while resizing objects"),
+        ]
+        for key, label in options:
+            cb = QCheckBox(label)
+            cb.setChecked(self.canvas.snap_options.get(key, True))
+            cb.stateChanged.connect(
+                lambda state, k=key: self.canvas.snap_options.__setitem__(k, bool(state)))
+            vbox.addWidget(cb)
+            self._snap_checks[key] = cb
+
+        wa = QWidgetAction(self.snap_menu)
+        wa.setDefaultWidget(container)
+        self.snap_menu.addAction(wa)
+
+        self.btn_magnet.clicked.connect(self._on_magnet_clicked)
+
+    def _on_magnet_clicked(self):
+        self.canvas.snap_enabled = self.btn_magnet.isChecked()
+        pos = self.btn_magnet.mapToGlobal(QPoint(0, self.btn_magnet.height()))
+        self.snap_menu.popup(pos)
 
     def select_tool(self, name):
         self.canvas.current_tool = name
