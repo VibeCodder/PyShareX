@@ -1829,6 +1829,12 @@ class _OverlayCanvas(QGraphicsView):
         self._current_freehand_item = None
         self._freehand_path = None
 
+        # Undo / Redo history — same snapshot-based approach as EditorCanvas
+        # (see EditorCanvas.push_undo/undo/redo for the rationale).
+        self._undo_stack = []
+        self._redo_stack = []
+        self._undo_limit = 40
+
     def send_mouse_to_scene(self, qevent):
         """
         Forward a QMouseEvent from the parent overlay into the QGraphicsScene
@@ -2161,6 +2167,161 @@ class _OverlayCanvas(QGraphicsView):
         if hasattr(item, 'setBrush'):
             item.setBrush(Qt.GlobalColor.transparent)
 
+    # ── Undo / Redo ───────────────────────────────────────────────────────
+    # Snapshot-based history — mirrors EditorCanvas (Image Editor) exactly:
+    # push_undo() captures a detached copy of every item on the canvas right
+    # before a mutating action runs; undo/redo simply swap the live scene
+    # for a stored snapshot. There's no background pixmap here (the overlay
+    # sits transparently on top of the desktop), so a snapshot is just the
+    # list of annotation items.
+    def _clone_item(self, item):
+        """Return a standalone (detached) copy of a supported annotation item."""
+        if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
+            cls = type(item)
+            dup = cls()
+            dup.setRect(QRectF(item.rect()))
+            dup.setPen(QPen(item.pen()))
+            dup.setBrush(QBrush(item.brush()))
+            dup.setRotation(item.rotation())
+            dup.setTransformOriginPoint(item.transformOriginPoint())
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, HighlightRectItem):
+            dup = HighlightRectItem()
+            dup.setRect(QRectF(item.rect()))
+            dup._color = QColor(item._color)
+            dup.setPen(QPen(item.pen()))
+            dup.setBrush(QBrush(item.brush()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, FreehandItem):
+            dup = FreehandItem(QPainterPath(item.path()))
+            dup.setPen(QPen(item.pen()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, LineItem):
+            dup = LineItem(QLineF(item.line()), self)
+            dup.setPen(QPen(item.pen()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, ArrowItem):
+            dup = ArrowItem(QLineF(item.line()), self)
+            dup.setPen(QPen(item.pen()))
+            dup.head_style = getattr(item, 'head_style', ArrowItem.HEAD_SINGLE)
+            dup._bend = QPointF(getattr(item, '_bend', QPointF(0.0, 0.0)))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, TextBubbleItem):
+            dup = TextBubbleItem(item._text, QColor(item._fg_color), QColor(item._bg_color))
+            dup._w = item._w
+            dup._h = item._h
+            dup._cone_rel = QPointF(item._cone_rel)
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
+            dup = HighlightTextItem(item.toPlainText())
+            dup.setFont(QFont(item.font()))
+            dup.setDefaultTextColor(QColor(item.defaultTextColor()))
+            dup.highlight_color   = QColor(getattr(item, 'highlight_color', QColor(0, 0, 0, 0)))
+            dup.highlight_enabled = getattr(item, 'highlight_enabled', True)
+            dup.highlight_padding = getattr(item, 'highlight_padding', 0)
+            dup.outline_enabled   = getattr(item, 'outline_enabled', False)
+            dup.outline_width     = getattr(item, 'outline_width', 2)
+            dup.outline_color     = QColor(getattr(item, 'outline_color', QColor(0, 0, 0)))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, ResizablePixmapItem):
+            dup = ResizablePixmapItem(QPixmap(item.pixmap))
+            dup.setRect(QRectF(item.rect()))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        if isinstance(item, _MarkerItem):
+            dup = _MarkerItem(QPointF(0, 0), item.number)
+            dup._scale = item._scale
+            dup._spike_offset = QPointF(item._spike_offset)
+            dup._bg_color = QColor(getattr(item, '_bg_color', QColor(220, 50, 50)))
+            dup._text_color = QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white)))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
+        return None
+
+    def _snapshot(self):
+        """Capture a standalone clone of every real item on the canvas."""
+        items = list(self._scene.items())
+        items.reverse()  # scene.items() is topmost-first; keep paint order
+        clones = []
+        for it in items:
+            clone = self._clone_item(it)
+            if clone is not None:
+                clone.setZValue(it.zValue())
+                clones.append(clone)
+        return {'items': clones}
+
+    def push_undo(self):
+        """Call this right BEFORE a mutating action so it can be undone.
+        Any fresh action invalidates the redo stack."""
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._notify_history_changed()
+
+    def _restore_snapshot(self, snapshot):
+        self._scene.clearSelection()
+        for it in list(self._scene.items()):
+            self._scene.removeItem(it)
+
+        self._marker_count = 0
+        for stored in snapshot['items']:
+            # Clone again on the way back in — the objects held in the
+            # snapshot must stay pristine so they can be restored again
+            # later (e.g. redo after undo after redo...).
+            fresh = self._clone_item(stored)
+            if fresh is None:
+                continue
+            fresh.setZValue(stored.zValue())
+            self._scene.addItem(fresh)
+            if isinstance(fresh, _MarkerItem):
+                self._marker_count = max(self._marker_count, fresh.number)
+
+        self._current_freehand_item = None
+        self._freehand_path = None
+        self._notify_history_changed()
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        snapshot = self._undo_stack.pop()
+        self._restore_snapshot(snapshot)
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        snapshot = self._redo_stack.pop()
+        self._restore_snapshot(snapshot)
+
+    def can_undo(self) -> bool:
+        return bool(self._undo_stack)
+
+    def can_redo(self) -> bool:
+        return bool(self._redo_stack)
+
+    def _notify_history_changed(self):
+        owner = self.parent()
+        if hasattr(owner, '_update_undo_redo_buttons'):
+            owner._update_undo_redo_buttons()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  NEW ANNOTATION ITEMS
@@ -2407,23 +2568,71 @@ class ArrowItem(QGraphicsLineItem):
         always agree on exactly where the head's base sits."""
         return self._arrow_size() * 1.15
 
-    def _head_triangle(self, tip, angle_rad):
+    def _head_triangle(self, tip, fwd, back):
         """Return the two base points of an arrowhead triangle whose point is
-        at *tip*, facing along *angle_rad* (standard math convention, radians).
+        at *tip*, with its flat base centered at *back* and oriented
+        perpendicular to unit vector *fwd*.
+
+        *back* must be the exact on-curve point where the shaft was clipped
+        (see _shaft_endpoints) — not derived from tip/length — so the base
+        sits exactly where the visible shaft ends, with no gap or overlap
+        between the two.
+
+        *fwd* must be the curve's own tangent direction at *back* (pointing
+        from the back toward the tip) — NOT the straight chord from back to
+        tip. Qt's stroker caps the shaft's flat end perpendicular to that
+        same local tangent, so using the tangent here keeps the head's base
+        edge flush with the shaft's cut edge. Using the chord instead (the
+        previous approach) rotates the base relative to the shaft's edge
+        whenever the curve bends between the cut point and the tip: the
+        shaft's two corner points (offset perpendicular to the tangent) and
+        the head's two corner points (offset perpendicular to the chord)
+        then land in different places, leaving an uncovered wedge-shaped
+        gap on the convex side of the bend once the pen is thick enough for
+        the offsets to matter.
 
         Length and half-width are set independently (instead of deriving
         both from one sweep angle) so the head comes out as a blocky,
         flat-backed triangle — length roughly equal to width — matching a
         classic arrow-icon silhouette rather than a thin, wide sliver."""
         sz = self._arrow_size()
-        length = self._head_length()
         half_width = sz * 0.62
-        fwd = QPointF(math.cos(angle_rad), -math.sin(angle_rad))
-        back = QPointF(tip.x() - length * fwd.x(), tip.y() - length * fwd.y())
         perp = QPointF(-fwd.y(), fwd.x())
         p_left  = QPointF(back.x() + half_width * perp.x(), back.y() + half_width * perp.y())
         p_right = QPointF(back.x() - half_width * perp.x(), back.y() - half_width * perp.y())
         return p_left, p_right
+
+    @staticmethod
+    def _unit_vector(src, dst):
+        """Unit vector pointing from *src* to *dst*, or None if they coincide."""
+        dx, dy = dst.x() - src.x(), dst.y() - src.y()
+        d = math.hypot(dx, dy)
+        if d <= 1e-6:
+            return None
+        return QPointF(dx / d, dy / d)
+
+    @staticmethod
+    def _angle_vector(angle_rad):
+        """Unit vector for an angle in standard math convention (radians)."""
+        return QPointF(math.cos(angle_rad), -math.sin(angle_rad))
+
+    def _shaft_endpoints(self, path):
+        """Compute (t_start, t_end) — the arc-length percentAtLength cut
+        points shared by both the shaft (_shaft_paint_path) and the
+        arrowhead geometry (paint), so the two always meet at the exact
+        same on-curve point instead of being computed independently by
+        two different methods (arc-length walk vs. straight projection)."""
+        total_len = path.length()
+        if total_len <= 0:
+            return 0.0, 1.0
+        head_style = getattr(self, 'head_style', self.HEAD_SINGLE)
+        length = self._head_length()
+        t_start, t_end = 0.0, 1.0
+        if head_style in (self.HEAD_SINGLE_START, self.HEAD_DOUBLE) and total_len > length:
+            t_start = path.percentAtLength(length)
+        if head_style in (self.HEAD_SINGLE, self.HEAD_DOUBLE) and total_len > length:
+            t_end = path.percentAtLength(total_len - length)
+        return t_start, t_end
 
     def _shaft_paint_path(self, path):
         """The actual path used to stroke the shaft: the same curve as
@@ -2454,14 +2663,7 @@ class ArrowItem(QGraphicsLineItem):
         if total_len <= 0:
             return None
 
-        head_style = getattr(self, 'head_style', self.HEAD_SINGLE)
-        length = self._head_length()
-
-        t_start, t_end = 0.0, 1.0
-        if head_style in (self.HEAD_SINGLE_START, self.HEAD_DOUBLE) and total_len > length:
-            t_start = path.percentAtLength(length)
-        if head_style in (self.HEAD_SINGLE, self.HEAD_DOUBLE) and total_len > length:
-            t_end = path.percentAtLength(total_len - length)
+        t_start, t_end = self._shaft_endpoints(path)
         if t_end <= t_start:
             # The arrow is shorter than its head(s) — no shaft left to draw
             # (the head triangle itself is drawn separately regardless).
@@ -2507,21 +2709,52 @@ class ArrowItem(QGraphicsLineItem):
             painter.setBrush(QBrush(self.pen().color()))
             painter.setPen(Qt.PenStyle.NoPen)
 
+            # Same arc-length cut points used to trim the shaft (see
+            # _shaft_endpoints). The head's base is anchored exactly at that
+            # cut point and oriented along the curve's own local tangent
+            # there (not the chord from cut-point to tip) — see
+            # _head_triangle for why the tangent, not the chord, is what
+            # keeps the base flush with the shaft's flat-capped edge.
+            t_start, t_end = self._shaft_endpoints(path)
+            length = self._head_length()
+            has_length_for_head = path.length() > length
+
             if draw_head_p2:
-                # Head at p2 — faces the direction the curve arrives at p2
-                angle2 = math.radians(path.angleAtPercent(1.0))
+                # Head at p2 — base sits at the cut point near p2.
                 tip2 = self.line().p2()
-                pl, pr = self._head_triangle(tip2, angle2)
+                if has_length_for_head:
+                    back2 = path.pointAtPercent(t_end)
+                    fwd2 = self._angle_vector(math.radians(path.angleAtPercent(t_end)))
+                    # angleAtPercent gives the tangent LINE, not which of its
+                    # two directions to use — flip it if it points away from
+                    # the tip instead of toward it.
+                    if fwd2.x() * (tip2.x() - back2.x()) + fwd2.y() * (tip2.y() - back2.y()) < 0:
+                        fwd2 = QPointF(-fwd2.x(), -fwd2.y())
+                else:
+                    # Arrow shorter than the head itself — no shaft to stay
+                    # flush with, so fall back to the old chord-based axis.
+                    fwd2 = (self._unit_vector(self.line().p1(), tip2) or
+                            self._angle_vector(math.radians(path.angleAtPercent(1.0))))
+                    back2 = QPointF(tip2.x() - length * fwd2.x(), tip2.y() - length * fwd2.y())
+                pl, pr = self._head_triangle(tip2, fwd2, back2)
                 head_path = QPainterPath()
                 head_path.moveTo(tip2); head_path.lineTo(pl); head_path.lineTo(pr)
                 head_path.closeSubpath()
                 painter.drawPath(head_path)
 
             if draw_head_p1:
-                # Head at p1 — faces opposite the direction the curve leaves p1
-                angle1 = math.radians(path.angleAtPercent(0.0)) + math.pi
+                # Head at p1 — base sits at the cut point near p1.
                 tip1 = self.line().p1()
-                pl, pr = self._head_triangle(tip1, angle1)
+                if has_length_for_head:
+                    back1 = path.pointAtPercent(t_start)
+                    fwd1 = self._angle_vector(math.radians(path.angleAtPercent(t_start)))
+                    if fwd1.x() * (tip1.x() - back1.x()) + fwd1.y() * (tip1.y() - back1.y()) < 0:
+                        fwd1 = QPointF(-fwd1.x(), -fwd1.y())
+                else:
+                    fwd1 = (self._unit_vector(self.line().p2(), tip1) or
+                            self._angle_vector(math.radians(path.angleAtPercent(0.0)) + math.pi))
+                    back1 = QPointF(tip1.x() - length * fwd1.x(), tip1.y() - length * fwd1.y())
+                pl, pr = self._head_triangle(tip1, fwd1, back1)
                 head_path = QPainterPath()
                 head_path.moveTo(tip1); head_path.lineTo(pl); head_path.lineTo(pr)
                 head_path.closeSubpath()
@@ -2538,13 +2771,14 @@ class ArrowItem(QGraphicsLineItem):
             painter.drawEllipse(self.line().p1(), r, r)
             # p2 endpoint handle — white fill, blue border
             painter.drawEllipse(self.line().p2(), r, r)
-            # Bend/curve control handle — yellow fill, dark border
-            painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
-            painter.setPen(QPen(QColor(60, 60, 60), 2.0))
-            painter.drawEllipse(self._control_point(), r, r)
-            # Width (thickness) handle — black fill, white outline
+            # Bend/curve control handle — black fill, white outline
             painter.setBrush(QBrush(Qt.GlobalColor.black))
             painter.setPen(QPen(Qt.GlobalColor.white, 2.0))
+            painter.drawEllipse(self._control_point(), r, r)
+            # Width (thickness) handle — yellow fill, dark border (matches
+            # the width-handle color used by every other shape)
+            painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
+            painter.setPen(QPen(QColor(60, 60, 60), 2.0))
             painter.drawEllipse(self._width_handle_pos(), r, r)
 
     def _handle_hit_radius(self):
@@ -4019,7 +4253,7 @@ class EnhancedRegionSelector(QWidget):
             (self.TOOL_HIGHLIGHT, "🟨",  "Draw highlight (semi-transparent yellow rectangle)"),
             (self.TOOL_FREEHAND,  "✏️",  "Freehand drawing"),
             (self.TOOL_LINE,      "📏",  "Draw straight line"),
-            (self.TOOL_ARROW,     "➡️",  "Draw arrow"),
+            (self.TOOL_ARROW,     None,  "Draw arrow"),
             (self.TOOL_BUBBLE,    "💬",  "Add text bubble"),
             (self.TOOL_MARKER,    "📍",  "Add numbered marker"),
             (self.TOOL_TEXT,      "T",   "Add text annotation"),
@@ -4038,6 +4272,9 @@ class EnhancedRegionSelector(QWidget):
             elif tid == self.TOOL_RECT:
                 btn.setIcon(_svg_icon(_SVG_RECT_TOOL, 32))
                 btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_ARROW:
+                btn.setIcon(_svg_icon(_SVG_ARROW_TOOL, 32))
+                btn.setIconSize(QSize(28, 28))
             elif tid == self.TOOL_COLOR:
                 btn.setObjectName("colorPickerBtn")
                 btn.setText("🎨🔧")
@@ -4053,6 +4290,23 @@ class EnhancedRegionSelector(QWidget):
         self._color_preview.setStyleSheet(
             f"background:{self._draw_color.name()}; border:1px solid white; border-radius:3px;")
         lay.addWidget(self._color_preview)
+
+        lay.addSpacing(6)
+
+        # ── Undo / Redo — same as the Image Editor ────────────────────────────
+        self.btn_undo = QPushButton("↩️")
+        self.btn_undo.setToolTip("Undo (Ctrl+Z)")
+        self.btn_undo.setCheckable(False)
+        self.btn_undo.clicked.connect(self.canvas_undo)
+        self.btn_undo.setEnabled(False)
+        lay.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("↪️")
+        self.btn_redo.setToolTip("Redo (Ctrl+Y)")
+        self.btn_redo.setCheckable(False)
+        self.btn_redo.clicked.connect(self.canvas_redo)
+        self.btn_redo.setEnabled(False)
+        lay.addWidget(self.btn_redo)
 
         lay.addSpacing(6)
 
@@ -4325,6 +4579,7 @@ class EnhancedRegionSelector(QWidget):
         if isinstance(item, HighlightRectItem):
             dlg = HighlightEditDialog(item._color, self)
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                self._canvas.push_undo()
                 new_color = dlg.result_color()
                 item._color = new_color
                 border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
@@ -4336,6 +4591,7 @@ class EnhancedRegionSelector(QWidget):
         if isinstance(item, TextBubbleItem):
             dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                self._canvas.push_undo()
                 text, fg, bg = dlg.result_data()
                 item._text     = text
                 item._fg_color = fg
@@ -4349,6 +4605,7 @@ class EnhancedRegionSelector(QWidget):
                 QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
                 self)
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                self._canvas.push_undo()
                 item._bg_color   = dlg.bg_color
                 item._text_color = dlg.text_color
                 item.update()
@@ -4357,6 +4614,7 @@ class EnhancedRegionSelector(QWidget):
         if isinstance(item, FreehandItem):
             dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                self._canvas.push_undo()
                 new_width, new_color = dlg.result_data()
                 pen = item.pen()
                 pen.setWidth(new_width)
@@ -4379,6 +4637,7 @@ class EnhancedRegionSelector(QWidget):
                                   getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
                                   target_item=item)
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                self._canvas.push_undo()
                 new_width, new_color, new_head = dlg.result_data()
                 pen = item.pen()
                 pen.setWidth(new_width)
@@ -4437,6 +4696,7 @@ class EnhancedRegionSelector(QWidget):
                 self._color_preview.setStyleSheet(
                     f"background:rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); border:1px solid white; border-radius:3px;")
                 if apply_to_item is not None:
+                    self._canvas.push_undo()
                     # Preserve the item's current pen width instead of resetting to default
                     current_width = (apply_to_item.pen().width()
                                      if hasattr(apply_to_item, 'pen')
@@ -4488,6 +4748,7 @@ class EnhancedRegionSelector(QWidget):
                 if not pix.isNull():
                     center = QPointF(self._geo.width() / 2 - pix.width()  / 2,
                                      self._geo.height()/ 2 - pix.height() / 2)
+                    self._canvas.push_undo()
                     self._canvas.add_pixmap(center, pix)
 
         # Always switch to SELECT after image import so user can move/resize it
@@ -4715,6 +4976,7 @@ class EnhancedRegionSelector(QWidget):
             scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
             item, handle = self._canvas.get_handle_at(scene_pos)
             if item and handle:
+                self._canvas.push_undo()
                 self._resizing_item = item
                 self._resize_handle = handle
                 # Send a synthetic press at the item's position so the scene
@@ -4723,6 +4985,14 @@ class EnhancedRegionSelector(QWidget):
                 # clear the grabber rather than leaving it in a stale state.
                 self._canvas.send_mouse_to_scene(e)
                 return
+            # If the press lands directly on an existing item (not empty
+            # space), it's about to be dragged/moved — snapshot first so
+            # that move can be undone. (If the click turns out to be a
+            # no-op, e.g. just a select with no drag, this leaves a
+            # harmless undo step that restores an identical state.)
+            clicked_item = self._canvas._scene.itemAt(scene_pos, self._canvas.transform())
+            if clicked_item is not None:
+                self._canvas.push_undo()
             self._canvas.send_mouse_to_scene(e)
             return
 
@@ -4730,6 +5000,7 @@ class EnhancedRegionSelector(QWidget):
         scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
         self._draw_start_scene = scene_pos
         self._preview_item = None
+        self._canvas.push_undo()
 
         if self._current_tool == self.TOOL_FREEHAND:
             self._canvas.begin_freehand(scene_pos, self._freehand_color, self._freehand_width)
@@ -4972,6 +5243,7 @@ class EnhancedRegionSelector(QWidget):
                               getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
                               target_item=item)
         if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            self._canvas.push_undo()
             new_width, new_color, new_head = dlg.result_data()
             pen = item.pen()
             pen.setWidth(new_width)
@@ -4988,6 +5260,7 @@ class EnhancedRegionSelector(QWidget):
 
     def _straighten_arrow(self, item):
         """Reset the bend/break point so the arrow is a straight line again."""
+        self._canvas.push_undo()
         item.prepareGeometryChange()
         item._bend = QPointF(0.0, 0.0)
         item.update()
@@ -4996,6 +5269,7 @@ class EnhancedRegionSelector(QWidget):
         """Open FreehandEditDialog for a selected FreehandItem — same UI/logic as Image Editor."""
         dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
         if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            self._canvas.push_undo()
             new_width, new_color = dlg.result_data()
             pen = item.pen()
             pen.setWidth(new_width)
@@ -5025,6 +5299,7 @@ class EnhancedRegionSelector(QWidget):
 
         if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
+            self._canvas.push_undo()
             if txt.strip():
                 item.setPlainText(txt)
                 item.setFont(QFont("Arial", fsz))
@@ -5047,6 +5322,7 @@ class EnhancedRegionSelector(QWidget):
         if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
             txt, fg_col, bg_col = dlg.result_data()
             if txt.strip():
+                self._canvas.push_undo()
                 item._text = txt
                 item._fg_color = fg_col
                 item._bg_color = bg_col
@@ -5058,6 +5334,7 @@ class EnhancedRegionSelector(QWidget):
                                 getattr(item, '_text_color', QColor(Qt.GlobalColor.white)),
                                 self)
         if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            self._canvas.push_undo()
             bg, fg = dlg.result_data()
             item._bg_color = bg
             item._text_color = fg
@@ -5066,6 +5343,7 @@ class EnhancedRegionSelector(QWidget):
     def _edit_highlight(self, item):
         dlg = HighlightEditDialog(item._color, self)
         if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            self._canvas.push_undo()
             new_color = dlg.result_color()
             item._color = new_color
             border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
@@ -5090,6 +5368,7 @@ class EnhancedRegionSelector(QWidget):
                 elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
+                    self._canvas.push_undo()
                     self._canvas._scene.removeItem(item)
             elif isinstance(item, TextBubbleItem):
                 edit_act = menu.addAction("✏️ Edit")
@@ -5101,6 +5380,7 @@ class EnhancedRegionSelector(QWidget):
                 elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
+                    self._canvas.push_undo()
                     self._canvas._scene.removeItem(item)
             elif isinstance(item, _MarkerItem):
                 edit_act = menu.addAction("✏️ Edit")
@@ -5109,6 +5389,7 @@ class EnhancedRegionSelector(QWidget):
                 if action == edit_act:
                     self._edit_marker(item)
                 elif action == del_act:
+                    self._canvas.push_undo()
                     self._canvas._scene.removeItem(item)
             elif isinstance(item, HighlightRectItem):
                 edit_act = menu.addAction("✏️ Edit Highlight")
@@ -5120,6 +5401,7 @@ class EnhancedRegionSelector(QWidget):
                 elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
+                    self._canvas.push_undo()
                     self._canvas._scene.removeItem(item)
             elif isinstance(item, FreehandItem):
                 edit_act = menu.addAction("✏️ Edit Freehand")
@@ -5131,6 +5413,7 @@ class EnhancedRegionSelector(QWidget):
                 elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
+                    self._canvas.push_undo()
                     self._canvas._scene.removeItem(item)
             elif isinstance(item, ArrowItem):
                 edit_act = menu.addAction("✏️ Edit Arrow")
@@ -5146,6 +5429,7 @@ class EnhancedRegionSelector(QWidget):
                 elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
+                    self._canvas.push_undo()
                     self._canvas._scene.removeItem(item)
             else:
                 dup_act = menu.addAction("⧉ Duplicate")
@@ -5154,6 +5438,7 @@ class EnhancedRegionSelector(QWidget):
                 if action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
+                    self._canvas.push_undo()
                     self._canvas._scene.removeItem(item)
 
     def _duplicate_item_beside(self, item):
@@ -5161,6 +5446,7 @@ class EnhancedRegionSelector(QWidget):
         dup = self._clone_item(item)
         if dup is None:
             return
+        self._canvas.push_undo()
         offset = QPointF(20, 20)
         dup.setPos(item.scenePos() + offset)
         self._canvas._scene.addItem(dup)
@@ -5175,6 +5461,20 @@ class EnhancedRegionSelector(QWidget):
             self.close()
             self.cancelled.emit()
             return
+        if (e.key() == Qt.Key.Key_Z and
+                e.modifiers() & Qt.KeyboardModifier.ControlModifier and
+                not (e.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
+            self.canvas_undo()
+            e.accept()
+            return
+        if ((e.key() == Qt.Key.Key_Y and
+             e.modifiers() & Qt.KeyboardModifier.ControlModifier) or
+            (e.key() == Qt.Key.Key_Z and
+             e.modifiers() & Qt.KeyboardModifier.ControlModifier and
+             e.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
+            self.canvas_redo()
+            e.accept()
+            return
         if (e.key() == Qt.Key.Key_D and
                 e.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self._duplicate_selected_at_cursor()
@@ -5183,11 +5483,31 @@ class EnhancedRegionSelector(QWidget):
         if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             selected = self._canvas._scene.selectedItems()
             if selected:
+                self._canvas.push_undo()
                 for item in selected:
                     self._canvas._scene.removeItem(item)
                 e.accept()
                 return
         super().keyPressEvent(e)
+
+    def canvas_undo(self):
+        """Undo last annotation action (keyboard shortcut / toolbar helper)."""
+        if hasattr(self._canvas, 'undo'):
+            self._canvas.undo()
+
+    def canvas_redo(self):
+        """Redo last undone annotation action (keyboard shortcut / toolbar helper)."""
+        if hasattr(self._canvas, 'redo'):
+            self._canvas.redo()
+
+    def _update_undo_redo_buttons(self):
+        """Enable/disable the toolbar Undo/Redo buttons to match the
+        canvas's history. Called by _OverlayCanvas whenever its undo/redo
+        stacks change (push, undo, redo)."""
+        if hasattr(self, 'btn_undo'):
+            self.btn_undo.setEnabled(self._canvas.can_undo())
+        if hasattr(self, 'btn_redo'):
+            self.btn_redo.setEnabled(self._canvas.can_redo())
 
     def _duplicate_selected_at_cursor(self):
         """Duplicate selected annotation items centred exactly at the cursor position."""
@@ -5199,6 +5519,7 @@ class EnhancedRegionSelector(QWidget):
         local = self.mapFromGlobal(cursor_global)
         cursor_scene = self._canvas.mapToScene(self._canvas.mapFrom(self, local))
 
+        self._canvas.push_undo()
         new_items = []
         for item in selected:
             # Never duplicate Numbered Markers
@@ -7404,7 +7725,9 @@ class ImageEditorStartDialog(QDialog):
         btn_file      = QPushButton("📂 Open screenshot file")
         btn_clipboard = QPushButton("📋 Open screenshot from clipboard")
         btn_web       = QPushButton("🌐 Open image from web")
-        btn_empty     = QPushButton("⬜ Empty Canvas")
+        btn_empty     = QPushButton(" Empty Canvas")
+        btn_empty.setIcon(_svg_icon(_SVG_EMPTY_CANVAS, 24))
+        btn_empty.setIconSize(QSize(20, 20))
 
         btn_file.clicked.connect(self.open_file)
         btn_clipboard.clicked.connect(self.open_clipboard)
@@ -8191,13 +8514,22 @@ class EditorCanvas(QGraphicsView):
         self._checker_cache: QPixmap | None = None   # full-size cache, rebuilt on image resize
         self._checker_cache_size: tuple[int, int] = (-1, -1)
 
+        # Undo / Redo history (see push_undo/undo/redo below)
+        self._undo_stack = []
+        self._redo_stack = []
+        self._undo_limit = 40
+        self._erase_stroke_active = False  # avoid one snapshot per erased pixel
+
     def keyPressEvent(self, event):
         """Handle Delete key to remove selected items, Ctrl+D to duplicate."""
         if event.key() == Qt.Key.Key_Delete:
-            for item in self.scene.selectedItems():
-                if item != self.bg_item and item != self.crop_item:
-                    self.scene.removeItem(item)
-                    self.is_dirty = True
+            to_remove = [i for i in self.scene.selectedItems()
+                         if i != self.bg_item and i != self.crop_item]
+            if to_remove:
+                self.push_undo()
+            for item in to_remove:
+                self.scene.removeItem(item)
+                self.is_dirty = True
         elif (event.key() == Qt.Key.Key_D and
               event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self._duplicate_selected_at_cursor()
@@ -8210,6 +8542,7 @@ class EditorCanvas(QGraphicsView):
                     and not isinstance(i, _MarkerItem)]
         if not selected:
             return
+        self.push_undo()
         cursor_scene = self.mapToScene(self.mapFromGlobal(QCursor.pos()))
         new_items = []
         for item in selected:
@@ -8306,7 +8639,109 @@ class EditorCanvas(QGraphicsView):
             dup.setFlags(item.flags())
             dup.setPos(item.pos())
             return dup
+        if isinstance(item, _MarkerItem):
+            dup = _MarkerItem(QPointF(0, 0), item.number)
+            dup._scale = item._scale
+            dup._spike_offset = QPointF(item._spike_offset)
+            dup._bg_color = QColor(getattr(item, '_bg_color', QColor(220, 50, 50)))
+            dup._text_color = QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white)))
+            dup.setFlags(item.flags())
+            dup.setPos(item.pos())
+            return dup
         return None
+
+    # ── Undo / Redo ───────────────────────────────────────────────────────
+    # Snapshot-based history: instead of tracking every possible mutation as
+    # a separate "command" (there are dozens of tools/dialogs that can touch
+    # the scene), push_undo() captures a full, detached copy of the current
+    # state right before a mutating action runs. Undo/redo simply swap the
+    # live scene for a stored snapshot. Simpler to reason about and far less
+    # error-prone than a per-action command stack, at the cost of a bit more
+    # memory — acceptable for a screenshot annotation tool.
+    def _snapshot(self):
+        """Capture the background pixmap/position plus a standalone
+        (detached) clone of every real item on the canvas. The crop overlay
+        is transient UI state, never real content, so it's excluded."""
+        items = [it for it in self.scene.items() if it not in (self.bg_item, self.crop_item)]
+        items.reverse()  # scene.items() is topmost-first; keep paint order
+        clones = []
+        for it in items:
+            clone = self._clone_item(it)
+            if clone is not None:
+                clone.setZValue(it.zValue())
+                clones.append(clone)
+        return {
+            'bg_pixmap': self.bg_pixmap,
+            'bg_pos': QPointF(self.bg_item.pos()),
+            'items': clones,
+        }
+
+    def push_undo(self):
+        """Call this right BEFORE a mutating action so it can be undone.
+        Any fresh action invalidates the redo stack."""
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._notify_history_changed()
+
+    def _restore_snapshot(self, snapshot):
+        # Leaving Crop mode avoids a dangling overlay that no longer
+        # matches the restored image bounds.
+        win = self.window()
+        if self.crop_item is not None and hasattr(win, 'select_tool'):
+            win.select_tool("Select")
+
+        self.scene.clearSelection()
+        for it in list(self.scene.items()):
+            if it is not self.bg_item:
+                self.scene.removeItem(it)
+
+        self.bg_pixmap = snapshot['bg_pixmap']
+        self.bg_item.setPixmap(self.bg_pixmap)
+        self.bg_item.setPos(snapshot['bg_pos'])
+
+        bg_rect = self.bg_item.sceneBoundingRect()
+        self.scene.setSceneRect(
+            bg_rect.center().x() - 50000, bg_rect.center().y() - 50000, 100000, 100000)
+
+        for stored in snapshot['items']:
+            # Clone again on the way back in — the objects held in the
+            # snapshot must stay pristine so they can be restored again
+            # later (e.g. redo after undo after redo...).
+            fresh = self._clone_item(stored)
+            if fresh is None:
+                continue
+            fresh.setZValue(stored.zValue())
+            self.scene.addItem(fresh)
+
+        self.is_dirty = True
+        self._notify_history_changed()
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        snapshot = self._undo_stack.pop()
+        self._restore_snapshot(snapshot)
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        snapshot = self._redo_stack.pop()
+        self._restore_snapshot(snapshot)
+
+    def can_undo(self) -> bool:
+        return bool(self._undo_stack)
+
+    def can_redo(self) -> bool:
+        return bool(self._redo_stack)
+
+    def _notify_history_changed(self):
+        win = self.window()
+        if hasattr(win, '_update_undo_redo_buttons'):
+            win._update_undo_redo_buttons()
 
     def wheelEvent(self, event):
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -8383,6 +8818,8 @@ class EditorCanvas(QGraphicsView):
             event.ignore()
             return
 
+        self.push_undo()
+
         # Fan multiple dropped images out a little so they don't land exactly
         # on top of one another.
         offset = QPointF(0, 0)
@@ -8424,6 +8861,9 @@ class EditorCanvas(QGraphicsView):
             return
 
         if self.current_tool == "Eraser":
+            if not self._erase_stroke_active:
+                self.push_undo()
+                self._erase_stroke_active = True
             self.erase_at(scene_pos)
             return
 
@@ -8439,6 +8879,7 @@ class EditorCanvas(QGraphicsView):
             # Detect which handle was clicked
             self.resizing_item, self.resize_handle = self.get_handle_at(scene_pos)
             if self.resizing_item:
+                self.push_undo()
                 self.start_point = scene_pos
                 return # Block regular selection/drawing
             # If the press lands on empty canvas (or the background), Qt's
@@ -8447,12 +8888,19 @@ class EditorCanvas(QGraphicsView):
             # to apply move-snapping to whatever happens to be selected.
             clicked_item = self.itemAt(event.position().toPoint())
             self._rubber_band_active = clicked_item is None or clicked_item is self.bg_item
+            if clicked_item is not None and clicked_item is not self.bg_item:
+                # About to potentially drag-move this item — snapshot first.
+                # (If the click turns out to be a no-op, e.g. just a select
+                # with no drag, this leaves a harmless undo step that
+                # restores an identical state.)
+                self.push_undo()
             super().mousePressEvent(event)
             return
 
         # Drawing Mode
         self.is_dirty = True
         self.start_point = scene_pos
+        self.push_undo()
         if self.current_tool == "Rectangle": 
             self.current_item = ResizableRectItem()
         elif self.current_tool == "Circle": 
@@ -8587,6 +9035,7 @@ class EditorCanvas(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         self._rubber_band_active = False
+        self._erase_stroke_active = False
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setCursor(Qt.CursorShape.ArrowCursor)
             self.update_cursor_by_handle(None)
@@ -8680,12 +9129,14 @@ class EditorCanvas(QGraphicsView):
                 win._edit_text_item(item)
                 return
         elif isinstance(item, FreehandItem):
+            self.push_undo()
             item._open_edit_dialog(event.globalPosition().toPoint())
             return
         elif isinstance(item, HighlightRectItem):
             dlg = HighlightEditDialog(item._color, self)
             _set_dialog_on_top(dlg)
             if dlg.exec() == QDialog.DialogCode.Accepted:
+                self.push_undo()
                 new_color = dlg.result_color()
                 item._color = new_color
                 item.setPen(QPen(Qt.PenStyle.NoPen))
@@ -8698,6 +9149,7 @@ class EditorCanvas(QGraphicsView):
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
                 if txt.strip():
+                    self.push_undo()
                     item._text = txt
                     item._fg_color = fg_col
                     item._bg_color = bg_col
@@ -8712,6 +9164,7 @@ class EditorCanvas(QGraphicsView):
                 self)
             _set_dialog_on_top(dlg)
             if dlg.exec() == QDialog.DialogCode.Accepted:
+                self.push_undo()
                 item._bg_color   = dlg.bg_color
                 item._text_color = dlg.text_color
                 item.update()
@@ -8731,6 +9184,7 @@ class EditorCanvas(QGraphicsView):
             dup_action  = menu.addAction("⧉ Duplicate")
             action = menu.exec(event.globalPos())
             if action == dup_action:
+                self.push_undo()
                 dup = self._clone_item(item)
                 if dup:
                     dup.setPos(item.pos() + QPointF(20, 20))
@@ -8748,6 +9202,7 @@ class EditorCanvas(QGraphicsView):
             del_act  = menu.addAction("🗑️ Delete")
             action = menu.exec(event.globalPos())
             if action == dup_act:
+                self.push_undo()
                 dup = self._clone_item(item)
                 if dup:
                     dup.setPos(item.pos() + QPointF(20, 20))
@@ -8758,6 +9213,7 @@ class EditorCanvas(QGraphicsView):
                 dlg = HighlightEditDialog(item._color, self)
                 _set_dialog_on_top(dlg)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self.push_undo()
                     new_color = dlg.result_color()
                     item._color = new_color
                     item.setPen(QPen(Qt.PenStyle.NoPen))
@@ -8765,6 +9221,7 @@ class EditorCanvas(QGraphicsView):
                     item.update()
                     self.is_dirty = True
             elif action == del_act:
+                self.push_undo()
                 self.scene.removeItem(item)
                 self.is_dirty = True
             return
@@ -8775,6 +9232,7 @@ class EditorCanvas(QGraphicsView):
             del_act  = menu.addAction("🗑️ Delete")
             action = menu.exec(event.globalPos())
             if action == dup_act:
+                self.push_undo()
                 dup = self._clone_item(item)
                 if dup:
                     dup.setPos(item.pos() + QPointF(20, 20))
@@ -8787,6 +9245,7 @@ class EditorCanvas(QGraphicsView):
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     txt, fg_col, bg_col = dlg.result_data()
                     if txt.strip():
+                        self.push_undo()
                         item._text = txt
                         item._fg_color = fg_col
                         item._bg_color = bg_col
@@ -8794,6 +9253,7 @@ class EditorCanvas(QGraphicsView):
                         item.update()
                         self.is_dirty = True
             elif action == del_act:
+                self.push_undo()
                 self.scene.removeItem(item)
                 self.is_dirty = True
             return
@@ -8809,11 +9269,13 @@ class EditorCanvas(QGraphicsView):
                     self)
                 _set_dialog_on_top(dlg)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self.push_undo()
                     item._bg_color   = dlg.bg_color
                     item._text_color = dlg.text_color
                     item.update()
                     self.is_dirty = True
             elif action == del_act:
+                self.push_undo()
                 self.scene.removeItem(item)
                 self.is_dirty = True
         elif isinstance(item, FreehandItem):
@@ -8823,15 +9285,18 @@ class EditorCanvas(QGraphicsView):
             del_act  = menu.addAction("🗑️ Delete")
             action = menu.exec(event.globalPos())
             if action == edit_act:
+                self.push_undo()
                 item._open_edit_dialog(event.globalPos())
                 self.is_dirty = True
             elif action == dup_act:
+                self.push_undo()
                 dup = self._clone_item(item)
                 if dup:
                     dup.setPos(item.pos() + QPointF(20, 20))
                     self.scene.addItem(dup)
                     self.is_dirty = True
             elif action == del_act:
+                self.push_undo()
                 self.scene.removeItem(item)
                 self.is_dirty = True
         elif isinstance(item, ArrowItem):
@@ -8847,6 +9312,7 @@ class EditorCanvas(QGraphicsView):
                                       getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
                                       target_item=item)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self.push_undo()
                     new_width, new_color, new_head = dlg.result_data()
                     pen = item.pen()
                     pen.setWidth(new_width)
@@ -8857,6 +9323,7 @@ class EditorCanvas(QGraphicsView):
                     item.update()
                 self.is_dirty = True
             elif action == straighten_act:
+                self.push_undo()
                 # Reset the bend/break point so the arrow is drawn as a
                 # perfectly straight line from p1 to p2 again.
                 item.prepareGeometryChange()
@@ -8864,12 +9331,14 @@ class EditorCanvas(QGraphicsView):
                 item.update()
                 self.is_dirty = True
             elif action == dup_act:
+                self.push_undo()
                 dup = self._clone_item(item)
                 if dup:
                     dup.setPos(item.pos() + QPointF(20, 20))
                     self.scene.addItem(dup)
                     self.is_dirty = True
             elif action == del_act:
+                self.push_undo()
                 self.scene.removeItem(item)
                 self.is_dirty = True
         else:
@@ -8877,6 +9346,7 @@ class EditorCanvas(QGraphicsView):
             dup_act = menu.addAction("⧉ Duplicate")
             action = menu.exec(event.globalPos())
             if action == dup_act:
+                self.push_undo()
                 dup = self._clone_item(item)
                 if dup:
                     dup.setPos(item.pos() + QPointF(20, 20))
@@ -9351,7 +9821,7 @@ class ImageEditorWindow(QMainWindow):
             tbar.addSpacing(8)
 
         for n, i in [("Select", None), ("Crop", None), ("Rectangle", None), ("Circle", "⭕"),
-                     ("Line", "📏"), ("Arrow", "➡️"), ("Highlight", "🟨"), ("Freehand", "✏️"),
+                     ("Line", "📏"), ("Arrow", None), ("Highlight", "🟨"), ("Freehand", "✏️"),
                      ("Bubble", "💬"), ("Text", "T"), ("Marker", "📍"), ("Eraser", None)]:
             b = QPushButton(); b.setCheckable(True)
             b.setFixedSize(40, 40)
@@ -9379,6 +9849,10 @@ class ImageEditorWindow(QMainWindow):
                 b.setIcon(_svg_icon(_SVG_RECT_TOOL, 32))
                 b.setIconSize(QSize(32, 32))
                 b.setToolTip("Rectangle")
+            elif n == "Arrow":
+                b.setIcon(_svg_icon(_SVG_ARROW_TOOL, 32))
+                b.setIconSize(QSize(32, 32))
+                b.setToolTip("Arrow")
             elif n == "Eraser":
                 b.setIcon(_svg_icon(_SVG_ERASER, 32))
                 b.setIconSize(QSize(32, 32))
@@ -9390,6 +9864,21 @@ class ImageEditorWindow(QMainWindow):
 
         tbar.addSpacing(8)
         self._build_magnet_button(tbar)
+
+        tbar.addSpacing(8)
+        self.btn_undo = QPushButton("↩️")
+        self.btn_undo.setFixedSize(40, 40)
+        self.btn_undo.setToolTip("Undo (Ctrl+Z)")
+        self.btn_undo.setStyleSheet("font-size: 18px; padding: 0px;")
+        self.btn_undo.clicked.connect(self.canvas_undo)
+        tbar.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("↪️")
+        self.btn_redo.setFixedSize(40, 40)
+        self.btn_redo.setToolTip("Redo (Ctrl+Y)")
+        self.btn_redo.setStyleSheet("font-size: 18px; padding: 0px;")
+        self.btn_redo.clicked.connect(self.canvas_redo)
+        tbar.addWidget(self.btn_redo)
 
         tbar.addStretch()
         
@@ -9490,6 +9979,8 @@ class ImageEditorWindow(QMainWindow):
         _sc("Delete",       self._delete_selected)
         _sc("Ctrl+D",       self._duplicate_selected)
         _sc("Ctrl+A",       self._select_all)
+
+        self._update_undo_redo_buttons()
 
     def _build_magnet_button(self, tbar):
         """Magnet button (toggle snapping on/off) + a dropdown checklist
@@ -9664,6 +10155,8 @@ class ImageEditorWindow(QMainWindow):
         if new_w < 1 or new_h < 1:
             return  # degenerate selection — nothing to apply
 
+        self.canvas.push_undo()
+
         # Offset: where the old image's top-left lands inside the new canvas
         dx = bg_rect.x() - new_rect.x()
         dy = bg_rect.y() - new_rect.y()
@@ -9702,6 +10195,7 @@ class ImageEditorWindow(QMainWindow):
                 dlg = HighlightEditDialog(item._color, self)
                 dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self.canvas.push_undo()
                     new_color = dlg.result_color()
                     item._color = new_color
                     item.setPen(QPen(Qt.PenStyle.NoPen))
@@ -9715,6 +10209,7 @@ class ImageEditorWindow(QMainWindow):
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     txt, fg_col, bg_col = dlg.result_data()
                     if txt.strip():
+                        self.canvas.push_undo()
                         item._text = txt
                         item._fg_color = fg_col
                         item._bg_color = bg_col
@@ -9730,6 +10225,7 @@ class ImageEditorWindow(QMainWindow):
                     self)
                 dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self.canvas.push_undo()
                     item._bg_color   = dlg.bg_color
                     item._text_color = dlg.text_color
                     item.update()
@@ -9739,6 +10235,7 @@ class ImageEditorWindow(QMainWindow):
                 dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
                 dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self.canvas.push_undo()
                     new_width, new_color = dlg.result_data()
                     pen = item.pen()
                     pen.setWidth(new_width)
@@ -9757,6 +10254,7 @@ class ImageEditorWindow(QMainWindow):
                                       target_item=item)
                 dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
+                    self.canvas.push_undo()
                     new_width, new_color, new_head = dlg.result_data()
                     pen = item.pen()
                     pen.setWidth(new_width)
@@ -9836,6 +10334,8 @@ class ImageEditorWindow(QMainWindow):
             self.update_live_props()
 
             # Live-apply color to all currently selected items
+            if selected:
+                self.canvas.push_undo()
             for item in self.canvas.scene.selectedItems():
                 if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
                     item.setDefaultTextColor(c)
@@ -9989,6 +10489,7 @@ class ImageEditorWindow(QMainWindow):
         dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
+            self.canvas.push_undo()
             if txt.strip():
                 item.setPlainText(txt)
                 item.setFont(QFont("Arial", fsz))
@@ -10047,6 +10548,7 @@ class ImageEditorWindow(QMainWindow):
                 view_center = self.canvas.mapToScene(self.canvas.viewport().rect().center())
                 item.setPos(view_center - item.boundingRect().center())
                 
+                self.canvas.push_undo()
                 self.canvas.scene.addItem(item)
                 self.canvas.is_dirty = True
                 self.select_tool("Select")
@@ -10076,16 +10578,20 @@ class ImageEditorWindow(QMainWindow):
         view_center = self.canvas.mapToScene(self.canvas.viewport().rect().center())
         item.setPos(view_center - item.boundingRect().center())
 
+        self.canvas.push_undo()
         self.canvas.scene.addItem(item)
         self.canvas.is_dirty = True
         self.select_tool("Select")
 
     def _delete_selected(self):
         """Delete selected items (keyboard shortcut helper)."""
-        for item in self.canvas.scene.selectedItems():
-            if item not in (self.canvas.bg_item, getattr(self.canvas, 'crop_item', None)):
-                self.canvas.scene.removeItem(item)
-                self.canvas.is_dirty = True
+        to_remove = [item for item in self.canvas.scene.selectedItems()
+                     if item not in (self.canvas.bg_item, getattr(self.canvas, 'crop_item', None))]
+        if to_remove:
+            self.canvas.push_undo()
+        for item in to_remove:
+            self.canvas.scene.removeItem(item)
+            self.canvas.is_dirty = True
 
     def _duplicate_selected(self):
         """Duplicate selected items (keyboard shortcut helper)."""
@@ -10107,6 +10613,15 @@ class ImageEditorWindow(QMainWindow):
         """Redo last undone action (keyboard shortcut helper)."""
         if hasattr(self.canvas, 'redo'):
             self.canvas.redo()
+
+    def _update_undo_redo_buttons(self):
+        """Enable/disable the toolbar Undo/Redo buttons to match the
+        canvas's history. Called by EditorCanvas whenever its undo/redo
+        stacks change (push, undo, redo)."""
+        if hasattr(self, 'btn_undo'):
+            self.btn_undo.setEnabled(self.canvas.can_undo())
+        if hasattr(self, 'btn_redo'):
+            self.btn_redo.setEnabled(self.canvas.can_redo())
 
     def save_default(self):
         img = self.render_scene()
@@ -12090,6 +12605,14 @@ _SVG_RECT_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" 
  <rect x="2.6" y="2.6" width="18.8" height="18.8" stroke="#ea3323" stroke-width="2.6"/>
 </svg>"""
 
+# SVG source for the Arrow annotation tool — a solid white arrow glyph
+# with a thin black outline (same white-fill/black-stroke style as
+# _SVG_SELECT so it reads clearly on both the dark Capture Region toolbar
+# and the light Image Editor toolbar), replacing the "➡️" emoji.
+_SVG_ARROW_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+ <path d="M2 9 H14 V4 L22 12 L14 20 V15 H2 Z" fill="#fff" stroke="#000" stroke-width="1" stroke-linejoin="round"/>
+</svg>"""
+
 # SVG source for the Crop tool — classic two-corner "crop marks" glyph
 # (matches the universal crop-tool icon used by most photo editors),
 # replacing the previous generic "📐" ruler emoji which didn't read as
@@ -12097,6 +12620,14 @@ _SVG_RECT_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" 
 _SVG_CROP = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
  <path d="M6 1v15a2 2 0 0 0 2 2h15" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
  <path d="M18 23V8a2 2 0 0 0-2-2H1" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"""
+
+# SVG source for the "Empty Canvas" option in the Image Editor's
+# "Select Source" dialog — a blank white painter's canvas on an easel,
+# replacing the generic "⬜" white-square emoji.
+_SVG_EMPTY_CANVAS = """<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+ <path d="M7 21.5 9.6 5.5M17 21.5 14.4 5.5M3.5 21.5h17" stroke="#8a8a8a" stroke-width="1.3" stroke-linecap="round"/>
+ <rect x="4.3" y="2.5" width="15.4" height="12" rx="0.6" fill="#ffffff" stroke="#5b5b5b" stroke-width="1.4"/>
 </svg>"""
 
 # SVG source for the Eraser tool — a classic angled eraser block split
