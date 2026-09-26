@@ -109,7 +109,8 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 
 ## Image Editor
 
-<img width="1920" height="1020" alt="pythonw_Gzan9BQ1eQ" src="https://github.com/user-attachments/assets/60bd1c35-d19b-4a72-a50b-8aa0ad784728" />
+<img width="1920" height="1020" alt="pythonw_QNFEYtRpNX" src="https://github.com/user-attachments/assets/98418e33-de5e-4ce8-a00e-75dd50db9732" />
+
 
 
 
