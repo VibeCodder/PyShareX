@@ -92,7 +92,8 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 
 
 ## Capture Region with toolbar
-<img width="1280" height="720" alt="598446750-475be521-9dc0-446d-bc05-e7a1324f1fea" src="https://github.com/user-attachments/assets/94762de0-bef2-484b-90e7-b939a8761d67" />
+<img width="1280" height="720" alt="598446750-475be521-9dc0-446d-bc05-se7a1324f1fea" src="https://github.com/user-attachments/assets/1d575a4e-c38d-4e11-b9ad-3d2128578a82" />
+
 
 
 ## Video Converter Window
