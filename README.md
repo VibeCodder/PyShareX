@@ -95,11 +95,6 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 <img width="1280" height="720" alt="598446750-475be521-9dc0-446d-bc05-e7a1324f1fea" src="https://github.com/user-attachments/assets/94762de0-bef2-484b-90e7-b939a8761d67" />
 
 
-
-
-
-
-
 ## Video Converter Window
 
 <img width="764" height="687" alt="region_2026-05-13_22-15-04" src="https://github.com/user-attachments/assets/556560f2-66ed-4679-b713-8bab0d2ff1f8" />
@@ -110,7 +105,8 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 
 ## Image Editor
 
-<img width="1920" height="1020" alt="pythonw_QNFEYtRpNX" src="https://github.com/user-attachments/assets/98418e33-de5e-4ce8-a00e-75dd50db9732" />
+<img width="1920" height="1020" alt="598416325-90835aa5-9a6e-4afc-a80f-4a0167fce0d3" src="https://github.com/user-attachments/assets/6dc0bd8e-73a1-4758-8f9a-0cd21f7c6bb0" />
+
 
 
 
