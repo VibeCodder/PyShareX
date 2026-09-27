@@ -2487,6 +2487,12 @@ class ArrowItem(QGraphicsLineItem):
                   center of the arrow — drag it vertically to change stroke width.
     """
     ARROW_BASE_SIZE = 14  # base arrow size at pen width=1
+    # Extra distance (local units) the shaft is drawn past the head's exact
+    # geometric base, so the tail tucks a little way *under* the head
+    # instead of stopping right at its edge. The head is painted on top of
+    # the shaft, so this overlap is invisible — it just guarantees the seam
+    # is always fully covered, whatever angle the head ends up at.
+    SHAFT_HEAD_OVERLAP = 5.0
     HEAD_SINGLE   = 'single'          # head at p2 (end) only
     HEAD_SINGLE_START = 'single_start'  # head at p1 (start) only — the other side
     HEAD_DOUBLE   = 'double'          # head at both ends
@@ -2568,35 +2574,34 @@ class ArrowItem(QGraphicsLineItem):
         always agree on exactly where the head's base sits."""
         return self._arrow_size() * 1.15
 
-    def _head_triangle(self, tip, fwd, back):
+    def _head_triangle(self, tip, fwd):
         """Return the two base points of an arrowhead triangle whose point is
-        at *tip*, with its flat base centered at *back* and oriented
-        perpendicular to unit vector *fwd*.
+        at *tip*, facing along unit vector *fwd* (pointing from the head's
+        back toward the tip).
 
-        *back* must be the exact on-curve point where the shaft was clipped
-        (see _shaft_endpoints) — not derived from tip/length — so the base
-        sits exactly where the visible shaft ends, with no gap or overlap
-        between the two.
-
-        *fwd* must be the curve's own tangent direction at *back* (pointing
-        from the back toward the tip) — NOT the straight chord from back to
-        tip. Qt's stroker caps the shaft's flat end perpendicular to that
-        same local tangent, so using the tangent here keeps the head's base
-        edge flush with the shaft's cut edge. Using the chord instead (the
-        previous approach) rotates the base relative to the shaft's edge
-        whenever the curve bends between the cut point and the tip: the
-        shaft's two corner points (offset perpendicular to the tangent) and
-        the head's two corner points (offset perpendicular to the chord)
-        then land in different places, leaving an uncovered wedge-shaped
-        gap on the convex side of the bend once the pen is thick enough for
-        the offsets to matter.
+        *fwd* is deliberately the straight chord from the shaft's cut point
+        to the tip — NOT the curve's own tangent at the cut point. Tangent-
+        based orientation was tried and reverted: on a sharp bend the curve's
+        tangent at the cut point can point tens of degrees away from where
+        the tip actually is, which swings the whole triangle off to one
+        side — the head then folds back over the shaft in a self-
+        intersecting sliver that looks like it's been twisted out of the
+        page (in 3D) rather than just rotated flat. The chord always points
+        the triangle straight at the tip, so it can never fold like that,
+        on any bend. The (much smaller) seam gap that a chord-oriented head
+        can leave against the shaft's flat-capped edge is closed separately
+        by drawing the shaft a little way past this triangle's base, tucked
+        underneath it (see SHAFT_HEAD_OVERLAP / _shaft_trim_percents)
+        instead of trying to make the two edges perfectly coincide.
 
         Length and half-width are set independently (instead of deriving
         both from one sweep angle) so the head comes out as a blocky,
         flat-backed triangle — length roughly equal to width — matching a
         classic arrow-icon silhouette rather than a thin, wide sliver."""
         sz = self._arrow_size()
+        length = self._head_length()
         half_width = sz * 0.62
+        back = QPointF(tip.x() - length * fwd.x(), tip.y() - length * fwd.y())
         perp = QPointF(-fwd.y(), fwd.x())
         p_left  = QPointF(back.x() + half_width * perp.x(), back.y() + half_width * perp.y())
         p_right = QPointF(back.x() - half_width * perp.x(), back.y() - half_width * perp.y())
@@ -2634,11 +2639,33 @@ class ArrowItem(QGraphicsLineItem):
             t_end = path.percentAtLength(total_len - length)
         return t_start, t_end
 
+    def _shaft_trim_percents(self, path):
+        """Like _shaft_endpoints, but the shaft is trimmed
+        SHAFT_HEAD_OVERLAP units short of the head's exact base instead of
+        flush with it — i.e. the shaft is drawn a little way *into* the
+        head's footprint. The head is always painted on top afterwards, so
+        that overlap is invisible; what it buys is a seam that's always
+        fully covered no matter how the head's base happens to be angled,
+        instead of depending on the shaft's edge and the head's edge
+        landing on exactly the same line."""
+        total_len = path.length()
+        if total_len <= 0:
+            return 0.0, 1.0
+        head_style = getattr(self, 'head_style', self.HEAD_SINGLE)
+        length = max(0.0, self._head_length() - self.SHAFT_HEAD_OVERLAP)
+        t_start, t_end = 0.0, 1.0
+        if head_style in (self.HEAD_SINGLE_START, self.HEAD_DOUBLE) and total_len > length:
+            t_start = path.percentAtLength(length)
+        if head_style in (self.HEAD_SINGLE, self.HEAD_DOUBLE) and total_len > length:
+            t_end = path.percentAtLength(total_len - length)
+        return t_start, t_end
+
     def _shaft_paint_path(self, path):
         """The actual path used to stroke the shaft: the same curve as
-        *path*, but shortened by the arrowhead's length at whichever
-        end(s) have a head — so the shaft simply never reaches into the
-        head's zone, rather than being drawn there and then patched up.
+        *path*, but shortened by the arrowhead's length (minus a small
+        overlap — see _shaft_trim_percents) at whichever end(s) have a
+        head — so the shaft simply never reaches past the head's zone,
+        rather than being drawn there and then patched up.
 
         First attempt at this used a straight guillotine clip (a flat cut
         line positioned via the tip's tangent direction). That works for
@@ -2663,7 +2690,7 @@ class ArrowItem(QGraphicsLineItem):
         if total_len <= 0:
             return None
 
-        t_start, t_end = self._shaft_endpoints(path)
+        t_start, t_end = self._shaft_trim_percents(path)
         if t_end <= t_start:
             # The arrow is shorter than its head(s) — no shaft left to draw
             # (the head triangle itself is drawn separately regardless).
@@ -2710,51 +2737,40 @@ class ArrowItem(QGraphicsLineItem):
             painter.setPen(Qt.PenStyle.NoPen)
 
             # Same arc-length cut points used to trim the shaft (see
-            # _shaft_endpoints). The head's base is anchored exactly at that
-            # cut point and oriented along the curve's own local tangent
-            # there (not the chord from cut-point to tip) — see
-            # _head_triangle for why the tangent, not the chord, is what
-            # keeps the base flush with the shaft's flat-capped edge.
+            # _shaft_endpoints). The head's direction is derived from the
+            # vector *cut-point -> tip*, not from the curve's own tangent
+            # at the tip, so the head always points exactly at the spot
+            # where the visible shaft ends, even on a sharp bend — see
+            # _head_triangle for why the chord (not the tangent) is what
+            # keeps the head flat/2D instead of folding on tight bends.
             t_start, t_end = self._shaft_endpoints(path)
-            length = self._head_length()
-            has_length_for_head = path.length() > length
+            has_length_for_head = path.length() > self._head_length()
 
             if draw_head_p2:
-                # Head at p2 — base sits at the cut point near p2.
+                # Head at p2 — faces from the shaft's cut point toward p2
                 tip2 = self.line().p2()
+                fwd2 = None
                 if has_length_for_head:
-                    back2 = path.pointAtPercent(t_end)
-                    fwd2 = self._angle_vector(math.radians(path.angleAtPercent(t_end)))
-                    # angleAtPercent gives the tangent LINE, not which of its
-                    # two directions to use — flip it if it points away from
-                    # the tip instead of toward it.
-                    if fwd2.x() * (tip2.x() - back2.x()) + fwd2.y() * (tip2.y() - back2.y()) < 0:
-                        fwd2 = QPointF(-fwd2.x(), -fwd2.y())
-                else:
-                    # Arrow shorter than the head itself — no shaft to stay
-                    # flush with, so fall back to the old chord-based axis.
-                    fwd2 = (self._unit_vector(self.line().p1(), tip2) or
-                            self._angle_vector(math.radians(path.angleAtPercent(1.0))))
-                    back2 = QPointF(tip2.x() - length * fwd2.x(), tip2.y() - length * fwd2.y())
-                pl, pr = self._head_triangle(tip2, fwd2, back2)
+                    cut2 = path.pointAtPercent(t_end)
+                    fwd2 = self._unit_vector(cut2, tip2)
+                if fwd2 is None:
+                    fwd2 = self._angle_vector(math.radians(path.angleAtPercent(1.0)))
+                pl, pr = self._head_triangle(tip2, fwd2)
                 head_path = QPainterPath()
                 head_path.moveTo(tip2); head_path.lineTo(pl); head_path.lineTo(pr)
                 head_path.closeSubpath()
                 painter.drawPath(head_path)
 
             if draw_head_p1:
-                # Head at p1 — base sits at the cut point near p1.
+                # Head at p1 — faces from the shaft's cut point toward p1
                 tip1 = self.line().p1()
+                fwd1 = None
                 if has_length_for_head:
-                    back1 = path.pointAtPercent(t_start)
-                    fwd1 = self._angle_vector(math.radians(path.angleAtPercent(t_start)))
-                    if fwd1.x() * (tip1.x() - back1.x()) + fwd1.y() * (tip1.y() - back1.y()) < 0:
-                        fwd1 = QPointF(-fwd1.x(), -fwd1.y())
-                else:
-                    fwd1 = (self._unit_vector(self.line().p2(), tip1) or
-                            self._angle_vector(math.radians(path.angleAtPercent(0.0)) + math.pi))
-                    back1 = QPointF(tip1.x() - length * fwd1.x(), tip1.y() - length * fwd1.y())
-                pl, pr = self._head_triangle(tip1, fwd1, back1)
+                    cut1 = path.pointAtPercent(t_start)
+                    fwd1 = self._unit_vector(cut1, tip1)
+                if fwd1 is None:
+                    fwd1 = self._angle_vector(math.radians(path.angleAtPercent(0.0)) + math.pi)
+                pl, pr = self._head_triangle(tip1, fwd1)
                 head_path = QPainterPath()
                 head_path.moveTo(tip1); head_path.lineTo(pl); head_path.lineTo(pr)
                 head_path.closeSubpath()
