@@ -10,3 +10,4 @@ easyocr
 qrcode[pil]
 paddleocr
 paddlepaddle
+python-xlib
