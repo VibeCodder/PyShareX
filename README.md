@@ -14,8 +14,8 @@ For Windows use .pyw script, for Linux .py script
 
 ## For Linux:
 
-> Note: The app has been tested on Linux Mint Cimanonn and should work for this OS.<br>
-other Linux distros has not been tested.
+> Note: The app has been tested on Linux Mint Cinamonn and should work for this OS.<br>
+Other Linux distros have not been tested.
 
 Run 
 ```
