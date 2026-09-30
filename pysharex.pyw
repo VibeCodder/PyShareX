@@ -336,6 +336,73 @@ def _get_visible_window_bounds(hwnd):
         pass
     return win32gui.GetWindowRect(hwnd)
 
+
+def _get_child_window_bounds(hwnd, parent_bounds, min_size=24):
+    """Widoczne okna potomne (HWND) `hwnd` jako fizyczne (l, t, r, b).
+
+    To właśnie pozwala wykryć "fragment okna" - np. obszar strony w Chrome
+    (Chrome_RenderWidgetHostHWND), panel podglądu, listę plików w Eksploratorze,
+    pole edycji itp. - tak jak robi to ShareX. Prostokąty są przycięte do
+    widocznych granic rodzica (dziecko potrafi wystawać poza okno), a te
+    identyczne z rodzicem lub mniejsze niż `min_size` px są pomijane.
+    """
+    import win32gui
+    pl, pt, pr, pb = parent_bounds
+    seen, out = set(), []
+
+    def _cb(ch, _):
+        try:
+            if not win32gui.IsWindowVisible(ch):
+                return True
+            l, t, r, b = win32gui.GetWindowRect(ch)
+            l, t = max(l, pl), max(t, pt)
+            r, b = min(r, pr), min(b, pb)
+            if r - l < min_size or b - t < min_size:
+                return True
+            key = (l, t, r, b)
+            if key == tuple(parent_bounds) or key in seen:
+                return True
+            seen.add(key)
+            out.append(key)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(hwnd, _cb, None)
+    except Exception:
+        pass
+    return out
+
+
+def _is_window_cloaked(hwnd) -> bool:
+    """
+    True if the window is "cloaked" (Windows 8+ DWM concept): technically
+    satisfies IsWindowVisible() but isn't actually shown to the user.
+
+    This is what window-detection accidentally picks up without this check:
+    Chrome (and many Electron/UWP apps) keep extra hidden helper windows
+    alive — often sharing the visible tab's title — that IsWindowVisible()
+    reports as visible but that the user never sees. DWM also cloaks any
+    window sitting on a different virtual desktop. Filtering these out is
+    the standard fix for the "detected rectangle doesn't match anything
+    actually on screen" problem.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        DWMWA_CLOAKED = 14
+        val = ctypes.c_int(0)
+        hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            wintypes.HWND(hwnd),
+            ctypes.c_uint(DWMWA_CLOAKED),
+            ctypes.byref(val),
+            ctypes.sizeof(val),
+        )
+        return hr == 0 and val.value != 0
+    except Exception:
+        return False
+
 def _is_wayland_session() -> bool:
     """Wykrywa, czy bieżąca sesja graficzna to Wayland (np. przyszła sesja
     Cinnamon-Wayland w Linux Mint 23 / Cinnamon 6.8), a nie X11."""
@@ -348,6 +415,138 @@ def _is_wayland_session() -> bool:
         return False
     # XDG_SESSION_TYPE bywa puste (np. w niektórych DM-ach) - dodatkowy fallback:
     return bool(os.environ.get("WAYLAND_DISPLAY"))
+
+def _get_x11_window_rects():
+    """
+    Enumerate visible top-level window rects on an X11 session (Xorg), via
+    EWMH _NET_CLIENT_LIST — this is what lets "Capture region" outline real
+    windows (not just whole screens) on Linux Mint / Cinnamon, MATE, XFCE,
+    KDE Plasma (X11) and any other EWMH-compliant window manager.
+
+    Returns a list of (left, top, right, bottom) in root-window pixels
+    (the same coordinate space as QApplication.screens() geometry on X11,
+    since X11 has no separate physical/logical DPI layer the way Windows
+    does). Returns an empty list — never raises — if this isn't an X11
+    session, python-xlib isn't installed, or the window manager doesn't
+    support EWMH; callers should fall back to the per-screen rects used
+    before this feature existed.
+    """
+    if not IS_LINUX or _is_wayland_session():
+        # Wayland deliberately hides other applications' window positions
+        # from clients for security — there is no equivalent API to fall
+        # back to, so per-screen detection is used instead (see _refresh_win_rects).
+        return []
+    try:
+        from Xlib import display, X
+        from Xlib.error import XError
+    except ImportError:
+        return []
+
+    try:
+        d    = display.Display()
+        root = d.screen().root
+        net_client_list   = d.intern_atom('_NET_CLIENT_LIST')
+        net_wm_state       = d.intern_atom('_NET_WM_STATE')
+        net_wm_state_hidden = d.intern_atom('_NET_WM_STATE_HIDDEN')
+        net_frame_extents  = d.intern_atom('_NET_FRAME_EXTENTS')
+
+        prop = root.get_full_property(net_client_list, X.AnyPropertyType)
+        if not prop or not prop.value:
+            return []
+
+        rects = []
+        for wid in prop.value:
+            try:
+                win = d.create_resource_object('window', wid)
+
+                attrs = win.get_attributes()
+                if attrs.map_state != X.IsViewable:
+                    continue  # minimized or unmapped
+
+                state_prop = win.get_full_property(net_wm_state, X.AnyPropertyType)
+                if state_prop and net_wm_state_hidden in (state_prop.value or []):
+                    continue  # minimized (some WMs use _NET_WM_STATE_HIDDEN instead)
+
+                geom   = win.get_geometry()
+                origin = win.translate_coords(root, 0, 0)
+                x, y   = origin.x, origin.y
+                w, h   = geom.width, geom.height
+
+                # Client geometry excludes the window manager's decorations
+                # (title bar / borders). Expand by _NET_FRAME_EXTENTS, when
+                # the WM provides it, so the whole visible window is captured
+                # — matching the DWM extended-frame handling used on Windows.
+                extents = win.get_full_property(net_frame_extents, X.AnyPropertyType)
+                if extents and extents.value and len(extents.value) >= 4:
+                    left, right, top, bottom = extents.value[:4]
+                    x -= left
+                    y -= top
+                    w += left + right
+                    h += top + bottom
+
+                if w < 20 or h < 20:
+                    continue
+                rects.append((x, y, x + w, y + h))
+            except XError:
+                continue
+        return rects
+    except Exception:
+        return []
+
+
+def _physical_rects_to_local(phys_rects, geo: QRect):
+    """
+    Convert a list of (left, top, right, bottom) PHYSICAL desktop-pixel
+    rects into LOCAL QRects relative to `geo` (the union of all screens'
+    logical geometry, i.e. EnhancedRegionSelector's own widget geometry).
+
+    Each rect is matched to whichever screen's physical bounds contain its
+    origin, then converted using THAT screen's own devicePixelRatio — so
+    multi-monitor setups where different monitors use different DPI scale
+    factors (mixed-DPI) still land each window at the correct local
+    position and size. A rect that can't be matched to any screen falls
+    back to the primary screen's scale factor.
+
+    Used for both the Win32 (GetWindowRect/DwmGetWindowAttribute) and X11
+    (EWMH via python-xlib) window-detection backends, which both report
+    physical pixels.
+    """
+    screens = QApplication.screens()
+    out = []
+    for (pl, pt, pr, pb) in phys_rects:
+        pw, ph = pr - pl, pb - pt
+        if pw < 20 or ph < 20:
+            continue
+
+        scr = None
+        for s in screens:
+            lg  = s.geometry()
+            dpr = s.devicePixelRatio()
+            sx  = round(lg.x()      * dpr)
+            sy  = round(lg.y()      * dpr)
+            sw  = round(lg.width()  * dpr)
+            sh  = round(lg.height() * dpr)
+            if sx <= pl < sx + sw and sy <= pt < sy + sh:
+                scr = s
+                break
+        if scr is None:
+            scr = QApplication.primaryScreen()
+
+        lg  = scr.geometry()
+        dpr = scr.devicePixelRatio()
+        ox  = round(lg.x() * dpr)
+        oy  = round(lg.y() * dpr)
+
+        # physical → logical global
+        lx = lg.x() + (pl - ox) / dpr
+        ly = lg.y() + (pt - oy) / dpr
+        lw = max(1, pw / dpr)
+        lh = max(1, ph / dpr)
+
+        # logical global → LOCAL widget
+        out.append(QRect(int(lx) - geo.x(), int(ly) - geo.y(), int(lw), int(lh)))
+    return out
+
 
 def _set_dialog_on_top(dlg):
     """Set dialog window flags so it appears above fullscreen overlays on all platforms.
@@ -1047,6 +1246,12 @@ class Config:
             #   "standard" — new ffmpeg-free method (mss + PIL), DPI-aware
             #                across monitors with different scaling
             "region_capture_method": "standard",
+            # "Capture region": while hovering (no mouse button held) before a
+            # drag starts, automatically outline the window / UI element under
+            # the cursor with a dashed rectangle; a plain click captures it
+            # immediately. Holding the left button and dragging still falls
+            # back to the normal manual rectangle-selection mode.
+            "detect_windows_on_capture": True,
         }
 
     def _load(self):
@@ -3926,9 +4131,20 @@ class EnhancedRegionSelector(QWidget):
         # Sync color swatch and freehand defaults when selection changes
         self._canvas._scene.selectionChanged.connect(self._on_selection_changed)
 
-        # ── Window-rect cache — disabled (detection mode removed) ──────────────
+        # ── Window / UI-element detection (hover-to-outline, click-to-capture) ──
+        # Enabled by default; can be turned off in Settings → "Capture Region method".
+        self._detect_windows_enabled = Config().get("detect_windows_on_capture", True)
+        self._inline_dragging   = False   # True once a real drag (not just a click) starts
         self._win_rects: list[QRect] = []
-        self._cache_timer = QTimer(self)  # kept as reference but not started
+        self._win_tops: list = []           # [(hwnd, QRect)] z-order, Windows
+        self._win_children: list[QRect] = []
+        self._win_child_owner = None
+        self._child_refresh_pending = False
+        self._cache_timer = QTimer(self)
+        self._cache_timer.timeout.connect(self._refresh_win_rects)
+        if self._detect_windows_enabled:
+            self._cache_timer.start(300)
+            self._refresh_win_rects()
 
         # ── Toolbar ───────────────────────────────────────────────────────────
         self._toolbar = self._build_toolbar()
@@ -4024,62 +4240,89 @@ class EnhancedRegionSelector(QWidget):
 
     def _refresh_win_rects(self):
         """
-        Collect visible window rects (Win32 physical px → logical → LOCAL coords).
-        On Linux falls back to per-screen full-rect entries.
+        Collect visible window rects, in LOCAL widget coords.
+        Win32 (GetWindowRect/DwmGetWindowAttribute) and X11 (EWMH, via
+        python-xlib) both report PHYSICAL desktop pixels, so both go through
+        _physical_rects_to_local() to become correct LOCAL rects even when
+        different monitors use different DPI scale factors. Falls back to
+        per-screen full-rect entries when neither backend is available
+        (Wayland, missing python-xlib, a non-EWMH window manager, or macOS).
         """
         rects = []
+        tops, children, child_owner = [], [], None
         if IS_WINDOWS:
             try:
                 import win32gui
-                screens = QApplication.screens()
+                import win32process
+                cur = win32gui.GetCursorPos()        # fizyczne px
+                phys_tops = []                        # [(hwnd, (l,t,r,b))] z-order: góra → dół
+                my_pid   = os.getpid()
+                my_hwnd  = int(self.winId())
+
+                def _is_own_overlay(hwnd) -> bool:
+                    # Sam overlay (i inne nasze okna "zawsze na wierzchu": pasek
+                    # narzędzi, ramki) leży NAJWYŻEJ w z-order i pokrywa cały
+                    # ekran - bez tego filtra zawsze on wygrywa i zaznaczany
+                    # jest "cały ekran".
+                    if hwnd == my_hwnd:
+                        return True
+                    try:
+                        if win32process.GetWindowThreadProcessId(hwnd)[1] != my_pid:
+                            return False
+                        exstyle = win32gui.GetWindowLong(hwnd, -20)   # GWL_EXSTYLE
+                        return bool(exstyle & 0x00000008)             # WS_EX_TOPMOST
+                    except Exception:
+                        return False
 
                 def _cb(hwnd, _):
                     if not (win32gui.IsWindowVisible(hwnd) and
                             win32gui.GetWindowText(hwnd)):
-                        return
+                        return True
+                    if _is_own_overlay(hwnd):
+                        return True
+                    if win32gui.IsIconic(hwnd):
+                        return True   # minimized — its rect is meaningless/off-screen
+                    if _is_window_cloaked(hwnd):
+                        return True   # ghost/helper window (see _is_window_cloaked),
+                                      # or a window on a different virtual desktop
                     try:
-                        r = _get_visible_window_bounds(hwnd)
+                        phys_tops.append((hwnd, _get_visible_window_bounds(hwnd)))
                     except Exception:
-                        return
-                    pl, pt, pr, pb = r
-                    pw, ph = pr - pl, pb - pt
-                    if pw < 20 or ph < 20:
-                        return
-
-                    # Find screen by physical origin
-                    scr = None
-                    for s in screens:
-                        lg  = s.geometry()
-                        dpr = s.devicePixelRatio()
-                        sx  = round(lg.x()      * dpr)
-                        sy  = round(lg.y()      * dpr)
-                        sw  = round(lg.width()  * dpr)
-                        sh  = round(lg.height() * dpr)
-                        if sx <= pl < sx + sw and sy <= pt < sy + sh:
-                            scr = s
-                            break
-                    if scr is None:
-                        scr = QApplication.primaryScreen()
-
-                    lg  = scr.geometry()
-                    dpr = scr.devicePixelRatio()
-                    ox  = round(lg.x() * dpr)
-                    oy  = round(lg.y() * dpr)
-
-                    # physical → logical global
-                    lx = lg.x() + (pl - ox) / dpr
-                    ly = lg.y() + (pt - oy) / dpr
-                    lw = max(1, pw / dpr)
-                    lh = max(1, ph / dpr)
-
-                    # logical global → LOCAL widget
-                    loc_x = int(lx) - self._geo.x()
-                    loc_y = int(ly) - self._geo.y()
-                    rects.append(QRect(loc_x, loc_y, int(lw), int(lh)))
+                        pass
+                    return True
 
                 win32gui.EnumWindows(_cb, None)
+
+                for hwnd, pb in phys_tops:
+                    loc = _physical_rects_to_local([pb], self._geo)
+                    if loc:
+                        tops.append((hwnd, loc[0]))
+
+                # Okna potomne liczymy tylko dla okna, które jest faktycznie
+                # NA WIERZCHU pod kursorem (EnumChildWindows dla wszystkich
+                # okien co 300 ms byłoby zbędnie drogie).
+                for hwnd, pb in phys_tops:
+                    if pb[0] <= cur[0] < pb[2] and pb[1] <= cur[1] < pb[3]:
+                        child_owner = hwnd
+                        phys_children = _get_child_window_bounds(hwnd, pb)
+                        children = _physical_rects_to_local(phys_children, self._geo)
+                        break
+
+                rects = [r for _, r in tops] + children
             except Exception:
                 pass
+        elif IS_LINUX:
+            x11_rects = _get_x11_window_rects()
+            if x11_rects:
+                rects = _physical_rects_to_local(x11_rects, self._geo)
+            else:
+                # Not an X11 session (e.g. Wayland), python-xlib missing, or
+                # no EWMH support — fall back to whole-screen rects.
+                for s in QApplication.screens():
+                    lg = s.geometry()
+                    rects.append(QRect(
+                        lg.x() - self._geo.x(), lg.y() - self._geo.y(),
+                        lg.width(), lg.height()))
         else:
             for s in QApplication.screens():
                 lg = s.geometry()
@@ -4087,10 +4330,22 @@ class EnhancedRegionSelector(QWidget):
                     lg.x() - self._geo.x(), lg.y() - self._geo.y(),
                     lg.width(), lg.height()))
         self._win_rects = rects
+        self._win_tops = tops if IS_WINDOWS else []
+        self._win_children = children
+        self._win_child_owner = child_owner
         self._update_detection_at_cursor()
 
     def _update_detection_at_cursor(self):
-        if self._current_tool != self.TOOL_DETECT or self._dragging:
+        # Active in the dedicated DETECT tool, and also in the default
+        # "_capture_select" mode (the one "Capture region" opens into) as
+        # long as window detection is enabled in Settings and the user
+        # isn't currently dragging out a manual selection rectangle.
+        in_capture_hover = (self._current_tool == "_capture_select" and
+                             self._detect_windows_enabled and
+                             not self._inline_dragging)
+        if not (self._current_tool == self.TOOL_DETECT or in_capture_hover):
+            return
+        if self._dragging:
             return
         gpos  = QCursor.pos()
         found = self._best_rect_at_global(gpos)
@@ -4099,8 +4354,39 @@ class EnhancedRegionSelector(QWidget):
             self.update()
 
     def _best_rect_at_global(self, gpos: QPoint) -> QRect:
-        """Smallest LOCAL-coord rect containing global logical pos gpos."""
+        """LOCAL-coord rect under global pos gpos.
+
+        Windows: bierzemy okno NAJWYŻEJ w z-order pod kursorem (zasłonięte
+        okna już nie "wygrywają" tylko dlatego, że są mniejsze), a w nim
+        najmniejszy element potomny (fragment okna) zawierający kursor;
+        gdy brak potomka - całe okno. Inne systemy: najmniejszy prostokąt.
+        """
         local = gpos - self._geo.topLeft()
+        tops = getattr(self, "_win_tops", [])
+        if tops:
+            top_hwnd, top_rect = None, QRect()
+            for hwnd, r in tops:
+                if r.contains(local):
+                    top_hwnd, top_rect = hwnd, r
+                    break
+            if top_hwnd is None:
+                return QRect()
+            if top_hwnd != getattr(self, "_win_child_owner", None):
+                # dzieci policzone dla innego okna - odśwież zaraz (raz)
+                if not getattr(self, "_child_refresh_pending", False):
+                    self._child_refresh_pending = True
+                    def _again():
+                        self._child_refresh_pending = False
+                        self._refresh_win_rects()
+                    QTimer.singleShot(0, _again)
+                return top_rect
+            best, best_area = top_rect, top_rect.width() * top_rect.height()
+            for r in self._win_children:
+                a = r.width() * r.height()
+                if r.contains(local) and a < best_area:
+                    best, best_area = r, a
+            return best
+
         best, best_area = QRect(), 10**9
         for r in self._win_rects:
             if r.contains(local) and r.width() * r.height() < best_area:
@@ -4932,6 +5218,23 @@ class EnhancedRegionSelector(QWidget):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(0, 0, 0, 90))
 
+        # ── Window / UI-element detection highlight (dashed rectangle) ─────────
+        # Shown only while hovering before a drag starts (ShareX-style).
+        if (self._current_tool == "_capture_select" and self._detect_windows_enabled
+                and not self._inline_dragging and self._detected_rect.isValid()
+                and self._detected_rect.width() > 0 and self._detected_rect.height() > 0):
+            dr = self._detected_rect
+            pen = QPen(QColor(0, 220, 130), 2, Qt.PenStyle.DashLine)
+            pen.setDashPattern([6, 4])
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(dr)
+            p.setPen(QColor(255, 255, 255))
+            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+            label = f"{dr.width()} × {dr.height()} px — click to capture"
+            ty = dr.y() - 6 if dr.y() > 20 else dr.bottom() + 14
+            p.drawText(dr.x() + 4, ty, label)
+
         # ── Draw inline capture selection rectangle ────────────────────────────
         if (self._current_tool == "_capture_select" and
                 self._inline_start and self._inline_end):
@@ -4979,8 +5282,9 @@ class EnhancedRegionSelector(QWidget):
 
         # ── Inline capture-selection mode ─────────────────────────────────────
         if self._current_tool == "_capture_select":
-            self._inline_start = gpos   # global Qt coords — same as RegionSelector
-            self._inline_end   = gpos
+            self._inline_start   = gpos   # global Qt coords — same as RegionSelector
+            self._inline_end     = gpos
+            self._inline_dragging = False   # becomes True only once the mouse actually moves
             return
 
         # ── DETECT mode ───────────────────────────────────────────────────────
@@ -5067,7 +5371,19 @@ class EnhancedRegionSelector(QWidget):
         if self._current_tool == "_capture_select":
             if e.buttons() & Qt.MouseButton.LeftButton and self._inline_start is not None:
                 self._inline_end = gpos   # global Qt coords — same as RegionSelector
+                # Once the mouse has moved far enough from the press point,
+                # this is a real drag — switch out of hover/detect mode and
+                # into the normal manual rectangle selection (unchanged
+                # behaviour from before this feature was added).
+                if not self._inline_dragging:
+                    moved = (gpos - self._inline_start).manhattanLength()
+                    if moved > 4:
+                        self._inline_dragging = True
+                        self._detected_rect = QRect()
                 self.update()
+            elif self._detect_windows_enabled:
+                # No button held: hovering — refresh the detected-window outline.
+                self._update_detection_at_cursor()
             return
 
         # ── DETECT mode disabled
@@ -5174,6 +5490,20 @@ class EnhancedRegionSelector(QWidget):
 
         # ── Inline capture-selection mode — finalize rect ─────────────────────
         if self._current_tool == "_capture_select":
+            # A plain click (no real drag) on a detected window/element:
+            # capture that rect immediately (ShareX-style window detection).
+            if (self._detect_windows_enabled and not self._inline_dragging and
+                    self._detected_rect.isValid() and
+                    self._detected_rect.width() > 4 and self._detected_rect.height() > 4):
+                global_rect = self._detected_rect.translated(self._geo.topLeft())
+                self._current_tool = self._prev_tool
+                self._inline_selecting = False
+                self._inline_start = None
+                self._inline_end = None
+                self._inline_dragging = False
+                self._detected_rect = QRect()
+                self._do_capture_global_rect(global_rect)
+                return
             if self._inline_start and self._inline_end:
                 global_rect = QRect(self._inline_start, self._inline_end).normalized()
                 if global_rect.width() > 4 and global_rect.height() > 4:
@@ -5181,6 +5511,7 @@ class EnhancedRegionSelector(QWidget):
                     self._inline_selecting = False
                     self._inline_start = None
                     self._inline_end = None
+                    self._inline_dragging = False
                     self._do_capture_global_rect(global_rect)
                     return
             # Selection too small — cancel and restore toolbar
@@ -5188,6 +5519,7 @@ class EnhancedRegionSelector(QWidget):
             self._inline_selecting = False
             self._inline_start = None
             self._inline_end = None
+            self._inline_dragging = False
             self._toolbar.show()
             self.activateWindow()
             self.setFocus()
@@ -5640,6 +5972,10 @@ class EnhancedRegionSelector(QWidget):
 
     def closeEvent(self, e):
         self._stop_esc_listener()
+        try:
+            self._cache_timer.stop()
+        except Exception:
+            pass
         try:
             self.releaseKeyboard()
         except Exception:
@@ -11354,6 +11690,20 @@ class MainWindow(QMainWindow):
         rm_hint.setWordWrap(True)
         rm_hint.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
         crl.addWidget(rm_hint)
+
+        self._detect_windows_cb = QCheckBox(
+            "Automatically detect windows / UI elements while selecting  (click to capture instantly)")
+        self._detect_windows_cb.setChecked(self.config.get("detect_windows_on_capture", True))
+        crl.addWidget(self._detect_windows_cb)
+        detect_hint = QLabel(
+            "When enabled, moving the mouse in \"Capture region\" outlines the window or "
+            "control under the cursor with a dashed rectangle — click it to capture that area "
+            "instantly. Holding the left button and dragging still uses the normal manual "
+            "rectangle selection, exactly as before.")
+        detect_hint.setWordWrap(True)
+        detect_hint.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
+        crl.addWidget(detect_hint)
+
         lay.addWidget(crg)
 
         # Selected monitor
@@ -11750,6 +12100,7 @@ class MainWindow(QMainWindow):
         self.config.data["selected_monitor"] = self._mcb.currentData() or 0
         self.config.data["region_capture_method"] = (
             "standard" if self._region_method_grp.checkedId() == 1 else "ffmpeg")
+        self.config.data["detect_windows_on_capture"] = self._detect_windows_cb.isChecked()
         
         # Safely determine the active OCR engine using QButtonGroup ID
         engine_id = self._ocr_grp.checkedId()
@@ -12764,13 +13115,43 @@ def _set_windows_dpi_awareness():
             pass
 
 
+def _dump_screen_layout():
+    """Diagnostyka: wypisuje układ monitorów widziany przez Qt i przez mss.
+    Jeśli wykrywanie okien znów się rozjedzie, wklej ten wydruk z konsoli."""
+    try:
+        print("[screens] Qt:")
+        for s in QApplication.screens():
+            g = s.geometry()
+            print(f"   {s.name():<14} geo=({g.x()},{g.y()} {g.width()}x{g.height()})"
+                  f" dpr={s.devicePixelRatio():.3f}"
+                  f"{'  <primary>' if s is QApplication.primaryScreen() else ''}")
+        with mss.MSS() as sct:
+            print("[screens] mss (fizyczne px):")
+            for m in sct.monitors[1:]:
+                print(f"   ({m['left']},{m['top']} {m['width']}x{m['height']})")
+    except Exception as e:
+        print(f"[screens] dump failed: {e}")
+
+
 def main():
     _set_windows_dpi_awareness()
+
+    if IS_WINDOWS and os.environ.get("PYSHAREX_HIGHDPI") != "1":
+        # Mieszane DPI + jedno okno-overlay rozpięte na kilku monitorach:
+        # Qt liczy pozycje dzieci (pasek narzędzi, ramki okien) w logicznych
+        # pikselach, a Windows nakłada je na okno skalą JEDNEGO monitoru.
+        # Błąd rośnie z odległością od (0,0) - stąd "dobrze tylko na
+        # środkowym". Wyłączamy skalowanie Qt: współrzędne Qt == fizyczne px
+        # == współrzędne Win32/mss, więc cała konwersja staje się tożsamością.
+        # (PYSHAREX_HIGHDPI=1 przywraca stare zachowanie.)
+        os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
+        os.environ.pop("QT_SCALE_FACTOR", None)
 
     if IS_LINUX:
         os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
     app = QApplication(sys.argv)
+    _dump_screen_layout()
     app.setApplicationName("PyshareX")
     app.setQuitOnLastWindowClosed(False)
     # Set taskbar icon as early as possible
