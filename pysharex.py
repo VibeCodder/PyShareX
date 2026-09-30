@@ -416,46 +416,67 @@ def _is_wayland_session() -> bool:
     # XDG_SESSION_TYPE bywa puste (np. w niektórych DM-ach) - dodatkowy fallback:
     return bool(os.environ.get("WAYLAND_DISPLAY"))
 
+_X11_WARNED = set()
+
+def _x11_warn(key, msg):
+    """Wypisz powód, dla którego nie ma detekcji okien, tylko raz."""
+    if key not in _X11_WARNED:
+        _X11_WARNED.add(key)
+        print(f"[PyshareX] wykrywanie okien (X11): {msg}")
+
+
 def _get_x11_window_rects():
     """
-    Enumerate visible top-level window rects on an X11 session (Xorg), via
-    EWMH _NET_CLIENT_LIST — this is what lets "Capture region" outline real
-    windows (not just whole screens) on Linux Mint / Cinnamon, MATE, XFCE,
-    KDE Plasma (X11) and any other EWMH-compliant window manager.
+    Widoczne okna najwyższego poziomu na sesji X11 (Xorg), przez EWMH.
+    Działa na Linux Mint / Cinnamon, MATE, XFCE, KDE Plasma (X11) i każdym
+    menedżerze okien zgodnym z EWMH.
 
-    Returns a list of (left, top, right, bottom) in root-window pixels
-    (the same coordinate space as QApplication.screens() geometry on X11,
-    since X11 has no separate physical/logical DPI layer the way Windows
-    does). Returns an empty list — never raises — if this isn't an X11
-    session, python-xlib isn't installed, or the window manager doesn't
-    support EWMH; callers should fall back to the per-screen rects used
-    before this feature existed.
+    Zwraca listę (left, top, right, bottom) w pikselach roota, w kolejności
+    z-order: NAJWYŻSZE okno pierwsze (z _NET_CLIENT_LIST_STACKING; jeśli WM
+    go nie ma - z _NET_CLIENT_LIST, bez gwarancji kolejności). Nigdy nie
+    rzuca wyjątku; przy braku X11 / python-xlib / EWMH zwraca [] i (raz)
+    wypisuje w konsoli powód.
     """
-    if not IS_LINUX or _is_wayland_session():
-        # Wayland deliberately hides other applications' window positions
-        # from clients for security — there is no equivalent API to fall
-        # back to, so per-screen detection is used instead (see _refresh_win_rects).
+    if not IS_LINUX:
+        return []
+    if _is_wayland_session():
+        _x11_warn("wayland",
+                  "sesja Wayland - aplikacje nie widzą pozycji cudzych okien. "
+                  "Zaloguj się do sesji X11 (Cinnamon domyślnie jest na X11).")
         return []
     try:
         from Xlib import display, X
         from Xlib.error import XError
     except ImportError:
+        _x11_warn("xlib", "brak python-xlib -> zainstaluj: pip install python-xlib "
+                          "(albo: sudo apt install python3-xlib)")
         return []
 
     try:
         d    = display.Display()
         root = d.screen().root
-        net_client_list   = d.intern_atom('_NET_CLIENT_LIST')
-        net_wm_state       = d.intern_atom('_NET_WM_STATE')
-        net_wm_state_hidden = d.intern_atom('_NET_WM_STATE_HIDDEN')
-        net_frame_extents  = d.intern_atom('_NET_FRAME_EXTENTS')
+        atom = d.intern_atom
+        net_stacking        = atom('_NET_CLIENT_LIST_STACKING')
+        net_client_list     = atom('_NET_CLIENT_LIST')
+        net_wm_state        = atom('_NET_WM_STATE')
+        net_wm_state_hidden = atom('_NET_WM_STATE_HIDDEN')
+        net_frame_extents   = atom('_NET_FRAME_EXTENTS')
 
-        prop = root.get_full_property(net_client_list, X.AnyPropertyType)
-        if not prop or not prop.value:
+        ids, top_first = None, True
+        prop = root.get_full_property(net_stacking, X.AnyPropertyType)
+        if prop and prop.value is not None and len(prop.value):
+            ids = list(prop.value)[::-1]          # stacking = od dołu do góry
+        else:
+            prop = root.get_full_property(net_client_list, X.AnyPropertyType)
+            if prop and prop.value is not None and len(prop.value):
+                ids, top_first = list(prop.value), False
+        if not ids:
+            _x11_warn("ewmh", "menedżer okien nie udostępnia _NET_CLIENT_LIST "
+                              "(brak EWMH) - wykrywanie okien niemożliwe.")
             return []
 
         rects = []
-        for wid in prop.value:
+        for wid in ids:
             try:
                 win = d.create_resource_object('window', wid)
 
@@ -467,18 +488,20 @@ def _get_x11_window_rects():
                 if state_prop and net_wm_state_hidden in (state_prop.value or []):
                     continue  # minimized (some WMs use _NET_WM_STATE_HIDDEN instead)
 
-                geom   = win.get_geometry()
-                origin = win.translate_coords(root, 0, 0)
+                geom = win.get_geometry()
+                # Pozycja lewego-górnego rogu okna w układzie ROOTA.
+                # UWAGA: translate_coords(src_window, x, y) tłumaczy punkt z
+                # src_window NA układ obiektu, na którym jest wywołane - więc
+                # wołamy je na root, a nie na oknie (odwrotnie dawało -x, -y).
+                origin = root.translate_coords(win, 0, 0)
                 x, y   = origin.x, origin.y
                 w, h   = geom.width, geom.height
 
-                # Client geometry excludes the window manager's decorations
-                # (title bar / borders). Expand by _NET_FRAME_EXTENTS, when
-                # the WM provides it, so the whole visible window is captured
-                # — matching the DWM extended-frame handling used on Windows.
+                # Client geometry excludes the WM decorations (title bar /
+                # borders); expand by _NET_FRAME_EXTENTS when provided.
                 extents = win.get_full_property(net_frame_extents, X.AnyPropertyType)
-                if extents and extents.value and len(extents.value) >= 4:
-                    left, right, top, bottom = extents.value[:4]
+                if extents and extents.value is not None and len(extents.value) >= 4:
+                    left, right, top, bottom = list(extents.value)[:4]
                     x -= left
                     y -= top
                     w += left + right
@@ -489,8 +512,15 @@ def _get_x11_window_rects():
                 rects.append((x, y, x + w, y + h))
             except XError:
                 continue
+        d.close()
+        if not top_first:
+            _x11_warn("stacking", "brak _NET_CLIENT_LIST_STACKING - kolejność "
+                                  "okien (z-order) może być niedokładna.")
+        if not rects:
+            _x11_warn("empty", "lista okien jest pusta.")
         return rects
-    except Exception:
+    except Exception as e:
+        _x11_warn("exc", f"błąd przy odczycie okien: {e!r}")
         return []
 
 
@@ -4314,7 +4344,11 @@ class EnhancedRegionSelector(QWidget):
         elif IS_LINUX:
             x11_rects = _get_x11_window_rects()
             if x11_rects:
-                rects = _physical_rects_to_local(x11_rects, self._geo)
+                for i, pr in enumerate(x11_rects):          # najwyższe okno pierwsze
+                    loc = _physical_rects_to_local([pr], self._geo)
+                    if loc:
+                        tops.append((i, loc[0]))
+                rects = [r for _, r in tops]
             else:
                 # Not an X11 session (e.g. Wayland), python-xlib missing, or
                 # no EWMH support — fall back to whole-screen rects.
@@ -4330,7 +4364,8 @@ class EnhancedRegionSelector(QWidget):
                     lg.x() - self._geo.x(), lg.y() - self._geo.y(),
                     lg.width(), lg.height()))
         self._win_rects = rects
-        self._win_tops = tops if IS_WINDOWS else []
+        self._win_tops = tops
+        self._win_has_children = IS_WINDOWS
         self._win_children = children
         self._win_child_owner = child_owner
         self._update_detection_at_cursor()
@@ -4371,7 +4406,8 @@ class EnhancedRegionSelector(QWidget):
                     break
             if top_hwnd is None:
                 return QRect()
-            if top_hwnd != getattr(self, "_win_child_owner", None):
+            if (getattr(self, "_win_has_children", False) and
+                    top_hwnd != getattr(self, "_win_child_owner", None)):
                 # dzieci policzone dla innego okna - odśwież zaraz (raz)
                 if not getattr(self, "_child_refresh_pending", False):
                     self._child_refresh_pending = True
@@ -10335,13 +10371,23 @@ class ImageEditorWindow(QMainWindow):
         self._update_undo_redo_buttons()
 
     def _build_magnet_button(self, tbar):
-        """Magnet button (toggle snapping on/off) + a dropdown checklist
-        with snap options. Snapping is enabled by default."""
-        self.btn_magnet = QPushButton("🧲")
+        """Magnet button + a checklist popup that appears on HOVER.
+
+        The popup has a master checkbox ("Magnet enabled") and one checkbox
+        per snap option. Clicking the button still toggles the magnet too;
+        the button and the master checkbox always stay in sync. Snapping is
+        enabled by default."""
+        class _HoverButton(QPushButton):
+            hovered = Signal()
+            def enterEvent(self, e):
+                self.hovered.emit()
+                super().enterEvent(e)
+
+        self.btn_magnet = _HoverButton("🧲")
         self.btn_magnet.setCheckable(True)
-        self.btn_magnet.setChecked(True)
+        self.btn_magnet.setChecked(self.canvas.snap_enabled)
         self.btn_magnet.setFixedSize(40, 40)
-        self.btn_magnet.setToolTip("Snap objects (click to toggle on/off\nand show options)")
+        self.btn_magnet.setToolTip("Snapping - hover for options, click to toggle on/off")
         self.btn_magnet.setStyleSheet("""
             QPushButton {
                 font-size: 20px;
@@ -10357,11 +10403,29 @@ class ImageEditorWindow(QMainWindow):
         """)
         tbar.addWidget(self.btn_magnet)
 
-        self.snap_menu = QMenu(self)
-        container = QWidget()
-        vbox = QVBoxLayout(container)
-        vbox.setContentsMargins(8, 6, 8, 6)
-        vbox.setSpacing(4)
+        # ── Hover popup (plain tool window: no mouse grab, so enter/leave
+        #    tracking works; closed by a cursor-position poll below) ──────────
+        self.snap_popup = QFrame(self, Qt.WindowType.Tool |
+                                       Qt.WindowType.FramelessWindowHint |
+                                       Qt.WindowType.WindowStaysOnTopHint)
+        self.snap_popup.setObjectName("snapPopup")
+        self.snap_popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.snap_popup.setStyleSheet(
+            "#snapPopup { background: palette(window); border: 1px solid palette(mid);"
+            " border-radius: 6px; }")
+        vbox = QVBoxLayout(self.snap_popup)
+        vbox.setContentsMargins(10, 8, 10, 8)
+        vbox.setSpacing(5)
+
+        self._snap_master = QCheckBox("Magnet enabled")
+        f = self._snap_master.font(); f.setBold(True); self._snap_master.setFont(f)
+        self._snap_master.setChecked(self.canvas.snap_enabled)
+        self._snap_master.toggled.connect(self._set_snap_enabled)
+        vbox.addWidget(self._snap_master)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        vbox.addWidget(sep)
 
         self._snap_checks = {}
         options = [
@@ -10373,21 +10437,71 @@ class ImageEditorWindow(QMainWindow):
         for key, label in options:
             cb = QCheckBox(label)
             cb.setChecked(self.canvas.snap_options.get(key, True))
-            cb.stateChanged.connect(
+            cb.setEnabled(self.canvas.snap_enabled)
+            cb.toggled.connect(
                 lambda state, k=key: self.canvas.snap_options.__setitem__(k, bool(state)))
             vbox.addWidget(cb)
             self._snap_checks[key] = cb
 
-        wa = QWidgetAction(self.snap_menu)
-        wa.setDefaultWidget(container)
-        self.snap_menu.addAction(wa)
+        self._snap_leave_ticks = 0
+        self._snap_poll = QTimer(self)
+        self._snap_poll.setInterval(60)
+        self._snap_poll.timeout.connect(self._snap_hover_check)
 
-        self.btn_magnet.clicked.connect(self._on_magnet_clicked)
+        self.btn_magnet.hovered.connect(self._show_snap_popup)
+        self.btn_magnet.clicked.connect(self._set_snap_enabled)
 
-    def _on_magnet_clicked(self):
-        self.canvas.snap_enabled = self.btn_magnet.isChecked()
-        pos = self.btn_magnet.mapToGlobal(QPoint(0, self.btn_magnet.height()))
-        self.snap_menu.popup(pos)
+    def _set_snap_enabled(self, on):
+        """Single place that switches the magnet; keeps button, master
+        checkbox, option checkboxes and the canvas in sync."""
+        on = bool(on)
+        self.canvas.snap_enabled = on
+        if self.btn_magnet.isChecked() != on:
+            self.btn_magnet.setChecked(on)
+        if self._snap_master.isChecked() != on:
+            self._snap_master.blockSignals(True)
+            self._snap_master.setChecked(on)
+            self._snap_master.blockSignals(False)
+        for cb in self._snap_checks.values():
+            cb.setEnabled(on)
+
+    def _show_snap_popup(self):
+        if self.snap_popup.isVisible():
+            return
+        self.snap_popup.adjustSize()
+        pos = self.btn_magnet.mapToGlobal(QPoint(0, self.btn_magnet.height() - 1))
+        scr = self.btn_magnet.screen()
+        if scr is not None:
+            sg = scr.availableGeometry()
+            pos.setX(max(sg.left(), min(pos.x(), sg.right() - self.snap_popup.width())))
+            pos.setY(min(pos.y(), sg.bottom() - self.snap_popup.height()))
+        self.snap_popup.move(pos)
+        self.snap_popup.show()
+        self.snap_popup.raise_()
+        self._snap_leave_ticks = 0
+        self._snap_poll.start()
+
+    def _snap_hover_check(self):
+        """Hide the popup once the cursor has left both the button and the
+        popup (small grace area + 2 ticks, so crossing the gap doesn't close it)."""
+        if not self.snap_popup.isVisible():
+            self._snap_poll.stop()
+            return
+        cur = QCursor.pos()
+        btn_rect = QRect(self.btn_magnet.mapToGlobal(QPoint(0, 0)), self.btn_magnet.size())
+        # Sprawdzamy OSOBNO przycisk i okienko (+ 2 px luzu). Wcześniejsze
+        # united() tworzyło prostokąt obejmujący oba naraz, więc obszar obok
+        # przycisku (reszta paska narzędzi nad okienkiem) też liczył się jako
+        # "wewnątrz" i okienko nie znikało.
+        inside = (btn_rect.adjusted(-2, -2, 2, 2).contains(cur) or
+                  self.snap_popup.geometry().adjusted(-2, -2, 2, 2).contains(cur))
+        if inside:
+            self._snap_leave_ticks = 0
+            return
+        self._snap_leave_ticks += 1
+        if self._snap_leave_ticks >= 2:      # ~120 ms zwłoki
+            self.snap_popup.hide()
+            self._snap_poll.stop()
 
     def select_tool(self, name):
         self.canvas.current_tool = name
