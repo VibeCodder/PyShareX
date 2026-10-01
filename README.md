@@ -95,6 +95,22 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 
 
 ## Capture Region with toolbar
+It works in 2 modes:
+
+1) Hover over window/element, choose specific one and click to capture.
+
+<img width="1920" height="1080" alt="window detection 2026-10-01 20-47-15 mkv_snapshot_00 03 448" src="https://github.com/user-attachments/assets/cdc93b5e-ed06-4c51-b6d2-c37bdb3c1e8b" />
+
+<br><br><br>
+
+2) Hold LMB -> drag and release to capture custom screen region.  
+
+<img width="1920" height="1080" alt="custom region selection 2026-10-01 20-47-15 mkv_snapshot_00 08 288" src="https://github.com/user-attachments/assets/0cafb541-5376-49bd-b9a0-d02b9c4e48e6" />
+
+<br><br>
+
+You can also use tools from toolbar to attach various annotation object to the screen.
+
 <img width="1280" height="720" alt="598446750-475be521-9dc0-446d-bc05-se7a1324f1fea" src="https://github.com/user-attachments/assets/1d575a4e-c38d-4e11-b9ad-3d2128578a82" />
 
 
