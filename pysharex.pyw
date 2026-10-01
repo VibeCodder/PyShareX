@@ -5267,7 +5267,7 @@ class EnhancedRegionSelector(QWidget):
             p.drawRect(dr)
             p.setPen(QColor(255, 255, 255))
             p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
-            label = f"{dr.width()} × {dr.height()} px — click to capture"
+            label = f"{dr.width()} × {dr.height()} px — click to capture or hold LMB -> drag and release for a custom region capture"
             ty = dr.y() - 6 if dr.y() > 20 else dr.bottom() + 14
             p.drawText(dr.x() + 4, ty, label)
 
