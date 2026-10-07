@@ -99,13 +99,15 @@ It works in 2 modes:
 
 1) Hover over window/element, choose specific one and click to capture.
 
-<img width="1920" height="1080" alt="window detection 2026-10-01 20-47-15 mkv_snapshot_00 03 448" src="https://github.com/user-attachments/assets/cdc93b5e-ed06-4c51-b6d2-c37bdb3c1e8b" />
+<img width="1920" height="1080" alt="window detection 2026-10-01 20-47-15 mkv_snapshot_00 03 448" src="https://github.com/user-attachments/assets/f1b9382d-8697-4792-8046-94ad808151a2" />
+
 
 <br><br><br>
 
 2) Hold LMB -> drag and release to capture custom screen region.  
 
-<img width="1920" height="1080" alt="custom region selection 2026-10-01 20-47-15 mkv_snapshot_00 08 288" src="https://github.com/user-attachments/assets/0cafb541-5376-49bd-b9a0-d02b9c4e48e6" />
+<img width="1920" height="1080" alt="custom region selection 2026-10-01 20-47-15 mkv_snapshot_00 08 288" src="https://github.com/user-attachments/assets/f6f708c0-69e3-43f2-b261-b9cbcbee5076" />
+
 
 <br><br>
 
