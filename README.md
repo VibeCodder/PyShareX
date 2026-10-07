@@ -111,7 +111,8 @@ It works in 2 modes:
 
 You can also use tools from toolbar to attach various annotation objects to the screen.
 
-<img width="1280" height="720" alt="598446750-475be521-9dc0-446d-bc05-se7a1324f1fea" src="https://github.com/user-attachments/assets/1d575a4e-c38d-4e11-b9ad-3d2128578a82" />
+<img width="1280" height="720" alt="598446750-475be521-9dc0-446d-bc05-se7a1324f1fea" src="https://github.com/user-attachments/assets/216a50a5-2d98-497d-8b79-68f3506e34c1" />
+
 
 
 
@@ -125,7 +126,8 @@ You can also use tools from toolbar to attach various annotation objects to the 
 
 ## Image Editor
 
-<img width="1920" height="1020" alt="598416325-90835aa5-9a6e-4afc-a80f-4a0167fce0d3" src="https://github.com/user-attachments/assets/6dc0bd8e-73a1-4758-8f9a-0cd21f7c6bb0" />
+<img width="1920" height="1020" alt="598416325-90835aa5-9a6e-4afc-a80f-4a0167fce0d3" src="https://github.com/user-attachments/assets/53c7763b-896a-4096-ace9-cc9d85bd2aed" />
+
 
 
 
