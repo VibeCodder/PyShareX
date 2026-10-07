@@ -2293,7 +2293,14 @@ class _OverlayCanvas(QGraphicsView):
                 if B: return item, 'B'
         return None, None
 
-    def handle_resize(self, item, handle, scene_pos: QPointF, proportional=False):
+    def translate_item(self, item, delta: QPointF):
+        """Move *item* by *delta* (scene units) — used by the Shift-to-move
+        modifier while a handle is being dragged."""
+        item.setPos(item.pos() + delta)
+        item.update()
+
+    def handle_resize(self, item, handle, scene_pos: QPointF, proportional=False,
+                      from_center=False):
         """Resize/rotate item — full unified logic."""
         # Width handle — drag vertically to change pen width
         if handle == 'WIDTH' and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
@@ -2363,6 +2370,8 @@ class _OverlayCanvas(QGraphicsView):
             elif 'B' in handle: fixed_local.setY(old_rect.top())
             else: fixed_local.setY(old_rect.center().y())
             
+            if from_center:
+                fixed_local = old_rect.center()
             old_scene_fixed = item.mapToScene(fixed_local)
 
             left, top, right, bottom = old_rect.left(), old_rect.top(), old_rect.right(), old_rect.bottom()
@@ -2381,6 +2390,15 @@ class _OverlayCanvas(QGraphicsView):
                 if 'T' in handle: top = bottom - side
                 else: bottom = top + side
                 new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+
+            if from_center:
+                # Alt: grow/shrink symmetrically around the rect's center
+                c = old_rect.center()
+                hw = abs(local_pos.x() - c.x()) if ('L' in handle or 'R' in handle) else old_rect.width() / 2
+                hh = abs(local_pos.y() - c.y()) if ('T' in handle or 'B' in handle) else old_rect.height() / 2
+                if proportional:
+                    hw = hh = max(hw, hh)
+                new_rect = QRectF(c.x() - hw, c.y() - hh, hw * 2, hh * 2)
 
             item.prepareGeometryChange()
             item.setRect(new_rect)
@@ -3095,23 +3113,38 @@ class ArrowItem(QGraphicsLineItem):
     def mouseMoveEvent(self, event):
         handle = getattr(self, 'active_handle', None)
         if handle in ('p1', 'p2'):
+            # Shift held: move the whole arrow (as if dragging it with the mouse)
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                d = event.scenePos() - event.lastScenePos()
+                self.setPos(self.pos() + d)
+                event.accept()
+                return
             self.prepareGeometryChange()
             line = self.line()
             new_pos = event.pos()
 
             # 45-degree angle snapping constraint
+            alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+            mid = QPointF((line.p1().x() + line.p2().x()) / 2,
+                          (line.p1().y() + line.p2().y()) / 2)
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                anchor = line.p2() if handle == 'p1' else line.p1()
+                # Alt: the midpoint is the anchor (line is resized from its center)
+                anchor = mid if alt else (line.p2() if handle == 'p1' else line.p1())
                 dx, dy = new_pos.x() - anchor.x(), new_pos.y() - anchor.y()
                 snapped_angle = round(math.degrees(math.atan2(dy, dx)) / 45) * 45
                 d = math.hypot(dx, dy)
                 new_pos = QPointF(anchor.x() + d * math.cos(math.radians(snapped_angle)),
                                   anchor.y() + d * math.sin(math.radians(snapped_angle)))
 
+            mirrored = QPointF(2 * mid.x() - new_pos.x(), 2 * mid.y() - new_pos.y())
             if handle == 'p1':
                 line.setP1(new_pos)
+                if alt:
+                    line.setP2(mirrored)
             else:
                 line.setP2(new_pos)
+                if alt:
+                    line.setP1(mirrored)
 
             self.setLine(line)
             event.accept()
@@ -4586,12 +4619,12 @@ class EnhancedRegionSelector(QWidget):
 
         tools = [
             (self.TOOL_SELECT,    None,  "Select / move / resize annotations (Del to delete)"),
-            (self.TOOL_RECT,      None,  "Draw rectangle annotation"),
-            (self.TOOL_CIRCLE,    "⭕",  "Draw ellipse annotation"),
-            (self.TOOL_HIGHLIGHT, "🟨",  "Draw highlight (semi-transparent yellow rectangle)"),
+            (self.TOOL_RECT,      None,  "Draw rectangle annotation (Ctrl = square, Alt = from center, Shift = move)"),
+            (self.TOOL_CIRCLE,    "⭕",  "Draw ellipse annotation (Ctrl = circle, Alt = from center, Shift = move)"),
+            (self.TOOL_HIGHLIGHT, "🟨",  "Draw highlight (semi-transparent yellow rectangle) (Ctrl = square, Alt = from center, Shift = move)"),
             (self.TOOL_FREEHAND,  "✏️",  "Freehand drawing"),
-            (self.TOOL_LINE,      "📏",  "Draw straight line"),
-            (self.TOOL_ARROW,     None,  "Draw arrow"),
+            (self.TOOL_LINE,      "📏",  "Draw straight line (Ctrl = snap 45°, Alt = from center, Shift = move)"),
+            (self.TOOL_ARROW,     None,  "Draw arrow (Ctrl = snap 45°, Alt = from center, Shift = move)"),
             (self.TOOL_BUBBLE,    "💬",  "Add text bubble"),
             (self.TOOL_MARKER,    "📍",  "Add numbered marker"),
             (self.TOOL_TEXT,      "T",   "Add text annotation"),
@@ -4609,6 +4642,12 @@ class EnhancedRegionSelector(QWidget):
                 btn.setIconSize(QSize(28, 28))
             elif tid == self.TOOL_RECT:
                 btn.setIcon(_svg_icon(_SVG_RECT_TOOL, 32))
+                btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_CIRCLE:
+                btn.setIcon(_svg_icon(_SVG_CIRCLE_TOOL, 32))
+                btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_LINE:
+                btn.setIcon(_svg_icon(_SVG_LINE_TOOL, 32))
                 btn.setIconSize(QSize(28, 28))
             elif tid == self.TOOL_ARROW:
                 btn.setIcon(_svg_icon(_SVG_ARROW_TOOL, 32))
@@ -5335,6 +5374,7 @@ class EnhancedRegionSelector(QWidget):
                 self._canvas.push_undo()
                 self._resizing_item = item
                 self._resize_handle = handle
+                self._last_move_scene = scene_pos
                 # Send a synthetic press at the item's position so the scene
                 # registers it as the current mouse grabber — this ensures the
                 # paired synthetic release in mouseReleaseEvent will correctly
@@ -5355,6 +5395,7 @@ class EnhancedRegionSelector(QWidget):
         # ── Drawing tools ─────────────────────────────────────────────────────
         scene_pos = self._canvas.mapToScene(self._canvas.mapFrom(self, lpos))
         self._draw_start_scene = scene_pos
+        self._last_move_scene = scene_pos
         self._preview_item = None
         self._canvas.push_undo()
 
@@ -5432,8 +5473,16 @@ class EnhancedRegionSelector(QWidget):
 
             # Handle Active Resizing
             if getattr(self, '_resizing_item', None) and getattr(self, '_resize_handle', None):
+                # Shift held: move the item instead of resizing/rotating it
+                last = getattr(self, '_last_move_scene', None)
+                self._last_move_scene = scene_pos
+                if (e.modifiers() & Qt.KeyboardModifier.ShiftModifier) and last is not None:
+                    self._canvas.translate_item(self._resizing_item, scene_pos - last)
+                    return
                 proportional = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
-                self._canvas.handle_resize(self._resizing_item, self._resize_handle, scene_pos, proportional)
+                self._canvas.handle_resize(self._resizing_item, self._resize_handle, scene_pos,
+                                           proportional,
+                                           bool(e.modifiers() & Qt.KeyboardModifier.AltModifier))
                 return
 
             # Handle Cursor Hover Updates for Handles
@@ -5462,6 +5511,11 @@ class EnhancedRegionSelector(QWidget):
         elif self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_LINE, self.TOOL_HIGHLIGHT, self.TOOL_ARROW):
             if self._draw_start_scene is None:
                 return
+            # Shift held: drag the whole shape (start point follows the mouse)
+            last = getattr(self, '_last_move_scene', None)
+            self._last_move_scene = scene_pos
+            if (e.modifiers() & Qt.KeyboardModifier.ShiftModifier) and last is not None:
+                self._draw_start_scene = self._draw_start_scene + (scene_pos - last)
             end_scene = scene_pos
             # Ctrl held: constrain rect/circle to equal width and height (perfect square/circle)
             if (self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE) and
@@ -5473,6 +5527,12 @@ class EnhancedRegionSelector(QWidget):
                     self._draw_start_scene.x() + math.copysign(side, dx),
                     self._draw_start_scene.y() + math.copysign(side, dy))
             r = QRectF(self._draw_start_scene, end_scene).normalized()
+            # Alt held: the start point is the CENTER of the shape (works with Ctrl too)
+            if (self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_HIGHLIGHT) and
+                    e.modifiers() & Qt.KeyboardModifier.AltModifier):
+                c = self._draw_start_scene
+                r = QRectF(c.x() - r.width(), c.y() - r.height(),
+                           r.width() * 2, r.height() * 2)
             if self._preview_item is not None:
                 self._canvas._scene.removeItem(self._preview_item)
                 self._preview_item = None
@@ -5486,8 +5546,7 @@ class EnhancedRegionSelector(QWidget):
                     r, self._draw_color, self._draw_width)
             elif self._current_tool == self.TOOL_LINE:
                 end_pos = scene_pos
-                if e.modifiers() & (Qt.KeyboardModifier.ShiftModifier |
-                                    Qt.KeyboardModifier.ControlModifier):
+                if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
                     dx = end_pos.x() - self._draw_start_scene.x()
                     dy = end_pos.y() - self._draw_start_scene.y()
                     angle = math.atan2(dy, dx)
@@ -5497,12 +5556,11 @@ class EnhancedRegionSelector(QWidget):
                         self._draw_start_scene.x() + dist * math.cos(math.radians(snapped)),
                         self._draw_start_scene.y() + dist * math.sin(math.radians(snapped)))
                 self._preview_item = self._canvas.add_line(
-                    QLineF(self._draw_start_scene, end_pos),
+                    QLineF(self._alt_line_start(end_pos, e), end_pos),
                     self._draw_color, self._draw_width)
             elif self._current_tool == self.TOOL_ARROW:
                 end_pos = scene_pos
-                if e.modifiers() & (Qt.KeyboardModifier.ShiftModifier |
-                                    Qt.KeyboardModifier.ControlModifier):
+                if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
                     dx = end_pos.x() - self._draw_start_scene.x()
                     dy = end_pos.y() - self._draw_start_scene.y()
                     angle = math.atan2(dy, dx)
@@ -5512,8 +5570,16 @@ class EnhancedRegionSelector(QWidget):
                         self._draw_start_scene.x() + dist * math.cos(math.radians(snapped)),
                         self._draw_start_scene.y() + dist * math.sin(math.radians(snapped)))
                 self._preview_item = self._canvas.add_arrow(
-                    QLineF(self._draw_start_scene, end_pos),
+                    QLineF(self._alt_line_start(end_pos, e), end_pos),
                     self._draw_color, self._draw_width, self._arrow_head_style)
+
+    def _alt_line_start(self, end_pos, e):
+        """Line/arrow start point: the press point, or (Alt held) its mirror
+        across the press point so the press point becomes the line's center."""
+        s = self._draw_start_scene
+        if e.modifiers() & Qt.KeyboardModifier.AltModifier:
+            return QPointF(2 * s.x() - end_pos.x(), 2 * s.y() - end_pos.y())
+        return s
 
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
@@ -8456,23 +8522,38 @@ class LineItem(QGraphicsLineItem):
 
     def mouseMoveEvent(self, event):
         if getattr(self, 'active_handle', None) in ('p1', 'p2'):
+            # Shift held: move the whole line (as if dragging it with the mouse)
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                d = event.scenePos() - event.lastScenePos()
+                self.setPos(self.pos() + d)
+                event.accept()
+                return
             self.prepareGeometryChange()
             line = self.line()
             new_pos = event.pos()
 
             # 45-degree angle snapping constraint
+            alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+            mid = QPointF((line.p1().x() + line.p2().x()) / 2,
+                          (line.p1().y() + line.p2().y()) / 2)
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                anchor = line.p2() if self.active_handle == 'p1' else line.p1()
+                # Alt: the midpoint is the anchor (line is resized from its center)
+                anchor = mid if alt else (line.p2() if self.active_handle == 'p1' else line.p1())
                 dx, dy = new_pos.x() - anchor.x(), new_pos.y() - anchor.y()
                 snapped_angle = round(math.degrees(math.atan2(dy, dx)) / 45) * 45
                 d = math.hypot(dx, dy)
                 new_pos = QPointF(anchor.x() + d * math.cos(math.radians(snapped_angle)),
                                   anchor.y() + d * math.sin(math.radians(snapped_angle)))
 
+            mirrored = QPointF(2 * mid.x() - new_pos.x(), 2 * mid.y() - new_pos.y())
             if self.active_handle == 'p1':
                 line.setP1(new_pos)
+                if alt:
+                    line.setP2(mirrored)
             else:
                 line.setP2(new_pos)
+                if alt:
+                    line.setP1(mirrored)
 
             self.setLine(line)
             event.accept()
@@ -9239,9 +9320,28 @@ class EditorCanvas(QGraphicsView):
         item.setSelected(True)
         self.is_dirty = True
 
+    def _alt_line_start(self, end_pos, event):
+        """Line/arrow start point: the press point, or (Alt held) its mirror
+        across the press point so the press point becomes the line's center."""
+        s = self.start_point
+        if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+            return QPointF(2 * s.x() - end_pos.x(), 2 * s.y() - end_pos.y())
+        return s
+
+    def _translate_item(self, item, delta: QPointF):
+        """Move *item* by *delta* (scene units) — Shift-to-move modifier."""
+        if isinstance(item, CropOverlayItem):
+            # Crop frame is defined purely by its rect (pos stays at 0,0)
+            item.prepareGeometryChange()
+            item.setRect(item.rect().translated(delta))
+        else:
+            item.setPos(item.pos() + delta)
+        item.update()
+
     def mousePressEvent(self, event):
         self.setFocus() # Ensure canvas has focus for keyboard events
         scene_pos = self.mapToScene(event.position().toPoint())
+        self._last_move_scene = scene_pos
 
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -9360,7 +9460,14 @@ class EditorCanvas(QGraphicsView):
             self.update_cursor_by_handle(handle)
 
         if self.resizing_item and (event.buttons() & Qt.MouseButton.LeftButton):
-            self.handle_resize_logic(scene_pos, event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            # Shift held: move the item/crop frame instead of resizing/rotating it
+            last = getattr(self, '_last_move_scene', None)
+            self._last_move_scene = scene_pos
+            if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) and last is not None:
+                self._translate_item(self.resizing_item, scene_pos - last)
+            else:
+                self.handle_resize_logic(scene_pos, event.modifiers() & Qt.KeyboardModifier.ControlModifier,
+                                         bool(event.modifiers() & Qt.KeyboardModifier.AltModifier))
             self.is_dirty = True
             return
 
@@ -9376,6 +9483,14 @@ class EditorCanvas(QGraphicsView):
                 self._apply_move_snap()
             return
 
+        # Shift held: drag the whole shape (start point follows the mouse)
+        last = getattr(self, '_last_move_scene', None)
+        self._last_move_scene = scene_pos
+        if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier and last is not None
+                and self.start_point is not None
+                and self.current_tool in ("Rectangle", "Circle", "Highlight", "Line", "Arrow")):
+            self.start_point = self.start_point + (scene_pos - last)
+
         # Regular Drawing
         rect = QRectF(self.start_point, scene_pos).normalized()
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -9384,6 +9499,13 @@ class EditorCanvas(QGraphicsView):
             rect = QRectF(self.start_point.x(), self.start_point.y(), 
                           side if scene_pos.x() > self.start_point.x() else -side,
                           side if scene_pos.y() > self.start_point.y() else -side).normalized()
+
+        # Alt held: the start point is the CENTER of the shape (works with Ctrl too)
+        if (event.modifiers() & Qt.KeyboardModifier.AltModifier
+                and self.current_tool in ("Rectangle", "Circle", "Highlight")):
+            c = self.start_point
+            rect = QRectF(c.x() - rect.width(), c.y() - rect.height(),
+                          rect.width() * 2, rect.height() * 2)
 
         if self.current_tool in ["Rectangle", "Circle"]: self.current_item.setRect(rect)
         elif self.current_tool == "Highlight":
@@ -9399,7 +9521,7 @@ class EditorCanvas(QGraphicsView):
                 end_pos = QPointF(
                     self.start_point.x() + dist * math.cos(math.radians(snapped_angle)),
                     self.start_point.y() + dist * math.sin(math.radians(snapped_angle)))
-            self.current_item.setLine(QLineF(self.start_point, end_pos))
+            self.current_item.setLine(QLineF(self._alt_line_start(end_pos, event), end_pos))
         elif self.current_tool == "Freehand":
             if self.current_item and getattr(self, '_freehand_path', None) is not None:
                 new_pos = scene_pos
@@ -9419,7 +9541,7 @@ class EditorCanvas(QGraphicsView):
                     end_pos = QPointF(
                         self.start_point.x() + dist * math.cos(math.radians(snapped_angle)),
                         self.start_point.y() + dist * math.sin(math.radians(snapped_angle)))
-                self.current_item.setLine(QLineF(self.start_point, end_pos))
+                self.current_item.setLine(QLineF(self._alt_line_start(end_pos, event), end_pos))
 
     def mouseReleaseEvent(self, event):
         self._rubber_band_active = False
@@ -9811,7 +9933,7 @@ class EditorCanvas(QGraphicsView):
         elif handle in ['L', 'R']: self.setCursor(Qt.CursorShape.SizeHorCursor)
         elif handle in ['T', 'B']: self.setCursor(Qt.CursorShape.SizeVerCursor)
 
-    def handle_resize_logic(self, pos, proportional):
+    def handle_resize_logic(self, pos, proportional, from_center=False):
         import math
         item = self.resizing_item
 
@@ -9882,6 +10004,8 @@ class EditorCanvas(QGraphicsView):
         elif 'B' in self.resize_handle: fixed_local.setY(old_rect.top())
         else: fixed_local.setY(old_rect.center().y())
         
+        if from_center:
+            fixed_local = old_rect.center()
         old_scene_fixed = item.mapToScene(fixed_local)
 
         # Obliczamy nowe wymiary (rect)
@@ -9903,7 +10027,16 @@ class EditorCanvas(QGraphicsView):
             else: bottom = top + side
             
             new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
-            
+
+        if from_center:
+            # Alt: grow/shrink symmetrically around the rect's center
+            c = old_rect.center()
+            hw = abs(local_pos.x() - c.x()) if ('L' in self.resize_handle or 'R' in self.resize_handle) else old_rect.width() / 2
+            hh = abs(local_pos.y() - c.y()) if ('T' in self.resize_handle or 'B' in self.resize_handle) else old_rect.height() / 2
+            if proportional:
+                hw = hh = max(hw, hh)
+            new_rect = QRectF(c.x() - hw, c.y() - hh, hw * 2, hh * 2)
+
         # Usunięto ograniczenie intersected(), aby pozwolić na przeciąganie 
         # narzędzia Crop poza krawędzie w celu powiększenia płótna
         # if isinstance(item, CropOverlayItem):
@@ -10236,11 +10369,19 @@ class ImageEditorWindow(QMainWindow):
             elif n == "Rectangle":
                 b.setIcon(_svg_icon(_SVG_RECT_TOOL, 32))
                 b.setIconSize(QSize(32, 32))
-                b.setToolTip("Rectangle")
+                b.setToolTip("Rectangle (Ctrl = square, Alt = from center, Shift = move)")
+            elif n == "Circle":
+                b.setIcon(_svg_icon(_SVG_CIRCLE_TOOL, 32))
+                b.setIconSize(QSize(32, 32))
+                b.setToolTip("Circle (Ctrl = circle, Alt = from center, Shift = move)")
+            elif n == "Line":
+                b.setIcon(_svg_icon(_SVG_LINE_TOOL, 32))
+                b.setIconSize(QSize(32, 32))
+                b.setToolTip("Line (Ctrl = snap 45°, Alt = from center, Shift = move)")
             elif n == "Arrow":
                 b.setIcon(_svg_icon(_SVG_ARROW_TOOL, 32))
                 b.setIconSize(QSize(32, 32))
-                b.setToolTip("Arrow")
+                b.setToolTip("Arrow (Ctrl = snap 45°, Alt = from center, Shift = move)")
             elif n == "Eraser":
                 b.setIcon(_svg_icon(_SVG_ERASER, 32))
                 b.setIconSize(QSize(32, 32))
@@ -13084,6 +13225,19 @@ _SVG_SELECT = """<svg width="77.068" height="77.068" version="1.1" viewBox="0 0 
 # than a rectangle-drawing tool.
 _SVG_RECT_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
  <rect x="2.6" y="2.6" width="18.8" height="18.8" stroke="#ea3323" stroke-width="2.6"/>
+</svg>"""
+
+# SVG source for the Circle (ellipse) annotation tool — a red unfilled ring,
+# same colour and stroke weight as _SVG_RECT_TOOL, replacing the "⭕" emoji.
+_SVG_CIRCLE_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+ <circle cx="12" cy="12" r="9.4" stroke="#ea3323" stroke-width="2.6"/>
+</svg>"""
+
+# SVG source for the straight Line annotation tool — a red diagonal line
+# (bottom-left to top-right), same colour and stroke weight as the other
+# red shape icons, replacing the "📏" emoji.
+_SVG_LINE_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+ <line x1="3.5" y1="20.5" x2="20.5" y2="3.5" stroke="#ea3323" stroke-width="2.6" stroke-linecap="round"/>
 </svg>"""
 
 # SVG source for the Arrow annotation tool — a solid white arrow glyph
