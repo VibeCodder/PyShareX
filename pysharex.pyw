@@ -2108,9 +2108,10 @@ class _OverlayCanvas(QGraphicsView):
     # ------------------------------------------------------------------
     # Item factories (called by EnhancedRegionSelector)
     # ------------------------------------------------------------------
-    def add_rect(self, rect: QRectF, color: QColor, width: int):
+    def add_rect(self, rect: QRectF, color: QColor, width: int, radius: float = 0.0):
         item = ResizableRectItem()
         item.setRect(rect)
+        item.corner_radius = float(radius)
         self._apply_props(item, color, width)
         item.setAcceptHoverEvents(True)
         self._scene.addItem(item)
@@ -2261,6 +2262,12 @@ class _OverlayCanvas(QGraphicsView):
                     return item, 'TL'  # reuse TL to trigger uniform scale
                 continue
 
+            # Corner-radius handle (purple dot, top-left corner) — Rectangle only
+            if isinstance(item, ResizableRectItem):
+                rp = item._radius_handle_pos()
+                if math.hypot(local_pos.x() - rp.x(), local_pos.y() - rp.y()) <= 10:
+                    return item, 'RADIUS'
+
             # Rotation handle — above top edge (all rect/ellipse/pixmap/freehand items)
             rot_pt = QPointF(rect.center().x(), rect.top() - 30)
             if (abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
@@ -2302,6 +2309,22 @@ class _OverlayCanvas(QGraphicsView):
     def handle_resize(self, item, handle, scene_pos: QPointF, proportional=False,
                       from_center=False):
         """Resize/rotate item — full unified logic."""
+        # Corner-radius handle — drag right = rounder, left = sharper
+        if handle == 'RADIUS' and isinstance(item, ResizableRectItem):
+            local_pos = item.mapFromScene(scene_pos)
+            r = item.rect()
+            if item._radius_drag_off is None:
+                item._radius_drag_off = local_pos.x() - (r.left() + item._effective_radius())
+            new_r = max(0.0, min(local_pos.x() - item._radius_drag_off - r.left(),
+                                 item._max_radius()))
+            item.prepareGeometryChange()
+            item.corner_radius = new_r
+            item.update()
+            owner = self.parent()
+            if hasattr(owner, '_rect_radius'):
+                owner._rect_radius = new_r   # new rectangles inherit the last value
+            return
+
         # Width handle — drag vertically to change pen width
         if handle == 'WIDTH' and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
             local_pos = item.mapFromScene(scene_pos)
@@ -2384,12 +2407,16 @@ class _OverlayCanvas(QGraphicsView):
             new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
             
             if proportional:
-                side = max(new_rect.width(), new_rect.height())
-                if 'L' in handle: left = right - side
-                else: right = left + side
-                if 'T' in handle: top = bottom - side
-                else: bottom = top + side
-                new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+                ratio = _pixmap_item_ratio(item)
+                if ratio:
+                    new_rect = _aspect_locked_rect(new_rect, handle, ratio)
+                else:
+                    side = max(new_rect.width(), new_rect.height())
+                    if 'L' in handle: left = right - side
+                    else: right = left + side
+                    if 'T' in handle: top = bottom - side
+                    else: bottom = top + side
+                    new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
 
             if from_center:
                 # Alt: grow/shrink symmetrically around the rect's center
@@ -2397,7 +2424,18 @@ class _OverlayCanvas(QGraphicsView):
                 hw = abs(local_pos.x() - c.x()) if ('L' in handle or 'R' in handle) else old_rect.width() / 2
                 hh = abs(local_pos.y() - c.y()) if ('T' in handle or 'B' in handle) else old_rect.height() / 2
                 if proportional:
-                    hw = hh = max(hw, hh)
+                    ratio = _pixmap_item_ratio(item)
+                    if ratio:
+                        h_ax = 'L' in handle or 'R' in handle
+                        v_ax = 'T' in handle or 'B' in handle
+                        if h_ax and v_ax:
+                            hw = max(hw, hh * ratio)
+                        elif v_ax:
+                            hw = hh * ratio
+                        hw = max(hw, 0.5)
+                        hh = hw / ratio
+                    else:
+                        hw = hh = max(hw, hh)
                 new_rect = QRectF(c.x() - hw, c.y() - hh, hw * 2, hh * 2)
 
             item.prepareGeometryChange()
@@ -2435,6 +2473,8 @@ class _OverlayCanvas(QGraphicsView):
             dup.setRect(QRectF(item.rect()))
             dup.setPen(QPen(item.pen()))
             dup.setBrush(QBrush(item.brush()))
+            if isinstance(item, ResizableRectItem):
+                dup.corner_radius = float(getattr(item, 'corner_radius', 0.0))
             dup.setRotation(item.rotation())
             dup.setTransformOriginPoint(item.transformOriginPoint())
             dup.setFlags(item.flags())
@@ -4135,6 +4175,7 @@ class EnhancedRegionSelector(QWidget):
     TOOL_TEXT      = "text"
     TOOL_IMAGE     = "image"
     TOOL_COLOR     = "color"
+    TOOL_CLIP      = "clip"     # cut a rectangle out of the screen -> image item
 
     def __init__(self):
         super().__init__()
@@ -4163,6 +4204,9 @@ class EnhancedRegionSelector(QWidget):
         self._dragging          = False
         self._draw_color        = QColor(255, 0, 0)
         self._draw_width        = 3
+        self._rect_radius       = 0.0       # Rectangle tool corner rounding (px)
+        self._clip_start        = None      # Screen-clip tool drag (global Qt coords)
+        self._clip_end          = None
         self._hide_bg           = False
         # Arrow tool: default arrowhead style ('single' / 'double' / 'none')
         self._arrow_head_style  = ArrowItem.HEAD_SINGLE
@@ -4629,6 +4673,7 @@ class EnhancedRegionSelector(QWidget):
             (self.TOOL_MARKER,    "📍",  "Add numbered marker"),
             (self.TOOL_TEXT,      "T",   "Add text annotation"),
             (self.TOOL_IMAGE,     "🖼️",  "Import image onto canvas"),
+            (self.TOOL_CLIP,      None,  "Cut a rectangular piece of the screen and place it on the canvas as an image"),
             (self.TOOL_COLOR,     None,  "Change annotation color / width"),
         ]
         self._tool_btns = {}
@@ -4652,9 +4697,13 @@ class EnhancedRegionSelector(QWidget):
             elif tid == self.TOOL_ARROW:
                 btn.setIcon(_svg_icon(_SVG_ARROW_TOOL, 32))
                 btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_CLIP:
+                btn.setIcon(_svg_icon(_SVG_SCREEN_CLIP, 32))
+                btn.setIconSize(QSize(28, 28))
             elif tid == self.TOOL_COLOR:
                 btn.setObjectName("colorPickerBtn")
-                btn.setText("🎨🔧")
+                btn.setIcon(_svg_icon(_SVG_COLOR_TOOLS, 104, 48))
+                btn.setIconSize(QSize(46, 22))
             else:
                 btn.setText(icon)
             lay.addWidget(btn)
@@ -4737,7 +4786,7 @@ class EnhancedRegionSelector(QWidget):
         return t in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_FREEHAND,
                      self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
                      self.TOOL_BUBBLE, self.TOOL_MARKER, self.TOOL_TEXT,
-                     self.TOOL_IMAGE, self.TOOL_SELECT)
+                     self.TOOL_IMAGE, self.TOOL_CLIP, self.TOOL_SELECT)
 
     def _select_tool(self, tool_id):
         if tool_id == self.TOOL_IMAGE:
@@ -4828,6 +4877,7 @@ class EnhancedRegionSelector(QWidget):
 
         # Reset drawing state when switching tools to avoid stale start position
         self._draw_start_scene = None
+        self._clip_start = self._clip_end = None
         # Clear any stale resize state (e.g. after handle drag on Line/Arrow)
         self._resizing_item  = None
         self._resize_handle  = None
@@ -4863,7 +4913,7 @@ class EnhancedRegionSelector(QWidget):
 
         cross = (self.TOOL_DETECT, self.TOOL_RECT, self.TOOL_CIRCLE,
                  self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
-                 self.TOOL_FREEHAND)
+                 self.TOOL_FREEHAND, self.TOOL_CLIP)
         cur = Qt.CursorShape.CrossCursor if tool_id in cross else Qt.CursorShape.ArrowCursor
         self.setCursor(QCursor(cur))
         self._toolbar.adjustSize()
@@ -4915,7 +4965,7 @@ class EnhancedRegionSelector(QWidget):
                     btn.setChecked(tid == prev_tool)
             cross = (self.TOOL_DETECT, self.TOOL_RECT, self.TOOL_CIRCLE,
                      self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
-                     self.TOOL_FREEHAND)
+                     self.TOOL_FREEHAND, self.TOOL_CLIP)
             cur = Qt.CursorShape.CrossCursor if prev_tool in cross else Qt.CursorShape.ArrowCursor
             self.setCursor(QCursor(cur))
         else:
@@ -4942,6 +4992,9 @@ class EnhancedRegionSelector(QWidget):
             if not handled:
                 # Fallback: plain colour picker applied to selected item
                 self._open_generic_color_picker(apply_to_item=item)
+        elif self._current_tool == self.TOOL_RECT:
+            # No selection, Rectangle tool: width + colour + corner rounding defaults
+            self._open_rect_defaults_dialog()
         else:
             # No selection — just pick the drawing colour
             self._open_generic_color_picker(apply_to_item=None)
@@ -5034,6 +5087,16 @@ class EnhancedRegionSelector(QWidget):
                     self.spin.blockSignals(False)
             return True
 
+        if isinstance(item, ResizableRectItem):
+            dlg = RectEditDialog(item.pen().width(), item.pen().color(),
+                                 item.corner_radius, self, target_item=item)
+            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                new_width, new_color, new_radius = dlg.result_data()
+                dlg.restore_original()          # undo snapshot = state before the edit
+                self._canvas.push_undo()
+                self._apply_rect_settings(item, new_width, new_color, new_radius)
+            return True
+
         return False  # no dedicated dialog for this type
 
     def _open_generic_color_picker(self, apply_to_item=None):
@@ -5082,6 +5145,128 @@ class EnhancedRegionSelector(QWidget):
                     if hasattr(apply_to_item, 'setDefaultTextColor'):
                         apply_to_item.setDefaultTextColor(c)
                     apply_to_item.update()
+
+    # ── Rectangle settings (width / colour / corner rounding) ─────────────────
+    def _apply_rect_settings(self, item, width, color, radius):
+        """Apply RectEditDialog results to `item` (may be None = only defaults)
+        and remember them as the Rectangle tool's defaults."""
+        color = QColor(color)
+        if item is not None:
+            pen = item.pen()
+            pen.setWidth(int(width))
+            pen.setColor(color)
+            item.setPen(pen)
+            b = item.brush()
+            if b.style() != Qt.BrushStyle.NoBrush and b.color().alpha() > 0:
+                item.setBrush(QBrush(color))
+            item.corner_radius = float(radius)
+            item.prepareGeometryChange()
+            item.update()
+        self._draw_width = int(width)
+        self._draw_color = QColor(color)
+        self._rect_radius = float(radius)
+        self._color_preview.setStyleSheet(
+            f"background:rgba({color.red()},{color.green()},{color.blue()},{color.alphaF():.2f}); "
+            f"border:1px solid white; border-radius:3px;")
+        if hasattr(self, 'spin'):
+            self.spin.blockSignals(True)
+            self.spin.setValue(int(width))
+            self.spin.blockSignals(False)
+
+    def _open_rect_defaults_dialog(self):
+        dlg = RectEditDialog(self._draw_width, self._draw_color, self._rect_radius, self)
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            w, c, r = dlg.result_data()
+            self._apply_rect_settings(None, w, c, r)
+
+    def _edit_rect(self, item):
+        self._open_item_edit_dialog(item)
+
+    # ── Screen clip tool: cut a piece of the real screen onto the canvas ──────
+    def _logical_rect_to_physical(self, global_rect: QRect):
+        """Logical global Qt rect -> physical (mss) desktop rect (x, y, w, h).
+        Each corner is converted with the DPI scale of the monitor that owns
+        it (same mapping as _grab_composite_and_close)."""
+        start_screen = (QApplication.screenAt(global_rect.topLeft())
+                        or QApplication.screenAt(global_rect.center())
+                        or QApplication.primaryScreen())
+        end_screen = QApplication.screenAt(global_rect.bottomRight()) or start_screen
+        x, y = global_rect.x(), global_rect.y()
+        w, h = max(1, global_rect.width()), max(1, global_rect.height())
+        try:
+            with mss.MSS() as sct:
+                qt_screens = sorted(QApplication.screens(),
+                                    key=lambda s: (s.geometry().x(), s.geometry().y()))
+                mss_mons = sorted(sct.monitors[1:],
+                                  key=lambda m: (m["left"], m["top"]))
+
+                def _mon_for(scr):
+                    if scr in qt_screens:
+                        idx = qt_screens.index(scr)
+                        if idx < len(mss_mons):
+                            return mss_mons[idx]
+                    return {"left": 0, "top": 0}
+
+                def _to_phys(px, py, scr):
+                    r = scr.devicePixelRatio() or 1.0
+                    geo = scr.geometry()
+                    mon = _mon_for(scr)
+                    return (mon["left"] + round((px - geo.x()) * r),
+                            mon["top"] + round((py - geo.y()) * r))
+
+                x, y = _to_phys(global_rect.x(), global_rect.y(), start_screen)
+                ex, ey = _to_phys(global_rect.x() + global_rect.width(),
+                                  global_rect.y() + global_rect.height(), end_screen)
+                w, h = max(1, ex - x), max(1, ey - y)
+        except Exception as ex:
+            print(f"[PyshareX] clip coord mapping error: {ex}")
+        return x, y, w, h
+
+    def _clip_screen_region(self, global_rect: QRect):
+        """Hide the overlay (dim layer, toolbar and annotations), grab the
+        selected piece of the real screen, bring the overlay back and insert
+        the grab as a normal image item (ResizablePixmapItem)."""
+        phys = self._logical_rect_to_physical(global_rect)
+        self.releaseKeyboard()
+        self.hide()
+        QApplication.processEvents()
+        # Give the compositor a moment to actually remove the overlay
+        QTimer.singleShot(200, lambda: self._finish_clip(global_rect, phys))
+
+    def _finish_clip(self, global_rect: QRect, phys):
+        px, py, pw, ph = phys
+        pix = None
+        try:
+            with mss.MSS() as sct:
+                shot = sct.grab({"left": px, "top": py, "width": pw, "height": ph})
+                img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+            qim = QImage(img.tobytes(), img.width, img.height, img.width * 3,
+                         QImage.Format.Format_RGB888).copy()
+            pix = QPixmap.fromImage(qim)
+        except Exception as ex:
+            print(f"[PyshareX] screen clip error: {ex}")
+
+        # Restore the overlay first, whatever happened
+        self.show()
+        self.raise_()
+        self._canvas.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        self.grabKeyboard()
+        self._toolbar.show()
+
+        if pix is not None and not pix.isNull():
+            # Item is sized in logical units (so it covers exactly the area it
+            # was cut from) while keeping the full physical-resolution pixels.
+            pos = QPointF(self.mapFromGlobal(global_rect.topLeft()))
+            self._canvas.push_undo()
+            item = self._canvas.add_pixmap(pos, pix)
+            item.setRect(QRectF(0, 0, global_rect.width(), global_rect.height()))
+            self._select_tool(self.TOOL_SELECT)
+            self._canvas._scene.clearSelection()
+            item.setSelected(True)
+        else:
+            self._select_tool(self.TOOL_SELECT)
 
     def _import_image(self):
         self._toolbar.hide()
@@ -5326,6 +5511,24 @@ class EnhancedRegionSelector(QWidget):
             p.drawText(r.x() + 4, r.y() - 6 if r.y() > 20 else r.bottom() + 14,
                        f"{r.width()} × {r.height()} px")
 
+        # ── Screen-clip tool: dashed selection rectangle ───────────────────────
+        if (self._current_tool == self.TOOL_CLIP and
+                self._clip_start is not None and self._clip_end is not None):
+            r = QRect(self.mapFromGlobal(self._clip_start),
+                      self.mapFromGlobal(self._clip_end)).normalized()
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            p.fillRect(r, QColor(0, 0, 0, 1))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            pen = QPen(QColor(0, 200, 255), 2, Qt.PenStyle.DashLine)
+            pen.setDashPattern([6, 4])
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(r)
+            p.setPen(QColor(255, 255, 255))
+            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+            p.drawText(r.x() + 4, r.y() - 6 if r.y() > 20 else r.bottom() + 14,
+                       f"{r.width()} × {r.height()} px — release to cut")
+
         if self._dragging and self._drag_start and self._drag_end:
             r = QRect(self._drag_start, self._drag_end).normalized()
             p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
@@ -5390,6 +5593,13 @@ class EnhancedRegionSelector(QWidget):
             if clicked_item is not None:
                 self._canvas.push_undo()
             self._canvas.send_mouse_to_scene(e)
+            return
+
+        # ── Screen-clip tool: start dragging the cut rectangle ─────────────────
+        if self._current_tool == self.TOOL_CLIP:
+            self._clip_start = gpos
+            self._clip_end = gpos
+            self.update()
             return
 
         # ── Drawing tools ─────────────────────────────────────────────────────
@@ -5490,6 +5700,7 @@ class EnhancedRegionSelector(QWidget):
             if handle:
                 if handle == 'ROTATE': self.setCursor(Qt.CursorShape.PointingHandCursor)
                 elif handle == 'WIDTH': self.setCursor(Qt.CursorShape.SizeVerCursor)
+                elif handle == 'RADIUS': self.setCursor(Qt.CursorShape.SizeHorCursor)
                 elif handle in ['TL', 'BR']: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
                 elif handle in ['TR', 'BL']: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
                 elif handle in ['L', 'R']: self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -5498,6 +5709,13 @@ class EnhancedRegionSelector(QWidget):
                 self.setCursor(Qt.CursorShape.ArrowCursor)
 
             self._canvas.send_mouse_to_scene(e)
+            return
+
+        # ── Screen-clip tool: grow the cut rectangle ───────────────────────────
+        if self._current_tool == self.TOOL_CLIP:
+            if (e.buttons() & Qt.MouseButton.LeftButton) and self._clip_start is not None:
+                self._clip_end = gpos
+                self.update()
             return
 
         # ── Drawing tools (LMB held) ──────────────────────────────────────────
@@ -5538,7 +5756,7 @@ class EnhancedRegionSelector(QWidget):
                 self._preview_item = None
             if self._current_tool == self.TOOL_RECT:
                 self._preview_item = self._canvas.add_rect(
-                    r, self._draw_color, self._draw_width)
+                    r, self._draw_color, self._draw_width, self._rect_radius)
             elif self._current_tool == self.TOOL_HIGHLIGHT:
                 self._preview_item = self._canvas.add_highlight(r)
             elif self._current_tool == self.TOOL_CIRCLE:
@@ -5588,6 +5806,8 @@ class EnhancedRegionSelector(QWidget):
         for item in self._canvas._scene.selectedItems():
             if hasattr(item, '_width_drag_active'):
                 item._width_drag_active = False
+            if hasattr(item, '_radius_drag_off'):
+                item._radius_drag_off = None
         lpos = e.position().toPoint()
 
         # ── Inline capture-selection mode — finalize rect ─────────────────────
@@ -5653,6 +5873,16 @@ class EnhancedRegionSelector(QWidget):
             self._canvas.send_mouse_to_scene(e)
             return
 
+        # ── Screen-clip tool: cut the piece out and drop it on the canvas ──────
+        if self._current_tool == self.TOOL_CLIP:
+            if self._clip_start is not None and self._clip_end is not None:
+                r = QRect(self._clip_start, self._clip_end).normalized()
+                self._clip_start = self._clip_end = None
+                self.update()
+                if r.width() > 4 and r.height() > 4:
+                    self._clip_screen_region(r)
+            return
+
         # ── Draw tools — finalise ─────────────────────────────────────────────
         if self._current_tool == self.TOOL_FREEHAND:
             self._canvas.end_freehand()
@@ -5685,6 +5915,9 @@ class EnhancedRegionSelector(QWidget):
 
             elif isinstance(item, ArrowItem):
                 self._edit_arrow(item)
+
+            elif isinstance(item, ResizableRectItem):
+                self._edit_rect(item)
 
     def _edit_arrow(self, item):
         """Open ArrowEditDialog for a selected ArrowItem — live-previews
@@ -6008,6 +6241,8 @@ class EnhancedRegionSelector(QWidget):
             dup.setRect(QRectF(item.rect()))
             dup.setPen(QPen(item.pen()))
             dup.setBrush(QBrush(item.brush()))
+            if isinstance(item, ResizableRectItem):
+                dup.corner_radius = float(getattr(item, 'corner_radius', 0.0))
             dup.setRotation(item.rotation())
             dup.setTransformOriginPoint(item.transformOriginPoint())
             dup.setFlags(item.flags())
@@ -8295,6 +8530,132 @@ class FreehandEditDialog(QDialog):
         return self.spin_width.value(), QColor(self._color)
 
 
+class RectEditDialog(QDialog):
+    """Settings dialog for the Rectangle tool / rectangle items:
+    line width, colour and corner rounding.
+
+    If `target_item` is given, changes are previewed live on that item and
+    restored on Cancel. On OK the caller should call `restore_original()`
+    (so the undo snapshot is taken from the untouched state), push undo, and
+    then apply `result_data()` itself."""
+    def __init__(self, current_width: int, current_color: QColor,
+                 current_radius: float, parent=None, target_item=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Rectangle settings")
+        self._color = QColor(current_color)
+        self._target = target_item
+        if target_item is not None:
+            self._orig_pen = QPen(target_item.pen())
+            self._orig_radius = float(getattr(target_item, 'corner_radius', 0.0))
+        lay = QVBoxLayout(self)
+
+        # Line width
+        width_row = QHBoxLayout()
+        width_row.addWidget(QLabel("Line width:"))
+        self.spin_width = QSpinBox()
+        self.spin_width.setRange(1, 200)
+        self.spin_width.setValue(max(1, int(current_width)))
+        self.spin_width.setSuffix(" px")
+        width_row.addWidget(self.spin_width)
+        lay.addLayout(width_row)
+
+        # Line color
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Line color:"))
+        self.btn_color = QPushButton()
+        self.btn_color.setFixedSize(80, 28)
+        self.btn_color.clicked.connect(self._pick_color)
+        color_row.addWidget(self.btn_color)
+        lay.addLayout(color_row)
+
+        # Corner rounding (slider + spinner kept in sync)
+        max_r = 1000
+        if target_item is not None and hasattr(target_item, '_max_radius'):
+            max_r = max(1, int(math.ceil(target_item._max_radius())))
+        rad_row = QHBoxLayout()
+        rad_row.addWidget(QLabel("Corner rounding:"))
+        self.slider_radius = QSlider(Qt.Orientation.Horizontal)
+        self.slider_radius.setRange(0, max_r)
+        self.spin_radius = QSpinBox()
+        self.spin_radius.setRange(0, max_r)
+        self.spin_radius.setSuffix(" px")
+        start_r = max(0, min(max_r, int(round(current_radius))))
+        self.slider_radius.setValue(start_r)
+        self.spin_radius.setValue(start_r)
+        self.slider_radius.setToolTip(
+            "Also adjustable by dragging the purple dot at the top-left corner "
+            "of a selected rectangle (right = rounder)")
+        rad_row.addWidget(self.slider_radius, 1)
+        rad_row.addWidget(self.spin_radius)
+        lay.addLayout(rad_row)
+
+        self.slider_radius.valueChanged.connect(self._on_slider_radius)
+        self.spin_radius.valueChanged.connect(self._on_spin_radius)
+        self.spin_width.valueChanged.connect(self._apply_preview)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._update_btn()
+
+    def _on_slider_radius(self, v):
+        self.spin_radius.blockSignals(True)
+        self.spin_radius.setValue(v)
+        self.spin_radius.blockSignals(False)
+        self._apply_preview()
+
+    def _on_spin_radius(self, v):
+        self.slider_radius.blockSignals(True)
+        self.slider_radius.setValue(v)
+        self.slider_radius.blockSignals(False)
+        self._apply_preview()
+
+    def _pick_color(self):
+        c = _show_color_dialog(self._color, self, alpha=True)
+        if c is not None and c.isValid():
+            self._color = c
+            self._update_btn()
+            self._apply_preview()
+
+    def _update_btn(self):
+        c = self._color
+        self.btn_color.setStyleSheet(
+            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"border: 1px solid #888;")
+
+    def _apply_preview(self, *_):
+        it = self._target
+        if it is None:
+            return
+        pen = it.pen()
+        pen.setWidth(self.spin_width.value())
+        pen.setColor(self._color)
+        it.setPen(pen)
+        it.corner_radius = float(self.spin_radius.value())
+        it.prepareGeometryChange()
+        it.update()
+
+    def restore_original(self):
+        it = self._target
+        if it is None:
+            return
+        it.setPen(QPen(self._orig_pen))
+        it.corner_radius = self._orig_radius
+        it.prepareGeometryChange()
+        it.update()
+
+    def reject(self):
+        self.restore_original()
+        super().reject()
+
+    def result_data(self):
+        """(line width, colour, corner radius in px)"""
+        return (self.spin_width.value(), QColor(self._color),
+                float(self.spin_radius.value()))
+
+
 class FreehandItem(QGraphicsPathItem):
     def __init__(self, path, canvas=None):
         super().__init__(path)
@@ -8664,18 +9025,42 @@ class ResizableRectItem(QGraphicsRectItem):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._dragging_width = False
+        # Corner rounding in item units (px). Painting clamps it to half of
+        # the shorter side, so it can never produce a malformed shape.
+        self.corner_radius = 0.0
+        self._radius_drag_off = None   # grab offset while the green handle is dragged
 
     def boundingRect(self):
-        return super().boundingRect().adjusted(-5, -50, 5, 20)
+        return super().boundingRect().adjusted(-8, -50, 5, 20)
 
     def _width_handle_pos(self) -> QPointF:
         r = self.rect()
         return QPointF(r.center().x(), r.bottom() + 12)
 
+    def _max_radius(self) -> float:
+        r = self.rect()
+        return max(0.0, min(r.width(), r.height()) / 2.0)
+
+    def _effective_radius(self) -> float:
+        return max(0.0, min(float(self.corner_radius), self._max_radius()))
+
+    def _radius_handle_pos(self) -> QPointF:
+        """Purple corner-radius handle: sits just above the top-left corner
+        and slides right along the top edge as the rounding grows."""
+        r = self.rect()
+        return QPointF(r.left() + self._effective_radius(), r.top() - 18)
+
     def paint(self, painter, option, widget=None):
         from PySide6.QtWidgets import QStyle
         option.state &= ~QStyle.StateFlag.State_Selected
-        super().paint(painter, option, widget)
+        rad = self._effective_radius()
+        if rad > 0:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(self.pen())
+            painter.setBrush(self.brush())
+            painter.drawRoundedRect(self.rect(), rad, rad)
+        else:
+            super().paint(painter, option, widget)
         if self.isSelected():
             pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
             painter.setPen(pen)
@@ -8703,6 +9088,11 @@ class ResizableRectItem(QGraphicsRectItem):
             painter.setBrush(QBrush(QColor(255, 220, 50, 230)))
             painter.setPen(QPen(QColor(60, 60, 60), 1.5))
             painter.drawEllipse(wp, 8, 8)
+            # Corner-radius handle: purple dot with black outline at the top-left corner
+            rp = self._radius_handle_pos()
+            painter.setBrush(QBrush(QColor(168, 85, 247)))
+            painter.setPen(QPen(QColor(0, 0, 0), 1.5))
+            painter.drawEllipse(rp, 6, 6)
 
 
     def mousePressEvent(self, event):
@@ -8846,6 +9236,35 @@ class ResizableEllipseItem(QGraphicsEllipseItem):
         self.setCursor(Qt.CursorShape.ArrowCursor)
         super().hoverMoveEvent(event)
 
+def _pixmap_item_ratio(item):
+    """Native width/height ratio of an image item, or None for other items."""
+    if isinstance(item, ResizablePixmapItem):
+        pm = item.pixmap
+        if pm.height() > 0 and pm.width() > 0:
+            return pm.width() / pm.height()
+    return None
+
+
+def _aspect_locked_rect(new_rect: QRectF, handle: str, ratio: float) -> QRectF:
+    """Ctrl-resize for images: keep the image's own proportions.
+    Corner handles follow the dominant drag direction; edge handles follow the
+    dragged axis and grow/shrink symmetrically on the other one."""
+    has_h = 'L' in handle or 'R' in handle
+    has_v = 'T' in handle or 'B' in handle
+    if has_h and has_v:
+        w = max(new_rect.width(), new_rect.height() * ratio)
+    elif has_v:
+        w = new_rect.height() * ratio
+    else:
+        w = new_rect.width()
+    w = max(w, 1.0)
+    h = w / ratio
+    c = new_rect.center()
+    left = new_rect.right() - w if 'L' in handle else (new_rect.left() if 'R' in handle else c.x() - w / 2)
+    top = new_rect.bottom() - h if 'T' in handle else (new_rect.top() if 'B' in handle else c.y() - h / 2)
+    return QRectF(left, top, w, h)
+
+
 class ResizablePixmapItem(QGraphicsRectItem):
     """
     Niestandardowy element obrazka oparty na Rectangle, by zapewnić
@@ -8963,6 +9382,7 @@ class EditorCanvas(QGraphicsView):
         self.stroke_color = QColor(255, 0, 0, 255)
         self.fill_color = QColor(255, 0, 0, 0)
         self.stroke_width = 5
+        self.rect_radius = 0.0      # Rectangle tool corner rounding (px)
         self.font_size = 40
         self.is_filled = False
         self.text_highlight_color = QColor(255, 255, 0, 255)
@@ -9049,6 +9469,8 @@ class EditorCanvas(QGraphicsView):
             dup.setRect(QRectF(item.rect()))
             dup.setPen(QPen(item.pen()))
             dup.setBrush(QBrush(item.brush()))
+            if isinstance(item, ResizableRectItem):
+                dup.corner_radius = float(getattr(item, 'corner_radius', 0.0))
             dup.setRotation(item.rotation())
             dup.setTransformOriginPoint(item.transformOriginPoint())
             dup.setFlags(item.flags())
@@ -9391,6 +9813,7 @@ class EditorCanvas(QGraphicsView):
         self.push_undo()
         if self.current_tool == "Rectangle": 
             self.current_item = ResizableRectItem()
+            self.current_item.corner_radius = float(self.rect_radius)
         elif self.current_tool == "Circle": 
             self.current_item = ResizableEllipseItem()
         elif self.current_tool == "Line":
@@ -9551,9 +9974,11 @@ class EditorCanvas(QGraphicsView):
             self.update_cursor_by_handle(None)
             self._pan_start = None
             return
-        # Reset WIDTH drag state on release
+        # Reset WIDTH / RADIUS drag state on release
         if self.resizing_item and hasattr(self.resizing_item, '_width_drag_active'):
             self.resizing_item._width_drag_active = False
+        if self.resizing_item and hasattr(self.resizing_item, '_radius_drag_off'):
+            self.resizing_item._radius_drag_off = None
         
         if self.current_tool == "Text" and self.start_point:
             _pos = QPointF(self.start_point)
@@ -9898,6 +10323,13 @@ class EditorCanvas(QGraphicsView):
                 rect = item.rect()
                 m = 10 / self.transform().m11() # Scale-aware margin
 
+                # Corner-radius handle (purple dot, top-left corner) — Rectangle only
+                if isinstance(item, ResizableRectItem):
+                    rp = item._radius_handle_pos()
+                    r_hit = 12 / self.transform().m11()
+                    if math.hypot(local_pos.x() - rp.x(), local_pos.y() - rp.y()) <= r_hit:
+                        return item, 'RADIUS'
+
                 # Width handle (yellow dot below bottom edge) for Rect and Ellipse — check FIRST
                 if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
                     wp = item._width_handle_pos()
@@ -9928,6 +10360,7 @@ class EditorCanvas(QGraphicsView):
         if not handle: self.setCursor(Qt.CursorShape.ArrowCursor)
         elif handle == 'ROTATE': self.setCursor(Qt.CursorShape.PointingHandCursor)
         elif handle == 'WIDTH': self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif handle == 'RADIUS': self.setCursor(Qt.CursorShape.SizeHorCursor)
         elif handle in ['TL', 'BR']: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
         elif handle in ['TR', 'BL']: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
         elif handle in ['L', 'R']: self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -9964,6 +10397,21 @@ class EditorCanvas(QGraphicsView):
             item._scale = dist / item.RADIUS
             item.update()
             self.scene.update()
+            return
+
+        # --- 0. Corner-radius handle (purple dot): right = rounder, left = sharper ---
+        if self.resize_handle == 'RADIUS' and isinstance(item, ResizableRectItem):
+            local_pos = item.mapFromScene(pos)
+            r = item.rect()
+            if item._radius_drag_off is None:
+                item._radius_drag_off = local_pos.x() - (r.left() + item._effective_radius())
+            new_r = max(0.0, min(local_pos.x() - item._radius_drag_off - r.left(),
+                                 item._max_radius()))
+            item.prepareGeometryChange()
+            item.corner_radius = new_r
+            item.update()
+            self.rect_radius = new_r    # new rectangles inherit the last value
+            self.is_dirty = True
             return
 
         # --- 1. OBSŁUGA OBROTU ---
@@ -10019,14 +10467,19 @@ class EditorCanvas(QGraphicsView):
         new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
         
         if proportional:
-            side = max(new_rect.width(), new_rect.height())
-            if 'L' in self.resize_handle: left = right - side
-            else: right = left + side
-            
-            if 'T' in self.resize_handle: top = bottom - side
-            else: bottom = top + side
-            
-            new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+            ratio = _pixmap_item_ratio(item)
+            if ratio:
+                # Images: Ctrl keeps the image's own proportions (not a square)
+                new_rect = _aspect_locked_rect(new_rect, self.resize_handle, ratio)
+            else:
+                side = max(new_rect.width(), new_rect.height())
+                if 'L' in self.resize_handle: left = right - side
+                else: right = left + side
+                
+                if 'T' in self.resize_handle: top = bottom - side
+                else: bottom = top + side
+                
+                new_rect = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
 
         if from_center:
             # Alt: grow/shrink symmetrically around the rect's center
@@ -10034,7 +10487,18 @@ class EditorCanvas(QGraphicsView):
             hw = abs(local_pos.x() - c.x()) if ('L' in self.resize_handle or 'R' in self.resize_handle) else old_rect.width() / 2
             hh = abs(local_pos.y() - c.y()) if ('T' in self.resize_handle or 'B' in self.resize_handle) else old_rect.height() / 2
             if proportional:
-                hw = hh = max(hw, hh)
+                ratio = _pixmap_item_ratio(item)
+                if ratio:
+                    h_ax = 'L' in self.resize_handle or 'R' in self.resize_handle
+                    v_ax = 'T' in self.resize_handle or 'B' in self.resize_handle
+                    if h_ax and v_ax:
+                        hw = max(hw, hh * ratio)
+                    elif v_ax:
+                        hw = hh * ratio
+                    hw = max(hw, 0.5)
+                    hh = hw / ratio
+                else:
+                    hw = hh = max(hw, hh)
             new_rect = QRectF(c.x() - hw, c.y() - hh, hw * 2, hh * 2)
 
         # Usunięto ograniczenie intersected(), aby pozwolić na przeciąganie 
@@ -10880,6 +11344,9 @@ class ImageEditorWindow(QMainWindow):
                     self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
                     self.canvas.is_dirty = True
                 return
+            if isinstance(item, ResizableRectItem):
+                self._edit_rect_item(item)
+                return
             if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
                 self._edit_text_item(item)
                 return
@@ -10891,6 +11358,11 @@ class ImageEditorWindow(QMainWindow):
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self.canvas.highlight_tool_color = dlg.result_color()
                 self.canvas.is_dirty = True
+            return
+
+        # Rectangle tool active, nothing selected — edit width / colour / rounding defaults
+        if not selected and self.canvas.current_tool == "Rectangle":
+            self._edit_rect_defaults()
             return
 
         # No arrow selected but the Arrow tool is active — edit its defaults
@@ -10958,6 +11430,53 @@ class ImageEditorWindow(QMainWindow):
                         item.setBrush(QBrush(c))
                     item.update()
                     self.canvas.is_dirty = True
+
+    # ── Rectangle settings (width / colour / corner rounding) ─────────────────
+    def _apply_rect_settings(self, item, width, color, radius):
+        """Apply RectEditDialog results to `item` (None = only the tool defaults)."""
+        color = QColor(color)
+        cv = self.canvas
+        if item is not None:
+            pen = item.pen()
+            pen.setWidth(int(width))
+            pen.setColor(color)
+            item.setPen(pen)
+            b = item.brush()
+            if b.style() != Qt.BrushStyle.NoBrush and b.color().alpha() > 0:
+                item.setBrush(QBrush(color))
+            item.corner_radius = float(radius)
+            item.prepareGeometryChange()
+            item.update()
+        cv.stroke_width = int(width)
+        cv.stroke_color = QColor(color)
+        cv.rect_radius = float(radius)
+        if cv.is_filled:
+            cv.fill_color = QColor(color)
+        for w in (self.spin, self.spin_stroke):
+            w.blockSignals(True)
+            w.setValue(int(width))
+            w.blockSignals(False)
+        rgba = f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alphaF()})"
+        self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
+        cv.is_dirty = True
+
+    def _edit_rect_item(self, item):
+        dlg = RectEditDialog(item.pen().width(), item.pen().color(),
+                             item.corner_radius, self, target_item=item)
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            w, c, r = dlg.result_data()
+            dlg.restore_original()          # undo snapshot = state before the edit
+            self.canvas.push_undo()
+            self._apply_rect_settings(item, w, c, r)
+
+    def _edit_rect_defaults(self):
+        cv = self.canvas
+        dlg = RectEditDialog(cv.stroke_width, cv.stroke_color, cv.rect_radius, self)
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            w, c, r = dlg.result_data()
+            self._apply_rect_settings(None, w, c, r)
 
     def update_live_props(self):
         self.canvas.stroke_width = self.spin_stroke.value()
@@ -13169,10 +13688,11 @@ def _script_dir() -> Path:
     return Path(__file__).parent
 
 
-def _svg_icon(svg_str: str, size: int = 32) -> QIcon:
-    """Render an SVG string to a QIcon of the given pixel size."""
+def _svg_icon(svg_str: str, size: int = 32, height: int | None = None) -> QIcon:
+    """Render an SVG string to a QIcon of the given pixel size.
+    `height` defaults to `size` (square icon); pass it for wide icons."""
     renderer = QSvgRenderer(svg_str.encode())
-    pm = QPixmap(size, size)
+    pm = QPixmap(size, height or size)
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
     renderer.render(painter)
@@ -13334,6 +13854,32 @@ _SVG_ERASER = """<svg width="32" height="32" viewBox="0 0 24 24" xmlns="http://w
        style="display:inline;fill:url(#linearGradient5);stroke:#1a1a1a;stroke-width:1.4"
        d="M 6.4000001,6 H 17.6 C 18.9296,6 20,7.0704 20,8.4000001 V 14.6 C 20,15.9296 18.9296,17 17.6,17 H 6.4000001 C 5.0704,17 4,15.9296 4,14.6 V 8.4000001 C 4,7.0704 5.0704,6 6.4000001,6 Z" />
   </g>
+</svg>"""
+
+
+# SVG source for the "Screen clip" tool — a monitor with a dashed selection
+# rectangle on its screen (cut a piece of the screen -> image on the canvas).
+_SVG_SCREEN_CLIP = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+ <rect x="1.8" y="3" width="20.4" height="14" rx="1.8" fill="#1e1e2e" stroke="#cdd6f4" stroke-width="1.7"/>
+ <path d="M12 17v3.6M7.6 21h8.8" stroke="#cdd6f4" stroke-width="1.7" stroke-linecap="round"/>
+ <rect x="5.6" y="6.2" width="12.8" height="7.6" stroke="#00c8ff" stroke-width="1.5" stroke-dasharray="2.4 1.8" fill="none"/>
+</svg>"""
+
+# SVG source for the "Change annotation color / width" tool — colour palette,
+# a slash, and a wrench ("Color / Settings"). Wide (52x24) icon; every shape has
+# a black outline so it reads on both the dark Capture Region toolbar and the
+# light Image Editor toolbar. Render with _svg_icon(_SVG_COLOR_TOOLS, 104, 48).
+_SVG_COLOR_TOOLS = """<svg width="52" height="24" viewBox="0 0 52 24" xmlns="http://www.w3.org/2000/svg">
+ <path d="M12 2.2C6.2 2.2 2 6.4 2 11.6c0 5.4 4.4 9.6 9.6 9.6 1.5 0 2.3-.9 2.3-2 0-.6-.3-1.1-.6-1.5-.4-.5-.6-.9-.6-1.5 0-1.1.9-2 2-2h2.6c3 0 5.2-2.2 5.2-5.1C22.5 5.5 18 2.2 12 2.2z" fill="#ffffff" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/>
+ <circle cx="6.6" cy="11" r="1.9" fill="#ea3323" stroke="#000" stroke-width="0.5"/>
+ <circle cx="9.4" cy="6.6" r="1.9" fill="#f5c518" stroke="#000" stroke-width="0.5"/>
+ <circle cx="14.6" cy="5.8" r="1.9" fill="#2ecc40" stroke="#000" stroke-width="0.5"/>
+ <circle cx="18.4" cy="9.6" r="1.9" fill="#3b82f6" stroke="#000" stroke-width="0.5"/>
+ <line x1="23.4" y1="22" x2="29" y2="2" stroke="#000" stroke-width="3.6" stroke-linecap="round"/>
+ <line x1="23.4" y1="22" x2="29" y2="2" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round"/>
+ <g transform="translate(29.5 0)">
+  <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" fill="#cfd4dc" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/>
+ </g>
 </svg>"""
 
 
