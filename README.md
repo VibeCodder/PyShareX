@@ -113,7 +113,8 @@ It works in 2 modes:
 
 You can also use tools from toolbar to attach various annotation objects to the screen.
 
-<img width="1280" height="720" alt="598446750-475be521-9dc0-446d-bc05-se7a1324f1fea" src="https://github.com/user-attachments/assets/216a50a5-2d98-497d-8b79-68f3506e34c1" />
+<img width="1920" height="1080" alt="2026-10-23 00-33-26 mkv_snapshot_09 01 667" src="https://github.com/user-attachments/assets/92e4c2d2-a569-41cf-9ba8-6b21c81b0ee1" />
+
 
 
 
