@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QSizePolicy, QStackedWidget, QColorDialog, QInputDialog,
     QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsRectItem,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsTextItem,
-    QWidgetAction
+    QWidgetAction, QTabBar
 )
 from PySide6.QtCore import (
     QPointF, Qt, QThread, Signal, QTimer, QSize, QRect, QPoint,
@@ -2108,19 +2108,27 @@ class _OverlayCanvas(QGraphicsView):
     # ------------------------------------------------------------------
     # Item factories (called by EnhancedRegionSelector)
     # ------------------------------------------------------------------
-    def add_rect(self, rect: QRectF, color: QColor, width: int, radius: float = 0.0):
+    def add_rect(self, rect: QRectF, color: QColor, width: int, radius: float = 0.0,
+                 fill_color: QColor = None):
         item = ResizableRectItem()
         item.setRect(rect)
         item.corner_radius = float(radius)
         self._apply_props(item, color, width)
+        if fill_color is not None:
+            item._fill_color = QColor(fill_color)
+            item.setBrush(QBrush(fill_color))
         item.setAcceptHoverEvents(True)
         self._scene.addItem(item)
         return item
 
-    def add_ellipse(self, rect: QRectF, color: QColor, width: int):
+    def add_ellipse(self, rect: QRectF, color: QColor, width: int,
+                    fill_color: QColor = None):
         item = ResizableEllipseItem()
         item.setRect(rect)
         self._apply_props(item, color, width)
+        if fill_color is not None:
+            item._fill_color = QColor(fill_color)
+            item.setBrush(QBrush(fill_color))
         item.setAcceptHoverEvents(True)
         self._scene.addItem(item)
         return item
@@ -2131,9 +2139,11 @@ class _OverlayCanvas(QGraphicsView):
         self._scene.addItem(item)
         return item
 
-    def add_highlight(self, rect: QRectF):
+    def add_highlight(self, rect: QRectF, color: QColor = None):
         item = HighlightRectItem()
         item.setRect(rect)
+        if color is not None:
+            item._color = QColor(color)
         item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
                       QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
                       QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -2177,25 +2187,24 @@ class _OverlayCanvas(QGraphicsView):
         self._current_freehand_item = None
         self._freehand_path = None
 
-    def add_marker(self, pos: QPointF, color: QColor):
+    def add_marker(self, pos: QPointF, color: QColor, text_color: QColor = None,
+                   scale: float = None):
         # Always number after the highest existing marker so re-selecting
         # the tool and adding more markers continues the sequence correctly.
         existing = [it for it in self._scene.items() if isinstance(it, _MarkerItem)]
         self._marker_count = max((it.number for it in existing), default=0) + 1
 
-        # Inherit scale, bg_color and text_color from the most recently placed marker.
-        # Falls back to defaults if no markers remain on the canvas.
+        # Size is inherited from the most recently placed marker (so a resized
+        # marker keeps its size for the next ones); colours always come from the
+        # Marker tool's own settings, so changing them takes effect immediately.
         last_marker = next(
             (it for it in sorted(existing, key=lambda m: m.number, reverse=True)),
             None)
-        last_scale      = last_marker._scale      if last_marker else 1.0
-        last_bg_color   = QColor(last_marker._bg_color)   if last_marker else color
-        last_text_color = QColor(last_marker._text_color) if last_marker else QColor(Qt.GlobalColor.white)
-
         item = _MarkerItem(pos, self._marker_count)
-        item._scale      = last_scale
-        item._bg_color   = last_bg_color
-        item._text_color = last_text_color
+        item._scale      = float(scale) if scale is not None else (
+            last_marker._scale if last_marker else 1.0)
+        item._bg_color   = QColor(color)
+        item._text_color = QColor(text_color) if text_color is not None else QColor(Qt.GlobalColor.white)
         self._scene.addItem(item)
         return item
 
@@ -2321,8 +2330,8 @@ class _OverlayCanvas(QGraphicsView):
             item.corner_radius = new_r
             item.update()
             owner = self.parent()
-            if hasattr(owner, '_rect_radius'):
-                owner._rect_radius = new_r   # new rectangles inherit the last value
+            if hasattr(owner, '_prefs'):
+                owner._prefs.set('rect', 'radius', new_r)   # new rectangles inherit the last value
             return
 
         # Width handle — drag vertically to change pen width
@@ -2364,6 +2373,9 @@ class _OverlayCanvas(QGraphicsView):
             item.prepareGeometryChange()
             item._scale = dist / item.RADIUS
             item.update()
+            _hp = _host_prefs(item)
+            if _hp is not None:
+                _hp.set('marker', 'scale', item._scale)
             return
 
         # --- ROTATION ---
@@ -2620,63 +2632,1264 @@ class _OverlayCanvas(QGraphicsView):
 #  NEW ANNOTATION ITEMS
 # ─────────────────────────────────────────────────────────────────────────────
 
-class HighlightEditDialog(QDialog):
-    """Dialog for editing Highlight color and opacity."""
-    def __init__(self, current_color: QColor, parent=None):
+# ═════════════════════════════════════════════════════════════════════════════
+#  Tool options — shared infrastructure
+#  ---------------------------------------------------------------------------
+#  Every annotation tool (Capture Region overlay AND Image Editor) uses the
+#  same options window:
+#     ┌────────────────────────────────┐
+#     │ tool-specific main settings    │  ← width, head style, radius, text…
+#     │ [ Colour A ][ Colour B ]       │  ← tabs, only if the object has 2+ colours
+#     │ embedded QColorDialog          │  ← ONE panel, re-pointed at the active tab
+#     │ [ OK ] [ Cancel ]              │
+#     └────────────────────────────────┘
+#  and every tool remembers its own settings in a _ToolPrefs store, so
+#  switching tools never leaks one tool's colour / width into another.
+# ═════════════════════════════════════════════════════════════════════════════
+def _swatch_icon(color: QColor, size: int = 14) -> QIcon:
+    """Tiny filled-square icon (with checkerboard under transparent colours)
+    used on the colour tabs so each tab shows its current value."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    half = size // 2
+    p.fillRect(0, 0, size, size, QColor(255, 255, 255))
+    p.fillRect(0, 0, half, half, QColor(190, 190, 190))
+    p.fillRect(half, half, size - half, size - half, QColor(190, 190, 190))
+    p.fillRect(0, 0, size, size, color)
+    p.setPen(QPen(QColor(0, 0, 0, 200), 1))
+    p.drawRect(0, 0, size - 1, size - 1)
+    p.end()
+    return QIcon(pm)
+
+
+def _swatch_css(c: QColor) -> str:
+    """Stylesheet fragment painting a colour swatch (alpha-aware)."""
+    return (f"background:rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
+            f"border:1px solid white; border-radius:3px;")
+
+
+class _ToolPrefs:
+    """Remembers the settings of every annotation tool *separately*.
+
+    Keys are tool names ('rect', 'circle', 'line', 'arrow', 'freehand',
+    'highlight', 'bubble', 'marker', 'text'). Values are plain dicts; QColor
+    values are always copied on the way in and out, so no two tools (or a
+    tool and an item on the canvas) ever share a mutable colour object.
+    """
+    def __init__(self, width: int = 3, font_size: int = 18):
+        red = QColor(255, 0, 0)
+        self._d = {
+            'rect':      {'color': QColor(red), 'width': width, 'radius': 0.0, 'fill': False,
+                          'fill_color': None},
+            'circle':    {'color': QColor(red), 'width': width, 'fill': False,
+                          'fill_color': None},
+            'line':      {'color': QColor(red), 'width': width},
+            'arrow':     {'color': QColor(red), 'width': round(width * 1.6),
+                          'head': ArrowItem.HEAD_SINGLE},
+            'freehand':  {'color': QColor(red), 'width': round(width * 1.6)},
+            'highlight': {'color': QColor(255, 255, 0, 100)},
+            'bubble':    {'fg': QColor(red), 'bg': QColor(230, 230, 230, 240)},
+            'marker':    {'bg': QColor(255, 0, 0), 'fg': QColor(255, 255, 255), 'scale': 1.0},
+            'text':      {'color': QColor(red), 'size': font_size,
+                          'hl': QColor(255, 255, 0, 255), 'hl_on': True, 'hl_pad': 0,
+                          'ol': QColor(0, 0, 0), 'ol_on': False, 'ol_w': 2},
+        }
+
+    @staticmethod
+    def _cp(v):
+        return QColor(v) if isinstance(v, QColor) else v
+
+    def get(self, tool: str, key: str):
+        return self._cp(self._d[tool][key])
+
+    def set(self, tool: str, key: str, value):
+        if tool in self._d:
+            self._d[tool][key] = self._cp(value)
+
+    def update(self, tool: str, **kw):
+        for k, v in kw.items():
+            self.set(tool, k, v)
+
+    def all(self, tool: str) -> dict:
+        return {k: self._cp(v) for k, v in self._d[tool].items()}
+
+
+def _prefs_key_for_item(item):
+    """Which tool's prefs does a canvas item belong to? (None = no tool)"""
+    if isinstance(item, ArrowItem):             return 'arrow'
+    if isinstance(item, LineItem):              return 'line'
+    if isinstance(item, FreehandItem):          return 'freehand'
+    if isinstance(item, HighlightRectItem):     return 'highlight'
+    if isinstance(item, TextBubbleItem):        return 'bubble'
+    if isinstance(item, _MarkerItem):           return 'marker'
+    if isinstance(item, ResizableEllipseItem):  return 'circle'
+    if isinstance(item, ResizableRectItem):     return 'rect'
+    if isinstance(item, QGraphicsTextItem):     return 'text'
+    return None
+
+
+def _host_prefs(item):
+    """_ToolPrefs of the window (overlay / editor) that owns *item*, or None."""
+    host = _find_options_host(item)
+    if host is None:
+        return None
+    if hasattr(host, '_prefs'):
+        return host._prefs
+    return getattr(getattr(host, 'canvas', None), 'prefs', None)
+
+
+def _find_options_host(item):
+    """Window (Capture Region overlay / Image Editor) that owns *item*'s scene
+    and knows how to edit it through the shared options window."""
+    sc = item.scene()
+    if sc is not None:
+        for view in sc.views():
+            win = view.window()
+            if win is not None and hasattr(win, '_edit_item'):
+                return win
+    return None
+
+
+class _ToolOptionsDialog(QDialog):
+    """Base window for every tool's options.
+
+    Subclass recipe::
+
+        class MyDialog(_ToolOptionsDialog):
+            def __init__(self, ..., parent=None, target_item=None):
+                super().__init__("Edit thing", parent, target_item)
+                self.main_lay.addWidget(...)          # tool-specific settings
+                self.add_color_slot('a', "Line", color, alpha=False)
+                self.add_color_slot('b', "Fill", color2, alpha=True)
+                self.finish()                         # builds tabs + colour panel + OK/Cancel
+
+    * With ONE colour slot there are no tabs; with 2+ the user gets one tab per
+      colour and the single embedded colour panel is re-pointed at the active
+      slot (values are stored per slot, so nothing is lost when switching).
+    * Live preview: override ``_apply_preview()`` (called on every change) and
+      ``_restore_original()`` (called on Cancel).
+    """
+    SHOW_OPACITY = True       # subclasses set False to drop the opacity slider
+
+    def __init__(self, title: str, parent=None, target_item=None):
         super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("Edit Highlight")
-        self.color = QColor(current_color)
-        lay = QVBoxLayout(self)
+        self.setWindowTitle(title)
+        self._target_item = target_item
+        self._positioned = False
+        self._slots = {}          # key -> {'color': QColor, 'alpha': bool, 'label': str}
+        self._order = []          # slot keys in tab order
+        self._active = None       # key of the slot the colour panel currently edits
+        self._loading = False     # True while the panel is being re-pointed (ignore its signal)
+        self._finished = False
+        self._root = QVBoxLayout(self)
+        self.main_lay = QVBoxLayout()
+        self.main_lay.setContentsMargins(0, 0, 0, 0)
+        self._root.addLayout(self.main_lay)
 
-        # Color picker button
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Background color:"))
-        self.btn_color = QPushButton()
-        self.btn_color.setFixedSize(80, 28)
-        self.btn_color.clicked.connect(self._pick_color)
-        row.addWidget(self.btn_color)
-        lay.addLayout(row)
+    # ── colour slots ─────────────────────────────────────────────────────────
+    def add_color_slot(self, key: str, label: str, color: QColor, alpha: bool = True):
+        self._slots[key] = {'color': QColor(color), 'alpha': alpha, 'label': label}
+        self._order.append(key)
 
-        # Opacity slider
-        lay.addWidget(QLabel("Opacity:"))
-        slider_row = QHBoxLayout()
+    def slot_color(self, key: str) -> QColor:
+        return QColor(self._slots[key]['color'])
+
+    def set_slot_color(self, key: str, color: QColor):
+        """Programmatically change a slot (also refreshes the panel / tab)."""
+        self._slots[key]['color'] = QColor(color)
+        if self._finished:
+            self._refresh_tab(key)
+            if key == self._active:
+                self._point_panel_at(key)
+
+    def _coerce_color(self, key: str, c: QColor) -> QColor:
+        """Panel colours are RGB only — keep the opacity the slider gave this slot."""
+        c = QColor(c)
+        c.setAlpha(self._slots[key]['color'].alpha())
+        return c
+
+    # ── build the bottom half (tabs + colour panel + buttons) ────────────────
+    def finish(self):
+        self._tabs = QTabBar()
+        self._tabs.setExpanding(False)
+        self._tabs.setDrawBase(False)            # no baseline under the tabs
+        for key in self._order:
+            self._tabs.addTab(_swatch_icon(self._slots[key]['color']),
+                              self._slots[key]['label'])
+        # A single colour needs no tab strip — just a caption.
+        if len(self._order) == 1:
+            self._tabs.hide()
+            self._root.addWidget(QLabel(self._slots[self._order[0]]['label'] + ":"))
+        else:
+            self._root.addWidget(self._tabs)
+            self._restyle_tabs(self.palette().window().color())
+
+        # Opacity of the colour currently shown in the panel (per tab)
+        self._op_row = QHBoxLayout()
+        self._op_row.addWidget(QLabel("Opacity:"))
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(0, 255)
-        self.opacity_slider.setValue(self.color.alpha())
-        self.opacity_label = QLabel(f"{int(self.color.alpha() / 255 * 100)}%")
-        self.opacity_label.setFixedWidth(38)
-        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
-        slider_row.addWidget(self.opacity_slider)
-        slider_row.addWidget(self.opacity_label)
-        lay.addLayout(slider_row)
+        self.opacity_slider.setValue(255)
+        self.opacity_label = QLabel("100%")
+        self.opacity_label.setFixedWidth(40)
+        self._op_row.addWidget(self.opacity_slider, 1)
+        self._op_row.addWidget(self.opacity_label)
+        self._root.addLayout(self._op_row)
+
+        # Embedded colour panel: a QColorDialog is a QWidget underneath, so with
+        # plain Widget flags it folds into this dialog; its own OK/Cancel row is
+        # hidden (NoButtons) because this dialog's button box covers that. Its
+        # alpha field is hidden too — the opacity slider above replaces it.
+        self.color_dialog = QColorDialog(self)
+        self.color_dialog.setWindowFlags(Qt.WindowType.Widget)
+        self.color_dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        self.color_dialog.setOption(QColorDialog.ColorDialogOption.NoButtons, True)
+        self.color_dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
+        self._root.addWidget(self.color_dialog)
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                               QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-        self._update_btn()
+        self._root.addWidget(bb)
 
-    def _pick_color(self):
-        c = _show_color_dialog(self.color, self, alpha=False)
-        if c is not None:
-            c.setAlpha(self.color.alpha())
-            self.color = c
-            self._update_btn()
+        self._finished = True
+        if self._order:
+            self._active = self._order[0]
+            self._point_panel_at(self._active)
+            self.color_dialog.currentColorChanged.connect(self._on_panel_color_changed)
+            self._tabs.currentChanged.connect(self._on_tab_changed)
+            self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        else:
+            self.color_dialog.hide()
+        if not self._order or not self.SHOW_OPACITY:
+            for i in range(self._op_row.count()):
+                w = self._op_row.itemAt(i).widget()
+                if w is not None:
+                    w.hide()
 
-    def _on_opacity_changed(self, val):
-        self.color.setAlpha(val)
-        self.opacity_label.setText(f"{int(val / 255 * 100)}%")
-        self._update_btn()
+    def _restyle_tabs(self, bg: QColor):
+        """Active tab = exactly the dialog background, no outline underneath,
+        so it reads as part of the page; inactive tabs are a shade apart."""
+        dark = bg.lightness() < 128
+        inactive = bg.darker(140) if dark else bg.darker(110)
+        hover = bg.darker(120) if dark else bg.darker(105)
+        fg_on = "#e6e6e6" if dark else "#141414"
+        fg_off = "#8d8fa0" if dark else "#6c6c6c"
+        # subtle outline on left / top / right only (never underneath)
+        edge = bg.lighter(235) if dark else bg.darker(130)
+        edge_off = bg.lighter(190) if dark else bg.darker(118)
+        self._tabs.setStyleSheet(f"""
+            QTabBar {{ background: transparent; qproperty-drawBase: 0; }}
+            QTabBar::tab {{ background:{inactive.name()}; color:{fg_off}; border:none;
+                border-top:1px solid {edge_off.name()}; border-left:1px solid {edge_off.name()};
+                border-right:1px solid {edge_off.name()}; border-bottom:none;
+                padding:6px 13px; margin:0 2px 0 0;
+                border-top-left-radius:7px; border-top-right-radius:7px;
+                border-bottom-left-radius:0; border-bottom-right-radius:0; }}
+            QTabBar::tab:selected {{ background:{bg.name()}; color:{fg_on}; border:none;
+                border-top:1px solid {edge.name()}; border-left:1px solid {edge.name()};
+                border-right:1px solid {edge.name()}; border-bottom:none; }}
+            QTabBar::tab:hover:!selected {{ background:{hover.name()}; }}
+        """)
 
-    def _update_btn(self):
-        c = self.color
-        self.btn_color.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
-            f"color: {'black' if c.lightness() > 128 else 'white'}; border: 1px solid #888;")
+    def _sample_bg_and_restyle(self):
+        """Read the dialog's real background (global QSS or palette) from a
+        rendered pixel so the active tab matches it exactly."""
+        if len(self._order) < 2:
+            return
+        try:
+            bg = self.grab().toImage().pixelColor(1, 1)
+        except Exception:
+            bg = self.palette().window().color()
+        if bg.alpha() == 0:
+            bg = self.palette().window().color()
+        self._restyle_tabs(bg)
+
+    def _point_panel_at(self, key: str):
+        """Load a slot's value into the (single) colour panel + opacity slider
+        without triggering the change handlers."""
+        self._loading = True
+        try:
+            col = self._slots[key]['color']
+            shown = QColor(col)
+            shown.setAlpha(255)                 # panel edits RGB only
+            self.color_dialog.setCurrentColor(shown)
+            self.opacity_slider.blockSignals(True)
+            self.opacity_slider.setValue(col.alpha())
+            self.opacity_slider.blockSignals(False)
+            self.opacity_label.setText(f"{int(round(col.alpha() / 255 * 100))}%")
+        finally:
+            self._loading = False
+
+    def _on_opacity_changed(self, val: int):
+        if self._loading or self._active is None:
+            return
+        c = self.slot_color(self._active)
+        c.setAlpha(int(val))
+        self._slots[self._active]['color'] = c
+        self.opacity_label.setText(f"{int(round(val / 255 * 100))}%")
+        self._refresh_tab(self._active)
+        self._on_slot_changed(self._active)
+        self._apply_preview()
+
+    def _refresh_tab(self, key: str):
+        idx = self._order.index(key)
+        self._tabs.setTabIcon(idx, _swatch_icon(self._slots[key]['color']))
+
+    def _on_tab_changed(self, idx: int):
+        if idx < 0 or idx >= len(self._order):
+            return
+        self._active = self._order[idx]
+        self._point_panel_at(self._active)
+
+    def _on_panel_color_changed(self, color: QColor):
+        if self._loading or self._active is None:
+            return
+        self._slots[self._active]['color'] = self._coerce_color(self._active, color)
+        self._refresh_tab(self._active)
+        self._on_slot_changed(self._active)
+        self._apply_preview()
+
+    def _on_slot_changed(self, key: str):
+        """Hook for subclasses (e.g. refresh a preview label)."""
+
+    # ── live preview plumbing ────────────────────────────────────────────────
+    def _apply_preview(self, *_):
+        """Override: push the dialog's current state onto ``self._target_item``."""
+
+    def _restore_original(self):
+        """Override: put ``self._target_item`` back as it was before previewing."""
+
+    def restore_original(self):
+        """Public: hosts call this on OK so the undo snapshot is taken from the
+        pristine (pre-preview) state."""
+        self._restore_original()
+
+    def reject(self):
+        self._restore_original()
+        super().reject()
+
+    # ── show on whichever monitor holds the cursor ───────────────────────────
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._positioned:
+            self._positioned = True
+            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+            if screen is not None:
+                geo = screen.geometry()
+                size = self.sizeHint()
+                self.move(geo.x() + (geo.width() - size.width()) // 2,
+                          geo.y() + (geo.height() - size.height()) // 2)
+            QTimer.singleShot(0, self._sample_bg_and_restyle)
+
+    # ── small helper used by several subclasses ──────────────────────────────
+    def _make_width_row(self, label: str, value: int, lo: int = 1, hi: int = 100):
+        """Label + slider + spin box kept in sync. Returns (row_layout, spin)."""
+        self.main_lay.addWidget(QLabel(label))
+        row = QHBoxLayout()
+        spin = QSpinBox()
+        spin.setRange(lo, hi)
+        spin.setValue(max(lo, min(hi, int(value))))
+        spin.setSuffix(" px")
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(lo, hi)
+        slider.setValue(spin.value())
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        self.main_lay.addLayout(row)
+
+        def _spin_changed(v):
+            if slider.value() != v:
+                slider.blockSignals(True); slider.setValue(v); slider.blockSignals(False)
+            self._apply_preview()
+
+        def _slider_changed(v):
+            if spin.value() != v:
+                spin.blockSignals(True); spin.setValue(v); spin.blockSignals(False)
+            self._apply_preview()
+
+        spin.valueChanged.connect(_spin_changed)
+        slider.valueChanged.connect(_slider_changed)
+        return row, spin
+
+
+class _ColorSwatch(QWidget):
+    """Small toolbar indicator showing the colour(s) of the active tool or the
+    selected object. Two-colour objects show two halves, three-colour objects
+    three stripes — so the swatch always mirrors what the options window edits."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._colors = [QColor(255, 0, 0)]
+        self.setFixedSize(18, 18)
+        self.setToolTip("Colour(s) of the active tool / selected object")
+
+    def set_colors(self, colors):
+        colors = [QColor(c) for c in colors] or [QColor(255, 0, 0)]
+        self._colors = colors
+        n = len(colors)
+        self.setFixedSize(18 if n == 1 else 14 * n + 4, 18)
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        r = self.rect().adjusted(0, 0, -1, -1)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(r), 3, 3)
+        p.setClipPath(clip)
+        # checkerboard so transparent colours are visible as such
+        p.fillRect(r, QColor(255, 255, 255))
+        step = 5
+        for yy in range(0, r.height() + 1, step):
+            for xx in range(0, r.width() + 1, step):
+                if ((xx // step) + (yy // step)) % 2:
+                    p.fillRect(xx, yy, step, step, QColor(200, 200, 200))
+        n = len(self._colors)
+        w = r.width() / n
+        for i, c in enumerate(self._colors):
+            p.fillRect(QRectF(i * w, 0, w + 1, r.height() + 1), c)
+        p.setClipping(False)
+        p.setPen(QPen(QColor(255, 255, 255), 1))
+        p.drawRoundedRect(QRectF(r), 3, 3)
+        p.end()
+
+
+class HighlightEditDialog(_ToolOptionsDialog):
+    """Highlight: background colour + opacity (the shared opacity slider)."""
+    def __init__(self, current_color: QColor, parent=None, target_item=None):
+        super().__init__("Edit Highlight", parent, target_item)
+        self._orig_color = QColor(current_color)
+        self.add_color_slot('bg', "Background color", current_color)
+        self.finish()
+
+    @property
+    def color(self) -> QColor:
+        return self.slot_color('bg')
+
+    def _apply_preview(self, *_):
+        it = self._target_item
+        if it is None:
+            return
+        c = self.result_color()
+        it._color = c
+        it.setBrush(QBrush(c))
+        it.update()
+
+    def restore_original(self):
+        it = self._target_item
+        if it is None:
+            return
+        it._color = QColor(self._orig_color)
+        it.setBrush(QBrush(self._orig_color))
+        it.update()
+
+    _restore_original = restore_original
 
     def result_color(self) -> QColor:
-        return self.color
+        return self.slot_color('bg')
+
+
+class ArrowEditDialog(_ToolOptionsDialog):
+    SHOW_OPACITY = False      # no transparency slider for this object
+    """Arrow: head style + line width (main settings) and line colour.
+
+    If *target_item* (an ArrowItem already on the canvas) is given, every
+    change is applied to it live; Cancel restores the original values."""
+    def __init__(self, current_width: int, current_color: QColor,
+                 current_head_style: str = 'single', parent=None,
+                 target_item=None):
+        super().__init__("Edit Arrow", parent, target_item)
+        self._orig_width = current_width
+        self._orig_color = QColor(current_color)
+        self._orig_head = current_head_style
+
+        self.main_lay.addWidget(QLabel("Arrowhead:"))
+        head_row = QHBoxLayout()
+        self.rb_single       = QRadioButton("➡️ One head")
+        self.rb_single_start = QRadioButton("⬅️ One head (other side)")
+        self.rb_double       = QRadioButton("↔️ Two heads")
+        self.rb_none         = QRadioButton("— No head")
+        self._head_group = QButtonGroup(self)
+        for rb in (self.rb_single, self.rb_single_start, self.rb_double, self.rb_none):
+            self._head_group.addButton(rb)
+            head_row.addWidget(rb)
+        self.main_lay.addLayout(head_row)
+        if current_head_style == ArrowItem.HEAD_DOUBLE:
+            self.rb_double.setChecked(True)
+        elif current_head_style == ArrowItem.HEAD_NONE:
+            self.rb_none.setChecked(True)
+        elif current_head_style == ArrowItem.HEAD_SINGLE_START:
+            self.rb_single_start.setChecked(True)
+        else:
+            self.rb_single.setChecked(True)
+        for rb in (self.rb_single, self.rb_single_start, self.rb_double, self.rb_none):
+            rb.toggled.connect(self._apply_preview)
+
+        _, self.spin_width = self._make_width_row("Line width:", current_width, 1, 100)
+        self.add_color_slot('line', "Line color", current_color, alpha=False)
+        self.finish()
+
+    @property
+    def _color(self) -> QColor:
+        return self.slot_color('line')
+
+    def _apply_preview(self, *_):
+        it = self._target_item
+        if it is None:
+            return
+        pen = it.pen()
+        pen.setWidth(self.spin_width.value())
+        pen.setColor(self.slot_color('line'))
+        it.setPen(pen)
+        it.head_style = self.result_head_style()
+        it.prepareGeometryChange()
+        it.update()
+        if it.scene() is not None:
+            it.scene().update()
+
+    def restore_original(self):
+        it = self._target_item
+        if it is None:
+            return
+        pen = it.pen()
+        pen.setWidth(self._orig_width)
+        pen.setColor(self._orig_color)
+        it.setPen(pen)
+        it.head_style = self._orig_head
+        it.prepareGeometryChange()
+        it.update()
+        if it.scene() is not None:
+            it.scene().update()
+
+    _restore_original = restore_original
+
+    def result_head_style(self) -> str:
+        if self.rb_double.isChecked():
+            return ArrowItem.HEAD_DOUBLE
+        if self.rb_none.isChecked():
+            return ArrowItem.HEAD_NONE
+        if self.rb_single_start.isChecked():
+            return ArrowItem.HEAD_SINGLE_START
+        return ArrowItem.HEAD_SINGLE
+
+    def result_data(self):
+        """Returns (width, color, head_style)."""
+        return self.spin_width.value(), self.slot_color('line'), self.result_head_style()
+
+
+class _FillTabsMixin:
+    """Shared by the dialogs of fillable shapes: a 'Fill shape' checkbox plus a
+    second colour tab ('Background color') that is the fill. The tab is marked
+    '(off)' while the checkbox is unchecked."""
+    def _add_fill_controls(self, fill, fill_color, outline_color):
+        self.chk_fill = None
+        if fill is None:
+            return
+        self.chk_fill = QCheckBox("Fill shape")
+        self.chk_fill.setChecked(bool(fill))
+        self.main_lay.addWidget(self.chk_fill)
+        self._fill_init = QColor(fill_color) if fill_color is not None else QColor(outline_color)
+
+    def _add_fill_slot(self):
+        if self.chk_fill is not None:
+            self.add_color_slot('fill', "Background color", self._fill_init)
+
+    def _connect_fill(self):
+        if self.chk_fill is not None:
+            self.chk_fill.toggled.connect(self._on_fill_toggled)
+            self._update_fill_tab_title()
+
+    def _on_fill_toggled(self, *_):
+        self._update_fill_tab_title()
+        self._apply_preview()
+
+    def _update_fill_tab_title(self):
+        if self.chk_fill is not None and 'fill' in self._order:
+            i = self._order.index('fill')
+            self._tabs.setTabText(i, "Background color" +
+                                  ("" if self.chk_fill.isChecked() else " (off)"))
+
+    def result_fill(self):
+        return None if self.chk_fill is None else self.chk_fill.isChecked()
+
+    def result_fill_color(self):
+        return QColor(self.slot_color('fill')) if self.chk_fill is not None else None
+
+    def _brush_for_preview(self):
+        if self.chk_fill is not None and self.chk_fill.isChecked():
+            return QBrush(self.slot_color('fill'))
+        return QBrush(Qt.GlobalColor.transparent)
+
+
+class StrokeEditDialog(_FillTabsMixin, _ToolOptionsDialog):
+    """Width + colour for Line / Circle / Freehand. With ``fill`` given (not
+    None) it also gets "Fill shape" and a second colour tab for the fill."""
+    def __init__(self, title: str, current_width: int, current_color: QColor,
+                 parent=None, target_item=None, alpha: bool = True,
+                 fill=None, max_width: int = 100, color_label: str = "Line color",
+                 fill_color=None):
+        super().__init__(title, parent, target_item)
+        self._orig_pen = QPen(target_item.pen()) if target_item is not None else None
+        self._orig_brush = (QBrush(target_item.brush())
+                            if target_item is not None and hasattr(target_item, 'brush') else None)
+        _, self.spin_width = self._make_width_row("Line width:", current_width, 1, max_width)
+        self._add_fill_controls(fill, fill_color, current_color)
+        self.add_color_slot('line', color_label, current_color)
+        self._add_fill_slot()
+        self.finish()
+        self._connect_fill()
+
+    def _apply_preview(self, *_):
+        it = self._target_item
+        if it is None:
+            return
+        pen = it.pen()
+        pen.setWidth(self.spin_width.value())
+        pen.setColor(self.slot_color('line'))
+        it.setPen(pen)
+        if self.chk_fill is not None and hasattr(it, 'setBrush'):
+            it.setBrush(self._brush_for_preview())
+        if hasattr(it, 'prepareGeometryChange'):
+            it.prepareGeometryChange()
+        it.update()
+
+    def restore_original(self):
+        it = self._target_item
+        if it is None or self._orig_pen is None:
+            return
+        it.setPen(QPen(self._orig_pen))
+        if self._orig_brush is not None and hasattr(it, 'setBrush'):
+            it.setBrush(QBrush(self._orig_brush))
+        if hasattr(it, 'prepareGeometryChange'):
+            it.prepareGeometryChange()
+        it.update()
+
+    _restore_original = restore_original
+
+    def result_data(self):
+        """Returns (width, color)."""
+        return self.spin_width.value(), self.slot_color('line')
+
+
+class FreehandEditDialog(StrokeEditDialog):
+    """Freehand strokes — line width and colour."""
+    def __init__(self, current_width: int, current_color: QColor, parent=None,
+                 target_item=None):
+        super().__init__("Edit Freehand", current_width, current_color, parent, target_item)
+
+
+class LineEditDialog(StrokeEditDialog):
+    """Straight line — line width and colour."""
+    def __init__(self, current_width: int, current_color: QColor, parent=None,
+                 target_item=None):
+        super().__init__("Edit Line", current_width, current_color, parent, target_item)
+
+
+class CircleEditDialog(StrokeEditDialog):
+    """Ellipse — width, outline colour, optional fill + background colour."""
+    def __init__(self, current_width: int, current_color: QColor, parent=None,
+                 target_item=None, fill=None, fill_color=None):
+        super().__init__("Edit Circle", current_width, current_color, parent,
+                         target_item, fill=fill, fill_color=fill_color,
+                         color_label="Outline color")
+
+
+class RectEditDialog(_FillTabsMixin, _ToolOptionsDialog):
+    """Rectangle: line width + corner rounding + optional fill (main settings),
+    'Outline color' and 'Background color' tabs.
+
+    If `target_item` is given, changes are previewed live and restored on
+    Cancel. On OK the caller should call `restore_original()` (so the undo
+    snapshot is taken from the untouched state), push undo, then apply
+    `result_data()` itself."""
+    def __init__(self, current_width: int, current_color: QColor,
+                 current_radius: float, parent=None, target_item=None,
+                 fill=None, fill_color=None):
+        super().__init__("Rectangle settings", parent, target_item)
+        if target_item is not None:
+            self._orig_pen = QPen(target_item.pen())
+            self._orig_brush = QBrush(target_item.brush())
+            self._orig_radius = float(getattr(target_item, 'corner_radius', 0.0))
+        _, self.spin_width = self._make_width_row("Line width:", current_width, 1, 200)
+
+        max_r = 1000
+        if target_item is not None and hasattr(target_item, '_max_radius'):
+            max_r = max(1, int(math.ceil(target_item._max_radius())))
+        rad_row = QHBoxLayout()
+        rad_row.addWidget(QLabel("Corner rounding:"))
+        self.slider_radius = QSlider(Qt.Orientation.Horizontal)
+        self.slider_radius.setRange(0, max_r)
+        self.spin_radius = QSpinBox()
+        self.spin_radius.setRange(0, max_r)
+        self.spin_radius.setSuffix(" px")
+        start_r = max(0, min(max_r, int(round(current_radius))))
+        self.slider_radius.setValue(start_r)
+        self.spin_radius.setValue(start_r)
+        self.slider_radius.setToolTip(
+            "Also adjustable by dragging the purple dot at the top-left corner "
+            "of a selected rectangle (right = rounder)")
+        rad_row.addWidget(self.slider_radius, 1)
+        rad_row.addWidget(self.spin_radius)
+        self.main_lay.addLayout(rad_row)
+        self.slider_radius.valueChanged.connect(self._on_slider_radius)
+        self.spin_radius.valueChanged.connect(self._on_spin_radius)
+
+        self._add_fill_controls(fill, fill_color, current_color)
+        self.add_color_slot('line', "Outline color", current_color)
+        self._add_fill_slot()
+        self.finish()
+        self._connect_fill()
+
+    def _on_slider_radius(self, v):
+        self.spin_radius.blockSignals(True)
+        self.spin_radius.setValue(v)
+        self.spin_radius.blockSignals(False)
+        self._apply_preview()
+
+    def _on_spin_radius(self, v):
+        self.slider_radius.blockSignals(True)
+        self.slider_radius.setValue(v)
+        self.slider_radius.blockSignals(False)
+        self._apply_preview()
+
+    def _apply_preview(self, *_):
+        it = self._target_item
+        if it is None:
+            return
+        pen = it.pen()
+        pen.setWidth(self.spin_width.value())
+        pen.setColor(self.slot_color('line'))
+        it.setPen(pen)
+        if self.chk_fill is not None:
+            it.setBrush(self._brush_for_preview())
+        it.corner_radius = float(self.spin_radius.value())
+        it.prepareGeometryChange()
+        it.update()
+
+    def restore_original(self):
+        it = self._target_item
+        if it is None:
+            return
+        it.setPen(QPen(self._orig_pen))
+        it.setBrush(QBrush(self._orig_brush))
+        it.corner_radius = self._orig_radius
+        it.prepareGeometryChange()
+        it.update()
+
+    _restore_original = restore_original
+
+    def result_data(self):
+        """(line width, outline colour, corner radius in px)"""
+        return (self.spin_width.value(), self.slot_color('line'),
+                float(self.spin_radius.value()))
+
+
+class _BubbleEditDialog(_ToolOptionsDialog):
+    SHOW_OPACITY = False      # no transparency slider for this object
+    """Text bubble: text (main setting) + two colour tabs (text / background).
+
+    ``show_text=False`` is used when editing a tool's *defaults* (no text)."""
+    def __init__(self, fg_color: QColor = None, bg_color: QColor = None,
+                 text: str = "", parent=None, target_item=None,
+                 title: str = "Edit Text Bubble", show_text: bool = True):
+        super().__init__(title, parent, target_item)
+        fg = QColor(fg_color) if fg_color else QColor(Qt.GlobalColor.black)
+        bg = QColor(bg_color) if bg_color else QColor(230, 230, 230, 240)
+        self._orig_fg, self._orig_bg = QColor(fg), QColor(bg)
+        self.edit = QTextEdit()
+        self.edit.setPlainText(text)
+        self.edit.setFixedHeight(80)
+        if show_text:
+            self.main_lay.addWidget(QLabel("Text:"))
+            self.main_lay.addWidget(self.edit)
+        self.add_color_slot('fg', "Text color", fg, alpha=False)
+        self.add_color_slot('bg', "Background color", bg, alpha=False)
+        self.finish()
+
+    fg_color = property(lambda s: s.slot_color('fg'),
+                        lambda s, c: s.set_slot_color('fg', c))
+    bg_color = property(lambda s: s.slot_color('bg'),
+                        lambda s, c: s.set_slot_color('bg', c))
+
+    def _update_btn_styles(self):          # legacy hook — panel/tabs refresh themselves
+        self._refresh_tab('fg'); self._refresh_tab('bg')
+
+    def _apply_preview(self, *_):
+        it = self._target_item
+        if it is None:
+            return
+        it._fg_color = self.slot_color('fg')
+        it._bg_color = self.slot_color('bg')
+        it.update()
+
+    def restore_original(self):
+        it = self._target_item
+        if it is None:
+            return
+        it._fg_color = QColor(self._orig_fg)
+        it._bg_color = QColor(self._orig_bg)
+        it.update()
+
+    _restore_original = restore_original
+
+    def result_data(self):
+        return self.edit.toPlainText(), self.slot_color('fg'), self.slot_color('bg')
+
+
+class _BubbleInputDialog(_BubbleEditDialog):
+    """New text bubble (same window as editing one, but empty)."""
+    def __init__(self, fg_color: QColor = None, parent=None, bg_color: QColor = None):
+        super().__init__(fg_color, bg_color, "", parent, None, "Text Bubble", True)
+
+
+class _MarkerPreview(QWidget):
+    """Little numbered-circle preview for the marker options window."""
+    def __init__(self, dlg, parent=None):
+        super().__init__(parent)
+        self._dlg = dlg
+        self.setFixedHeight(46)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = 16
+        cx, cy = self.width() / 2, self.height() / 2
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(self._dlg.slot_color('bg')))
+        p.drawEllipse(QPointF(cx, cy), r, r)
+        p.setPen(QPen(self._dlg.slot_color('fg'), 1))
+        p.setFont(QFont("Arial", 13, QFont.Weight.Bold))
+        p.drawText(QRectF(cx - r, cy - r, 2 * r, 2 * r), Qt.AlignmentFlag.AlignCenter, "1")
+        p.end()
+
+
+class _MarkerEditDialog(_ToolOptionsDialog):
+    """Numbered marker: Size (main setting — the same value the item's round
+    resize handle sets) + preview, and two colour tabs (background / number)."""
+    SHOW_OPACITY = False      # no transparency slider for this object
+
+    def __init__(self, bg_color: QColor = None, text_color: QColor = None,
+                 parent=None, target_item=None, scale: float = None):
+        super().__init__("Edit Marker", parent, target_item)
+        bg = QColor(bg_color) if bg_color else QColor(220, 50, 50)
+        fg = QColor(text_color) if text_color else QColor(Qt.GlobalColor.white)
+        self._orig_bg, self._orig_fg = QColor(bg), QColor(fg)
+        if scale is None:
+            scale = target_item._scale if target_item is not None else 1.0
+        self._orig_scale = float(scale)
+
+        # Size in % of the default marker (100% = default size). The resize
+        # handle on the marker sets the very same value (_scale).
+        self.main_lay.addWidget(QLabel("Size:"))
+        row = QHBoxLayout()
+        # The marker's resize handle has no upper limit, so neither does this:
+        # the range always covers the current value (min. 2000 %), otherwise
+        # opening + OK-ing the dialog would silently shrink a big marker.
+        lo = 20
+        hi = max(2000, int(math.ceil(scale * 100)))
+        pct = max(lo, int(round(scale * 100)))
+        self.size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.size_slider.setRange(lo, hi)
+        self.size_slider.setValue(pct)
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(lo, hi)
+        self.size_spin.setSuffix(" %")
+        self.size_spin.setValue(pct)
+        self.size_slider.setToolTip("Same as dragging the round handle on the left "
+                                    "edge of a selected marker")
+        row.addWidget(self.size_slider, 1)
+        row.addWidget(self.size_spin)
+        self.main_lay.addLayout(row)
+        self.size_slider.valueChanged.connect(self._on_size_slider)
+        self.size_spin.valueChanged.connect(self._on_size_spin)
+
+        self.add_color_slot('bg', "Background color", bg)
+        self.add_color_slot('fg', "Text color", fg)
+        self._preview = _MarkerPreview(self)
+        self.main_lay.addWidget(self._preview)
+        self.finish()
+
+    def _on_size_slider(self, v):
+        self.size_spin.blockSignals(True); self.size_spin.setValue(v); self.size_spin.blockSignals(False)
+        self._apply_preview()
+
+    def _on_size_spin(self, v):
+        self.size_slider.blockSignals(True); self.size_slider.setValue(v); self.size_slider.blockSignals(False)
+        self._apply_preview()
+
+    def result_scale(self) -> float:
+        return self.size_spin.value() / 100.0
+
+    bg_color = property(lambda s: s.slot_color('bg'),
+                        lambda s, c: s.set_slot_color('bg', c))
+    text_color = property(lambda s: s.slot_color('fg'),
+                          lambda s, c: s.set_slot_color('fg', c))
+
+    def _on_slot_changed(self, key):
+        self._preview.update()
+
+    def _update_styles(self):              # legacy hook
+        self._preview.update()
+
+    def _apply_preview(self, *_):
+        it = self._target_item
+        if it is None:
+            return
+        it._bg_color = self.slot_color('bg')
+        it._text_color = self.slot_color('fg')
+        it.prepareGeometryChange()
+        it._scale = self.result_scale()
+        it.update()
+
+    def restore_original(self):
+        it = self._target_item
+        if it is None:
+            return
+        it._bg_color = QColor(self._orig_bg)
+        it._text_color = QColor(self._orig_fg)
+        it.prepareGeometryChange()
+        it._scale = self._orig_scale
+        it.update()
+
+    _restore_original = restore_original
+
+    def result_data(self):
+        return self.slot_color('bg'), self.slot_color('fg')
+
+
+class _TextInputDialog(_ToolOptionsDialog):
+    """Text annotation: text, size, highlight and outline options (main
+    settings) + three colour tabs (text / highlight / outline).
+
+    ``show_text=False`` is used when editing the Text tool's *defaults*."""
+    def __init__(self, color, parent=None, show_text: bool = True, state: dict = None):
+        super().__init__("Add Text", parent)
+        self.edit = QTextEdit()
+        self.edit.setFixedHeight(80)
+        if show_text:
+            self.main_lay.addWidget(QLabel("Text:"))
+            self.main_lay.addWidget(self.edit)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Font size:"))
+        self.sz = QSpinBox(); self.sz.setRange(6, 120); self.sz.setValue(18)
+        row.addWidget(self.sz)
+        row.addStretch()
+        self.main_lay.addLayout(row)
+
+        hl_row = QHBoxLayout()
+        self.chk_hl = QCheckBox("Enable highlight")
+        self.chk_hl.setChecked(True)
+        hl_row.addWidget(self.chk_hl)
+        hl_row.addWidget(QLabel("Padding:"))
+        self.hl_pad = QSpinBox(); self.hl_pad.setRange(0, 40); self.hl_pad.setValue(0)
+        self.hl_pad.setSuffix(" px")
+        hl_row.addWidget(self.hl_pad)
+        hl_row.addStretch()
+        self.main_lay.addLayout(hl_row)
+
+        ol_row = QHBoxLayout()
+        self.chk_ol = QCheckBox("Enable outline")
+        self.chk_ol.setChecked(False)
+        ol_row.addWidget(self.chk_ol)
+        ol_row.addWidget(QLabel("Width:"))
+        self.ol_width = QSpinBox(); self.ol_width.setRange(1, 20); self.ol_width.setValue(2)
+        self.ol_width.setSuffix(" px")
+        ol_row.addWidget(self.ol_width)
+        ol_row.addStretch()
+        self.main_lay.addLayout(ol_row)
+
+        self.add_color_slot('text', "Text color", QColor(color), alpha=False)
+        self.add_color_slot('hl', "Highlight", QColor(255, 255, 0, 255), alpha=True)
+        self.add_color_slot('ol', "Outline", QColor(0, 0, 0), alpha=False)
+        self.finish()
+        self.chk_hl.toggled.connect(self._update_tab_titles)
+        self.chk_ol.toggled.connect(self._update_tab_titles)
+        if state:
+            self.apply_state(state)
+        self._update_tab_titles()
+
+    # legacy attribute names used by older call sites
+    color = property(lambda s: s.slot_color('text'),
+                     lambda s, c: s.set_slot_color('text', c))
+    highlight = property(lambda s: s.slot_color('hl'),
+                         lambda s, c: s.set_slot_color('hl', c))
+    outline_color = property(lambda s: s.slot_color('ol'),
+                             lambda s, c: s.set_slot_color('ol', c))
+
+    def _update_btn_color(self):           # legacy hook
+        for k in self._order:
+            self._refresh_tab(k)
+        self._point_panel_at(self._active)
+
+    def _update_tab_titles(self, *_):
+        names = {'text': "Text color",
+                 'hl': "Highlight" + ("" if self.chk_hl.isChecked() else " (off)"),
+                 'ol': "Outline" + ("" if self.chk_ol.isChecked() else " (off)")}
+        for i, k in enumerate(self._order):
+            self._tabs.setTabText(i, names[k])
+
+    def apply_state(self, s: dict):
+        """Load remembered Text-tool settings (see _ToolPrefs 'text')."""
+        self.sz.setValue(int(s['size']))
+        self.chk_hl.setChecked(bool(s['hl_on']))
+        self.hl_pad.setValue(int(s['hl_pad']))
+        self.chk_ol.setChecked(bool(s['ol_on']))
+        self.ol_width.setValue(int(s['ol_w']))
+        self.set_slot_color('text', s['color'])
+        self.set_slot_color('hl', s['hl'])
+        self.set_slot_color('ol', s['ol'])
+        self._update_tab_titles()
+
+    def state(self) -> dict:
+        return {'color': self.slot_color('text'), 'size': self.sz.value(),
+                'hl': self.slot_color('hl'), 'hl_on': self.chk_hl.isChecked(),
+                'hl_pad': self.hl_pad.value(),
+                'ol': self.slot_color('ol'), 'ol_on': self.chk_ol.isChecked(),
+                'ol_w': self.ol_width.value()}
+
+    def result_data(self):
+        return (self.edit.toPlainText(), self.sz.value(), self.slot_color('text'),
+                self.slot_color('hl'), self.chk_hl.isChecked(), self.hl_pad.value(),
+                self.chk_ol.isChecked(), self.ol_width.value(), self.slot_color('ol'))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Shared "build dialog / commit result" logic, used by BOTH the Capture Region
+#  overlay and the Image Editor so the two behave identically.
+# ─────────────────────────────────────────────────────────────────────────────
+def _item_is_filled(item) -> bool:
+    b = item.brush()
+    return b.style() != Qt.BrushStyle.NoBrush and b.color().alpha() > 0
+
+
+def _item_fill_color(item) -> QColor:
+    """Background colour of a rect/ellipse: its current fill if filled, else the
+    last one it had, else (legacy behaviour) its outline colour."""
+    b = item.brush()
+    if b.style() != Qt.BrushStyle.NoBrush and b.color().alpha() > 0:
+        return QColor(b.color())
+    c = getattr(item, '_fill_color', None)
+    return QColor(c) if c is not None else QColor(item.pen().color())
+
+
+def _prefs_fill_color(prefs, key) -> QColor:
+    """Fill colour a tool uses for new shapes (None setting → follows outline)."""
+    c = prefs.get(key, 'fill_color')
+    return QColor(c) if c is not None else prefs.get(key, 'color')
+
+
+def _build_options_dialog(key, parent, prefs, item=None, allow_fill=False):
+    """Return the options window for tool *key*.
+
+    * ``item`` given  → opens on that object's current values, with live preview.
+    * ``item`` None   → opens on the tool's remembered defaults (no text box).
+    """
+    if key == 'rect':
+        if item is not None:
+            return RectEditDialog(item.pen().width(), item.pen().color(),
+                                  item.corner_radius, parent, target_item=item,
+                                  fill=_item_is_filled(item) if allow_fill else None,
+                                  fill_color=_item_fill_color(item))
+        p = prefs.all('rect')
+        return RectEditDialog(p['width'], p['color'], p['radius'], parent,
+                              fill=p['fill'] if allow_fill else None,
+                              fill_color=_prefs_fill_color(prefs, 'rect'))
+    if key == 'circle':
+        if item is not None:
+            return CircleEditDialog(item.pen().width(), item.pen().color(), parent,
+                                    item, fill=_item_is_filled(item) if allow_fill else None,
+                                    fill_color=_item_fill_color(item))
+        p = prefs.all('circle')
+        return CircleEditDialog(p['width'], p['color'], parent,
+                                fill=p['fill'] if allow_fill else None,
+                                fill_color=_prefs_fill_color(prefs, 'circle'))
+    if key == 'line':
+        if item is not None:
+            return LineEditDialog(item.pen().width(), item.pen().color(), parent, item)
+        p = prefs.all('line')
+        return LineEditDialog(p['width'], p['color'], parent)
+    if key == 'arrow':
+        if item is not None:
+            return ArrowEditDialog(item.pen().width(), item.pen().color(),
+                                   getattr(item, 'head_style', ArrowItem.HEAD_SINGLE),
+                                   parent, target_item=item)
+        p = prefs.all('arrow')
+        return ArrowEditDialog(p['width'], p['color'], p['head'], parent)
+    if key == 'freehand':
+        if item is not None:
+            return FreehandEditDialog(item.pen().width(), item.pen().color(), parent, item)
+        p = prefs.all('freehand')
+        return FreehandEditDialog(p['width'], p['color'], parent)
+    if key == 'highlight':
+        if item is not None:
+            return HighlightEditDialog(item._color, parent, target_item=item)
+        return HighlightEditDialog(prefs.get('highlight', 'color'), parent)
+    if key == 'bubble':
+        if item is not None:
+            return _BubbleEditDialog(item._fg_color, item._bg_color, item._text,
+                                     parent, target_item=item)
+        p = prefs.all('bubble')
+        return _BubbleEditDialog(p['fg'], p['bg'], "", parent,
+                                 title="Text Bubble — defaults", show_text=False)
+    if key == 'marker':
+        if item is not None:
+            return _MarkerEditDialog(
+                QColor(item._bg_color),
+                QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
+                parent, target_item=item, scale=item._scale)
+        p = prefs.all('marker')
+        return _MarkerEditDialog(p['bg'], p['fg'], parent, scale=p['scale'])
+    if key == 'text':
+        p = prefs.all('text')
+        if item is not None:
+            dlg = _TextInputDialog(item.defaultTextColor(), parent, show_text=True)
+            dlg.setWindowTitle("Edit Text")
+            dlg.edit.setPlainText(item.toPlainText())
+            dlg.sz.setValue(item.font().pointSize())
+            dlg.chk_hl.setChecked(getattr(item, 'highlight_enabled', True))
+            dlg.hl_pad.setValue(getattr(item, 'highlight_padding', 0))
+            dlg.chk_ol.setChecked(getattr(item, 'outline_enabled', False))
+            dlg.ol_width.setValue(getattr(item, 'outline_width', 2))
+            dlg.set_slot_color('hl', QColor(getattr(item, 'highlight_color', p['hl'])))
+            dlg.set_slot_color('ol', QColor(getattr(item, 'outline_color', p['ol'])))
+            dlg._update_tab_titles()
+            return dlg
+        dlg = _TextInputDialog(p['color'], parent, show_text=False, state=p)
+        dlg.setWindowTitle("Text — defaults")
+        return dlg
+    return None
+
+
+def _store_dialog_in_prefs(key, dlg, prefs, allow_fill=False):
+    """Remember what the user chose as the tool's defaults ("last used")."""
+    if key == 'rect':
+        w, c, r = dlg.result_data()
+        prefs.update('rect', width=int(w), color=c, radius=float(r))
+        if allow_fill and dlg.result_fill() is not None:
+            prefs.set('rect', 'fill', bool(dlg.result_fill()))
+            prefs.set('rect', 'fill_color', dlg.result_fill_color())
+    elif key == 'circle':
+        w, c = dlg.result_data()
+        prefs.update('circle', width=int(w), color=c)
+        if allow_fill and dlg.result_fill() is not None:
+            prefs.set('circle', 'fill', bool(dlg.result_fill()))
+            prefs.set('circle', 'fill_color', dlg.result_fill_color())
+    elif key in ('line', 'freehand'):
+        w, c = dlg.result_data()
+        prefs.update(key, width=int(w), color=c)
+    elif key == 'arrow':
+        w, c, h = dlg.result_data()
+        prefs.update('arrow', width=int(w), color=c, head=h)
+    elif key == 'highlight':
+        prefs.set('highlight', 'color', dlg.result_color())
+    elif key == 'bubble':
+        _t, fg, bg = dlg.result_data()
+        prefs.update('bubble', fg=fg, bg=bg)
+    elif key == 'marker':
+        bg, fg = dlg.result_data()
+        prefs.update('marker', bg=bg, fg=fg, scale=dlg.result_scale())
+    elif key == 'text':
+        prefs._d['text'].update(dlg.state())
+
+
+def _commit_item_dialog(key, dlg, item, allow_fill=False):
+    """Apply an accepted dialog's values to *item* (call AFTER restore_original
+    + push_undo so the undo snapshot is the pristine state)."""
+    if key in ('rect', 'circle'):
+        if key == 'rect':
+            w, c, r = dlg.result_data()
+        else:
+            (w, c), r = dlg.result_data(), None
+        pen = item.pen(); pen.setWidth(int(w)); pen.setColor(QColor(c)); item.setPen(pen)
+        fill = dlg.result_fill() if allow_fill else None
+        if fill is not None:
+            fc = dlg.result_fill_color()
+            item._fill_color = QColor(fc)       # remembered even while fill is off
+            item.setBrush(QBrush(fc) if fill else QBrush(Qt.GlobalColor.transparent))
+        elif _item_is_filled(item):
+            item.setBrush(QBrush(QColor(c)))
+        if r is not None:
+            item.corner_radius = float(r)
+        item.prepareGeometryChange(); item.update()
+    elif key in ('line', 'freehand'):
+        w, c = dlg.result_data()
+        pen = item.pen(); pen.setWidth(int(w)); pen.setColor(QColor(c)); item.setPen(pen)
+        if hasattr(item, 'prepareGeometryChange'):
+            item.prepareGeometryChange()
+        item.update()
+    elif key == 'arrow':
+        w, c, h = dlg.result_data()
+        pen = item.pen(); pen.setWidth(int(w)); pen.setColor(QColor(c)); item.setPen(pen)
+        item.head_style = h
+        item.prepareGeometryChange(); item.update()
+    elif key == 'highlight':
+        c = dlg.result_color()
+        item._color = c
+        item.setPen(QPen(Qt.PenStyle.NoPen))
+        item.setBrush(QBrush(c))
+        item.update()
+    elif key == 'bubble':
+        txt, fg, bg = dlg.result_data()
+        item._text, item._fg_color, item._bg_color = txt, fg, bg
+        if hasattr(item, '_auto_grow'):
+            item._auto_grow()
+        item.prepareGeometryChange(); item.update()
+    elif key == 'marker':
+        bg, fg = dlg.result_data()
+        item._bg_color, item._text_color = bg, fg
+        item.prepareGeometryChange()
+        item._scale = dlg.result_scale()
+        item.update()
+    elif key == 'text':
+        txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
+        item.setPlainText(txt)
+        item.setFont(QFont("Arial", fsz))
+        item.setDefaultTextColor(col)
+        item.highlight_color, item.highlight_enabled = hl, hl_on
+        item.highlight_padding = hl_pad
+        item.outline_enabled, item.outline_width, item.outline_color = ol_on, ol_w, ol_col
+        item.update()
+
+
+def _item_swatch_colors(key, item):
+    """Colours to show on the toolbar swatch for a selected object."""
+    if key in ('rect', 'circle') and _item_is_filled(item):
+        return [item.pen().color(), _item_fill_color(item)]
+    if key in ('rect', 'circle', 'line', 'arrow', 'freehand'):
+        return [item.pen().color()]
+    if key == 'highlight':
+        return [item._color]
+    if key == 'bubble':
+        return [item._fg_color, item._bg_color]
+    if key == 'marker':
+        return [item._bg_color, getattr(item, '_text_color', QColor(Qt.GlobalColor.white))]
+    if key == 'text':
+        cols = [item.defaultTextColor()]
+        if getattr(item, 'highlight_enabled', False):
+            cols.append(getattr(item, 'highlight_color', QColor(255, 255, 0)))
+        return cols
+    return []
+
+
+def _prefs_swatch_colors(key, prefs):
+    """Colours to show on the toolbar swatch for the active tool (no selection)."""
+    if key in ('rect', 'circle') and prefs.get(key, 'fill'):
+        return [prefs.get(key, 'color'), _prefs_fill_color(prefs, key)]
+    if key in ('rect', 'circle', 'line', 'arrow', 'freehand', 'highlight'):
+        return [prefs.get(key, 'color')]
+    if key == 'bubble':
+        return [prefs.get('bubble', 'fg'), prefs.get('bubble', 'bg')]
+    if key == 'marker':
+        return [prefs.get('marker', 'bg'), prefs.get('marker', 'fg')]
+    if key == 'text':
+        cols = [prefs.get('text', 'color')]
+        if prefs.get('text', 'hl_on'):
+            cols.append(prefs.get('text', 'hl'))
+        return cols
+    return []
 
 
 class HighlightRectItem(QGraphicsRectItem):
@@ -2755,14 +3968,17 @@ class HighlightRectItem(QGraphicsRectItem):
         event.accept()
 
     def _open_edit_dialog(self, event=None):
-        dlg = HighlightEditDialog(self._color)
+        host = _find_options_host(self)
+        if host is not None:
+            host._edit_item(self)
+            return
+        dlg = HighlightEditDialog(self._color, target_item=self)   # standalone fallback
         _set_dialog_on_top(dlg)
-        # Show near the item
         if event:
             dlg.move(event.screenPos())
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_color = dlg.result_color()
-            self._color = new_color
+            dlg.restore_original()
+            self._color = dlg.result_color()
             self.setPen(Qt.PenStyle.NoPen)
             self.setBrush(QBrush(self._color))
             self.update()
@@ -3231,193 +4447,6 @@ class ArrowItem(QGraphicsLineItem):
             super().mouseReleaseEvent(event)
 
 
-class ArrowEditDialog(QDialog):
-    """Edit dialog for Arrow items — head style (single at end / single at
-    start / double / none), line width (spin box + slider, synced), and
-    color.
-
-    If *target_item* (an ArrowItem already on the canvas) is given, every
-    change made in the dialog — head style, width, color — is applied to
-    it immediately, live, so the user sees the arrow update on the canvas
-    as they interact with the dialog. Cancelling restores the item to
-    exactly the values it had when the dialog opened.
-    """
-    def __init__(self, current_width: int, current_color: QColor,
-                 current_head_style: str = 'single', parent=None,
-                 target_item=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("Edit Arrow")
-        self._color = QColor(current_color)
-        self._target_item = target_item
-        self._positioned = False
-
-        # Snapshot of the original state, so Cancel can put it back exactly
-        # the way it was before any live-preview edits.
-        self._orig_width = current_width
-        self._orig_color = QColor(current_color)
-        self._orig_head  = current_head_style
-
-        lay = QVBoxLayout(self)
-
-        # ── Arrowhead style — radio buttons at the top ──────────────────────
-        lay.addWidget(QLabel("Arrowhead:"))
-        head_row = QHBoxLayout()
-        self.rb_single       = QRadioButton("➡️ One head")
-        self.rb_single_start = QRadioButton("⬅️ One head (other side)")
-        self.rb_double       = QRadioButton("↔️ Two heads")
-        self.rb_none         = QRadioButton("— No head")
-        self._head_group = QButtonGroup(self)
-        self._head_group.addButton(self.rb_single)
-        self._head_group.addButton(self.rb_single_start)
-        self._head_group.addButton(self.rb_double)
-        self._head_group.addButton(self.rb_none)
-        head_row.addWidget(self.rb_single)
-        head_row.addWidget(self.rb_single_start)
-        head_row.addWidget(self.rb_double)
-        head_row.addWidget(self.rb_none)
-        lay.addLayout(head_row)
-
-        if current_head_style == ArrowItem.HEAD_DOUBLE:
-            self.rb_double.setChecked(True)
-        elif current_head_style == ArrowItem.HEAD_NONE:
-            self.rb_none.setChecked(True)
-        elif current_head_style == ArrowItem.HEAD_SINGLE_START:
-            self.rb_single_start.setChecked(True)
-        else:
-            self.rb_single.setChecked(True)
-
-        self.rb_single.toggled.connect(self._apply_preview)
-        self.rb_single_start.toggled.connect(self._apply_preview)
-        self.rb_double.toggled.connect(self._apply_preview)
-        self.rb_none.toggled.connect(self._apply_preview)
-
-        # ── Line width: spin box + slider, kept in sync ─────────────────────
-        lay.addWidget(QLabel("Line width:"))
-        width_row = QHBoxLayout()
-        self.spin_width = QSpinBox()
-        self.spin_width.setRange(1, 100)
-        self.spin_width.setValue(current_width)
-        self.spin_width.setSuffix(" px")
-        self.slider_width = QSlider(Qt.Orientation.Horizontal)
-        self.slider_width.setRange(1, 100)
-        self.slider_width.setValue(current_width)
-        width_row.addWidget(self.slider_width)
-        width_row.addWidget(self.spin_width)
-        lay.addLayout(width_row)
-
-        self.spin_width.valueChanged.connect(self._on_spin_width_changed)
-        self.slider_width.valueChanged.connect(self._on_slider_width_changed)
-
-        # ── Color ────────────────────────────────────────────────────────
-        # Embedded inline instead of popping a separate "Select Color"
-        # window: the color dialog is a QWidget under the hood, so giving
-        # it plain Qt.Widget flags and dropping it into this dialog's own
-        # layout folds both windows into one. Its own OK/Cancel row is
-        # hidden (NoButtons) since this dialog's button box at the bottom
-        # already covers that, and every change previews live via
-        # currentColorChanged — same as the head-style / width controls.
-        lay.addWidget(QLabel("Line color:"))
-        self.color_dialog = QColorDialog(self._color, self)
-        self.color_dialog.setWindowFlags(Qt.WindowType.Widget)
-        self.color_dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        self.color_dialog.setOption(QColorDialog.ColorDialogOption.NoButtons, True)
-        self.color_dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
-        self.color_dialog.currentColorChanged.connect(self._on_color_changed)
-        lay.addWidget(self.color_dialog)
-
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                              QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-
-    # ------------------------------------------------------------------
-    # Live preview — push current dialog state onto the target item
-    # ------------------------------------------------------------------
-    def _apply_preview(self, *args):
-        if self._target_item is None:
-            return
-        item = self._target_item
-        pen = item.pen()
-        pen.setWidth(self.spin_width.value())
-        pen.setColor(self._color)
-        item.setPen(pen)
-        item.head_style = self.result_head_style()
-        item.prepareGeometryChange()
-        item.update()
-        if item.scene() is not None:
-            item.scene().update()
-
-    def _restore_original(self):
-        """Put the target item back exactly as it was before previewing."""
-        if self._target_item is None:
-            return
-        item = self._target_item
-        pen = item.pen()
-        pen.setWidth(self._orig_width)
-        pen.setColor(self._orig_color)
-        item.setPen(pen)
-        item.head_style = self._orig_head
-        item.prepareGeometryChange()
-        item.update()
-        if item.scene() is not None:
-            item.scene().update()
-
-    def reject(self):
-        self._restore_original()
-        super().reject()
-
-    # ------------------------------------------------------------------
-    # Show on whichever monitor is currently active, not wherever Qt
-    # would otherwise default to (which on multi-monitor setups can be
-    # the wrong screen entirely, since this dialog gets Qt.Window flags).
-    # ------------------------------------------------------------------
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self._positioned:
-            self._positioned = True
-            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
-            if screen is not None:
-                geo = screen.geometry()
-                size = self.sizeHint()
-                x = geo.x() + (geo.width() - size.width()) // 2
-                y = geo.y() + (geo.height() - size.height()) // 2
-                self.move(x, y)
-
-    def _on_spin_width_changed(self, value):
-        if self.slider_width.value() != value:
-            self.slider_width.blockSignals(True)
-            self.slider_width.setValue(value)
-            self.slider_width.blockSignals(False)
-        self._apply_preview()
-
-    def _on_slider_width_changed(self, value):
-        if self.spin_width.value() != value:
-            self.spin_width.blockSignals(True)
-            self.spin_width.setValue(value)
-            self.spin_width.blockSignals(False)
-        self._apply_preview()
-
-    def _on_color_changed(self, color: QColor):
-        c = QColor(color)
-        c.setAlpha(255)  # arrow lines are always opaque, same as before
-        self._color = c
-        self._apply_preview()
-
-    def result_head_style(self) -> str:
-        if self.rb_double.isChecked():
-            return ArrowItem.HEAD_DOUBLE
-        if self.rb_none.isChecked():
-            return ArrowItem.HEAD_NONE
-        if self.rb_single_start.isChecked():
-            return ArrowItem.HEAD_SINGLE_START
-        return ArrowItem.HEAD_SINGLE
-
-    def result_data(self):
-        """Returns (width, color, head_style)."""
-        return self.spin_width.value(), QColor(self._color), self.result_head_style()
-
-
 class TextBubbleItem(QGraphicsItem):
     """Square text bubble with a draggable cone (spike) handle.
     Cone offset is stored relative to the box centre so it scales
@@ -3643,171 +4672,13 @@ class TextBubbleItem(QGraphicsItem):
 
 # ─── Dialogs for new items ────────────────────────────────────────────────────
 
-class _BubbleInputDialog(QDialog):
-    def __init__(self, fg_color: QColor = None, parent=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("Text Bubble")
-        self.fg_color = fg_color or QColor(Qt.GlobalColor.black)
-        self.bg_color = QColor(230, 230, 230, 240)
-        lay = QVBoxLayout(self)
-        self.edit = QTextEdit()
-        self.edit.setFixedHeight(80)
-        lay.addWidget(QLabel("Text:"))
-        lay.addWidget(self.edit)
-        row = QHBoxLayout()
-        self.btn_fg = QPushButton("Text color")
-        self.btn_fg.clicked.connect(self._pick_fg)
-        self.btn_bg = QPushButton("Background color")
-        self.btn_bg.clicked.connect(self._pick_bg)
-        row.addWidget(self.btn_fg)
-        row.addWidget(self.btn_bg)
-        lay.addLayout(row)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                              QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-        self._update_btn_styles()
-
-    def _pick_fg(self):
-        c = _show_color_dialog(self.fg_color, self, force_opaque=True)
-        if c is not None:
-            self.fg_color = c
-            self._update_btn_styles()
-
-    def _pick_bg(self):
-        c = _show_color_dialog(self.bg_color, self, force_opaque=True)
-        if c is not None:
-            self.bg_color = c
-            self._update_btn_styles()
-
-    def _update_btn_styles(self):
-        c = self.fg_color
-        self.btn_fg.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
-            f"color: {'black' if c.lightness() > 128 else 'white'};")
-        c = self.bg_color
-        self.btn_bg.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
-            f"color: {'black' if c.lightness() > 128 else 'white'};")
-
-    def result_data(self):
-        return self.edit.toPlainText(), self.fg_color, self.bg_color
-
-
-class _BubbleEditDialog(QDialog):
-    """Edit dialog for an existing TextBubbleItem (text + fg/bg colours)."""
-    def __init__(self, fg_color: QColor = None, bg_color: QColor = None,
-                 text: str = "", parent=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("Edit Text Bubble")
-        self.fg_color = QColor(fg_color) if fg_color else QColor(Qt.GlobalColor.black)
-        self.bg_color = QColor(bg_color) if bg_color else QColor(230, 230, 230, 240)
-        lay = QVBoxLayout(self)
-
-        lay.addWidget(QLabel("Text:"))
-        self.edit = QTextEdit()
-        self.edit.setPlainText(text)
-        self.edit.setFixedHeight(80)
-        lay.addWidget(self.edit)
-
-        row = QHBoxLayout()
-        self.btn_fg = QPushButton("Text color")
-        self.btn_fg.clicked.connect(self._pick_fg)
-        self.btn_bg = QPushButton("Background color")
-        self.btn_bg.clicked.connect(self._pick_bg)
-        row.addWidget(self.btn_fg)
-        row.addWidget(self.btn_bg)
-        lay.addLayout(row)
-
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                              QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-        self._update_btn_styles()
-
-    def _pick_fg(self):
-        c = _show_color_dialog(self.fg_color, self, force_opaque=True)
-        if c is not None:
-            self.fg_color = c
-            self._update_btn_styles()
-
-    def _pick_bg(self):
-        c = _show_color_dialog(self.bg_color, self, force_opaque=True)
-        if c is not None:
-            self.bg_color = c
-            self._update_btn_styles()
-
-    def _update_btn_styles(self):
-        c = self.fg_color
-        self.btn_fg.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
-            f"color: {'black' if c.lightness() > 128 else 'white'};")
-        c = self.bg_color
-        self.btn_bg.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
-            f"color: {'black' if c.lightness() > 128 else 'white'};")
-
-    def result_data(self):
-        return self.edit.toPlainText(), self.fg_color, self.bg_color
-
-
-class _MarkerEditDialog(QDialog):
-    def __init__(self, bg_color: QColor = None, text_color: QColor = None, parent=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("Edit Marker")
-        self.bg_color   = bg_color   or QColor(220, 50, 50)
-        self.text_color = text_color or QColor(Qt.GlobalColor.white)
-        lay = QVBoxLayout(self)
-        row = QHBoxLayout()
-        self.btn_bg   = QPushButton("Background color")
-        self.btn_txt  = QPushButton("Text color")
-        self.btn_bg.clicked.connect(self._pick_bg)
-        self.btn_txt.clicked.connect(self._pick_txt)
-        row.addWidget(self.btn_bg)
-        row.addWidget(self.btn_txt)
-        lay.addLayout(row)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                              QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-        self._update_styles()
-
-    def _pick_bg(self):
-        c = _show_color_dialog(self.bg_color, self, force_opaque=True)
-        if c is not None:
-            self.bg_color = c
-            self._update_styles()
-
-    def _pick_txt(self):
-        c = _show_color_dialog(self.text_color, self, force_opaque=True)
-        if c is not None:
-            self.text_color = c
-            self._update_styles()
-
-    def _update_styles(self):
-        c = self.bg_color
-        self.btn_bg.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
-            f"color: {'black' if c.lightness() > 128 else 'white'};")
-        c = self.text_color
-        self.btn_txt.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
-            f"color: {'black' if c.lightness() > 128 else 'white'};")
-
-    def result_data(self):
-        return self.bg_color, self.text_color
-
-
 class _MarkerItem(QGraphicsItem):
     """Numbered circular marker with:
     - a draggable spike handle (visible when selected, drag to reposition tip)
     - a scale handle on the left edge (visible when selected, drag to resize)
     Scaling is always uniform (equal W/H).
     """
-    RADIUS = 14
+    RADIUS = 21          # default marker radius in px (was 14; 1.5x larger)
     HANDLE_RADIUS = 6
 
     def __init__(self, pos: QPointF, number: int):
@@ -3952,6 +4823,9 @@ class _MarkerItem(QGraphicsItem):
             self.prepareGeometryChange()
             self._scale = dist / self.RADIUS
             self.update()
+            _hp = _host_prefs(self)
+            if _hp is not None:
+                _hp.set('marker', 'scale', self._scale)
             event.accept()
             return
         if self._dragging_spike:
@@ -3979,98 +4853,6 @@ class _MarkerItem(QGraphicsItem):
                 return
         self.setCursor(Qt.CursorShape.ArrowCursor)
         super().hoverMoveEvent(event)
-
-class _TextInputDialog(QDialog):
-    def __init__(self, color, parent=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("Add Text")
-        self.color = color
-        lay = QVBoxLayout(self)
-        self.edit = QTextEdit(); self.edit.setFixedHeight(80)
-        lay.addWidget(QLabel("Text:")); lay.addWidget(self.edit)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Font size:"))
-        self.sz = QSpinBox(); self.sz.setRange(6, 120); self.sz.setValue(18)
-        row.addWidget(self.sz)
-        lay.addLayout(row)
-        row2 = QHBoxLayout()
-        self.btn_col = QPushButton("Text color"); self.btn_col.clicked.connect(self._pick_col)
-        self.btn_hl  = QPushButton("Highlight"); self.btn_hl.clicked.connect(self._pick_hl)
-        row2.addWidget(self.btn_col); row2.addWidget(self.btn_hl)
-        lay.addLayout(row2)
-
-        # ── Highlight options ────────────────────────────────────────────────
-        hl_row = QHBoxLayout()
-        self.chk_hl = QCheckBox("Enable highlight")
-        self.chk_hl.setChecked(True)
-        hl_row.addWidget(self.chk_hl)
-        hl_row.addWidget(QLabel("Padding:"))
-        self.hl_pad = QSpinBox(); self.hl_pad.setRange(0, 40); self.hl_pad.setValue(0)
-        self.hl_pad.setSuffix(" px")
-        hl_row.addWidget(self.hl_pad)
-        hl_row.addStretch()
-        lay.addLayout(hl_row)
-
-        # ── Outline options ──────────────────────────────────────────────────
-        ol_row = QHBoxLayout()
-        self.chk_ol = QCheckBox("Enable outline")
-        self.chk_ol.setChecked(False)
-        ol_row.addWidget(self.chk_ol)
-        ol_row.addWidget(QLabel("Width:"))
-        self.ol_width = QSpinBox(); self.ol_width.setRange(1, 20); self.ol_width.setValue(2)
-        self.ol_width.setSuffix(" px")
-        ol_row.addWidget(self.ol_width)
-        self.btn_ol_color = QPushButton("Outline color")
-        self.btn_ol_color.clicked.connect(self._pick_ol_color)
-        ol_row.addWidget(self.btn_ol_color)
-        ol_row.addStretch()
-        lay.addLayout(ol_row)
-
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-        self.highlight = QColor(255, 255, 0, 255)  # fully opaque yellow highlight by default
-        self.outline_color = QColor(0, 0, 0)       # default outline color: black
-        self._update_btn_color()
-
-    def _pick_col(self):
-        c = _show_color_dialog(self.color, self, force_opaque=True)
-        if c is not None:
-            self.color = c
-            self._update_btn_color()
-
-    def _pick_hl(self):
-        # Highlight color keeps alpha (intentionally semi-transparent)
-        c = _show_color_dialog(self.highlight, self)
-        if c is not None:
-            self.highlight = c
-            self._update_btn_color()
-
-    def _pick_ol_color(self):
-        c = _show_color_dialog(self.outline_color, self, force_opaque=True)
-        if c is not None:
-            self.outline_color = c
-            self._update_btn_color()
-
-    def _update_btn_color(self):
-        c = self.color
-        self.btn_col.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
-            f"color: {'black' if c.lightness() > 128 else 'white'}; border: 1px solid #888;")
-        hl = self.highlight
-        self.btn_hl.setStyleSheet(
-            f"background: rgba({hl.red()},{hl.green()},{hl.blue()},{hl.alphaF():.2f}); "
-            f"color: {'black' if hl.lightness() > 128 else 'white'}; border: 1px solid #888;")
-        if hasattr(self, 'btn_ol_color'):
-            ol = self.outline_color
-            self.btn_ol_color.setStyleSheet(
-                f"background: rgba({ol.red()},{ol.green()},{ol.blue()},{ol.alphaF():.2f}); "
-                f"color: {'black' if ol.lightness() > 128 else 'white'}; border: 1px solid #888;")
-
-    def result_data(self):
-        return (self.edit.toPlainText(), self.sz.value(), self.color, self.highlight,
-                self.chk_hl.isChecked(), self.hl_pad.value(),
-                self.chk_ol.isChecked(), self.ol_width.value(), self.outline_color)
 
 class StandardRegionSnapshotThread(QThread):
     """
@@ -4202,20 +4984,12 @@ class EnhancedRegionSelector(QWidget):
         self._drag_start        = None      # QPoint local
         self._drag_end          = None
         self._dragging          = False
-        self._draw_color        = QColor(255, 0, 0)
-        self._draw_width        = 3
-        self._rect_radius       = 0.0       # Rectangle tool corner rounding (px)
+        # Every annotation tool keeps its OWN colour/width/etc. here (see _ToolPrefs)
+        self._prefs             = _ToolPrefs(width=3, font_size=18)
+        self._last_draw_key     = 'rect'    # last tool that has options (for ⚙ with Select active)
         self._clip_start        = None      # Screen-clip tool drag (global Qt coords)
         self._clip_end          = None
         self._hide_bg           = False
-        # Arrow tool: default arrowhead style ('single' / 'double' / 'none')
-        self._arrow_head_style  = ArrowItem.HEAD_SINGLE
-        # Freehand tool keeps its own independent color and width
-        self._freehand_color    = QColor(255, 0, 0)
-        self._freehand_width    = 3
-        # Marker and Bubble tools each keep their own independent color
-        self._marker_color      = QColor(255, 0, 0)
-        self._bubble_color      = QColor(255, 0, 0)
 
         # Drawing state
         self._draw_start_scene   = None     # QPointF scene coords
@@ -4510,31 +5284,39 @@ class EnhancedRegionSelector(QWidget):
     #  Toolbar
     # ══════════════════════════════════════════════════════════════════════════
 
+    _TOOL_KEYS = {
+        TOOL_RECT: 'rect', TOOL_CIRCLE: 'circle', TOOL_LINE: 'line',
+        TOOL_ARROW: 'arrow', TOOL_FREEHAND: 'freehand', TOOL_HIGHLIGHT: 'highlight',
+        TOOL_BUBBLE: 'bubble', TOOL_MARKER: 'marker', TOOL_TEXT: 'text',
+    }
+
+    def _tool_key(self, tool=None):
+        """_ToolPrefs key of a drawing tool (None for Select/Clip/Image/…)."""
+        return self._TOOL_KEYS.get(tool if tool is not None else self._current_tool)
+
+    def _active_key(self):
+        """Tool whose options the ⚙ button edits when nothing is selected."""
+        return self._tool_key() or self._last_draw_key
+
+    def _selected_editable_item(self):
+        for it in self._canvas._scene.selectedItems():
+            if _prefs_key_for_item(it):
+                return it
+        return None
+
+    def _refresh_swatch(self):
+        """Toolbar swatch = colours of the selected object, else of the active tool."""
+        if not hasattr(self, '_color_preview'):
+            return
+        item = self._selected_editable_item()
+        colors = (_item_swatch_colors(_prefs_key_for_item(item), item)
+                  if item is not None else
+                  _prefs_swatch_colors(self._active_key(), self._prefs))
+        self._color_preview.set_colors(colors or [QColor(128, 128, 128)])
+
     def _on_selection_changed(self):
-        """Called when scene selection changes.
-        If a FreehandItem is selected, update the toolbar color swatch and
-        sync _freehand_width/_freehand_color so the Edit dialog pre-fills correctly."""
-        selected = self._canvas._scene.selectedItems()
-        for item in selected:
-            if isinstance(item, FreehandItem):
-                w = item.pen().width()
-                c = item.pen().color()
-                self._freehand_width = w if w > 0 else self._freehand_width
-                self._freehand_color = QColor(c)
-                self._color_preview.setStyleSheet(
-                    f"background:{c.name()}; border:1px solid white; border-radius:3px;")
-                return
-        # No freehand item in selection — restore swatch to the active tool color
-        if self._current_tool == self.TOOL_FREEHAND:
-            swatch = self._freehand_color
-        elif self._current_tool == self.TOOL_MARKER:
-            swatch = self._marker_color
-        elif self._current_tool == self.TOOL_BUBBLE:
-            swatch = self._bubble_color
-        else:
-            swatch = self._draw_color
-        self._color_preview.setStyleSheet(
-            f"background:rgba({swatch.red()},{swatch.green()},{swatch.blue()},{swatch.alphaF():.2f}); border:1px solid white; border-radius:3px;")
+        """Scene selection changed → show the selected object's colours."""
+        self._refresh_swatch()
 
     def _build_toolbar(self):
         bar = QWidget(self,
@@ -4674,7 +5456,7 @@ class EnhancedRegionSelector(QWidget):
             (self.TOOL_TEXT,      "T",   "Add text annotation"),
             (self.TOOL_IMAGE,     "🖼️",  "Import image onto canvas"),
             (self.TOOL_CLIP,      None,  "Cut a rectangular piece of the screen and place it on the canvas as an image"),
-            (self.TOOL_COLOR,     None,  "Change annotation color / width"),
+            (self.TOOL_COLOR,     None,  "Tool options — colours, width, …  (edits the selected object, or the active tool's defaults)"),
         ]
         self._tool_btns = {}
         for tid, icon, tip in tools:
@@ -4710,12 +5492,10 @@ class EnhancedRegionSelector(QWidget):
             self._tool_btns[tid] = btn
         #self._tool_btns[self.TOOL_RECT].setChecked(True)
 
-        # Color swatch
-        self._color_preview = QLabel()
-        self._color_preview.setFixedSize(18, 18)
-        self._color_preview.setStyleSheet(
-            f"background:{self._draw_color.name()}; border:1px solid white; border-radius:3px;")
+        # Colour swatch (mirrors the colours the ⚙ options window edits)
+        self._color_preview = _ColorSwatch()
         lay.addWidget(self._color_preview)
+        self._refresh_swatch()
 
         lay.addSpacing(6)
 
@@ -4792,88 +5572,8 @@ class EnhancedRegionSelector(QWidget):
         if tool_id == self.TOOL_IMAGE:
             self._import_image(); return
         if tool_id == self.TOOL_COLOR:
-            # In Freehand mode: always show the Freehand edit dialog (width + color)
-            if self._current_tool == self.TOOL_FREEHAND:
-                selected = self._canvas._scene.selectedItems()
-                freehand_items = [i for i in selected if isinstance(i, FreehandItem)]
-                if freehand_items:
-                    # Edit the selected freehand item's properties
-                    item = freehand_items[0]
-                    dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
-                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                        new_width, new_color = dlg.result_data()
-                        pen = item.pen()
-                        pen.setWidth(new_width)
-                        pen.setColor(new_color)
-                        item.setPen(pen)
-                        item.update()
-                        # Save into freehand-specific slots
-                        self._freehand_width = new_width
-                        self._freehand_color = QColor(new_color)
-                        self._color_preview.setStyleSheet(
-                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
-                        if hasattr(self, 'spin'):
-                            self.spin.blockSignals(True)
-                            self.spin.setValue(new_width)
-                            self.spin.blockSignals(False)
-                else:
-                    # No freehand item selected — edit default stroke width/color for Freehand tool
-                    dlg = FreehandEditDialog(self._freehand_width, self._freehand_color, self)
-                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                        new_width, new_color = dlg.result_data()
-                        self._freehand_width = new_width
-                        self._freehand_color = QColor(new_color)
-                        self._color_preview.setStyleSheet(
-                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
-                        if hasattr(self, 'spin'):
-                            self.spin.blockSignals(True)
-                            self.spin.setValue(new_width)
-                            self.spin.blockSignals(False)
-                return
-            # In Arrow mode: always show the Arrow edit dialog (head style + width + color)
-            if self._current_tool == self.TOOL_ARROW:
-                selected = self._canvas._scene.selectedItems()
-                arrow_items = [i for i in selected if isinstance(i, ArrowItem)]
-                if arrow_items:
-                    item = arrow_items[0]
-                    dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
-                                          getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
-                                          target_item=item)
-                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                        new_width, new_color, new_head = dlg.result_data()
-                        pen = item.pen()
-                        pen.setWidth(new_width)
-                        pen.setColor(new_color)
-                        item.setPen(pen)
-                        item.head_style = new_head
-                        item.prepareGeometryChange()
-                        item.update()
-                        self._draw_width = new_width
-                        self._draw_color = QColor(new_color)
-                        self._arrow_head_style = new_head
-                        self._color_preview.setStyleSheet(
-                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
-                        if hasattr(self, 'spin'):
-                            self.spin.blockSignals(True)
-                            self.spin.setValue(new_width)
-                            self.spin.blockSignals(False)
-                else:
-                    # No arrow selected — edit default style/width/color for the Arrow tool
-                    dlg = ArrowEditDialog(self._draw_width, self._draw_color,
-                                          self._arrow_head_style, self)
-                    if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                        new_width, new_color, new_head = dlg.result_data()
-                        self._draw_width = new_width
-                        self._draw_color = QColor(new_color)
-                        self._arrow_head_style = new_head
-                        self._color_preview.setStyleSheet(
-                            f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
-                        if hasattr(self, 'spin'):
-                            self.spin.blockSignals(True)
-                            self.spin.setValue(new_width)
-                            self.spin.blockSignals(False)
-                return
-            self._pick_color(); return
+            self._open_tool_options()
+            return
 
         # Reset drawing state when switching tools to avoid stale start position
         self._draw_start_scene = None
@@ -4892,17 +5592,12 @@ class EnhancedRegionSelector(QWidget):
         for tid, btn in self._tool_btns.items():
             if btn.isCheckable():
                 btn.setChecked(tid == tool_id)
-        # Update color swatch: each independent tool has its own color
-        if tool_id == self.TOOL_FREEHAND:
-            swatch_color = self._freehand_color
-        elif tool_id == self.TOOL_MARKER:
-            swatch_color = self._marker_color
-        elif tool_id == self.TOOL_BUBBLE:
-            swatch_color = self._bubble_color
-        else:
-            swatch_color = self._draw_color
-        self._color_preview.setStyleSheet(
-            f"background:rgba({swatch_color.red()},{swatch_color.green()},{swatch_color.blue()},{swatch_color.alphaF():.2f}); border:1px solid white; border-radius:3px;")
+        # Remember the last tool that has options, then re-point the swatch at
+        # the newly selected tool's own (independent) settings.
+        _k = self._tool_key(tool_id)
+        if _k:
+            self._last_draw_key = _k
+        self._refresh_swatch()
 
         # Show/hide capture button
         if self._is_draw_tool(tool_id):
@@ -4978,209 +5673,56 @@ class EnhancedRegionSelector(QWidget):
 
     
 
-    def _pick_color(self):
-        """Open a context-aware edit dialog for the selected item, or a plain
-        colour picker if no item is selected / the item has no dedicated dialog."""
-        self._toolbar.hide()
-        self.releaseKeyboard()
-
-        selected = self._canvas._scene.selectedItems()
-
-        if selected:
-            item = selected[0]
-            handled = self._open_item_edit_dialog(item)
-            if not handled:
-                # Fallback: plain colour picker applied to selected item
-                self._open_generic_color_picker(apply_to_item=item)
-        elif self._current_tool == self.TOOL_RECT:
-            # No selection, Rectangle tool: width + colour + corner rounding defaults
-            self._open_rect_defaults_dialog()
+    # ── Tool options (same window + logic as the Image Editor) ───────────────
+    def _open_tool_options(self):
+        """⚙ button: edit the selected object — or, with nothing selected, the
+        remembered defaults of the active tool."""
+        item = self._selected_editable_item()
+        if item is not None:
+            self._open_item_edit_dialog(item)
         else:
-            # No selection — just pick the drawing colour
-            self._open_generic_color_picker(apply_to_item=None)
+            self._open_defaults_dialog(self._active_key())
 
-        self._toolbar.show()
-        self.activateWindow(); self.setFocus()
-        self.grabKeyboard()
+    def _pick_color(self):                 # legacy name
+        self._open_tool_options()
+
+    def _open_defaults_dialog(self, key):
+        dlg = _build_options_dialog(key, self, self._prefs, allow_fill=True)
+        if dlg is None:
+            return
+        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+            _store_dialog_in_prefs(key, dlg, self._prefs, allow_fill=True)
+        self._refresh_swatch()
 
     def _open_item_edit_dialog(self, item) -> bool:
-        """Open the dedicated edit dialog for *item*.
-        Returns True if a dedicated dialog was shown, False otherwise."""
-        if isinstance(item, HighlightRectItem):
-            dlg = HighlightEditDialog(item._color, self)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                self._canvas.push_undo()
-                new_color = dlg.result_color()
-                item._color = new_color
-                border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
-                item.setPen(QPen(border, 1.5))
-                item.setBrush(QBrush(new_color))
-                item.update()
-            return True
-
-        if isinstance(item, TextBubbleItem):
-            dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                self._canvas.push_undo()
-                text, fg, bg = dlg.result_data()
-                item._text     = text
-                item._fg_color = fg
-                item._bg_color = bg
-                item.update()
-            return True
-
-        if isinstance(item, _MarkerItem):
-            dlg = _MarkerEditDialog(
-                QColor(item._bg_color),
-                QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
-                self)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                self._canvas.push_undo()
-                item._bg_color   = dlg.bg_color
-                item._text_color = dlg.text_color
-                item.update()
-            return True
-
-        if isinstance(item, FreehandItem):
-            dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                self._canvas.push_undo()
-                new_width, new_color = dlg.result_data()
-                pen = item.pen()
-                pen.setWidth(new_width)
-                pen.setColor(new_color)
-                item.setPen(pen)
-                item.update()
-                # Save into freehand-specific slots (independent from other tools)
-                self._freehand_width = new_width
-                self._freehand_color = QColor(new_color)
-                self._color_preview.setStyleSheet(
-                    f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
-                if hasattr(self, 'spin'):
-                    self.spin.blockSignals(True)
-                    self.spin.setValue(new_width)
-                    self.spin.blockSignals(False)
-            return True
-
-        if isinstance(item, ArrowItem):
-            dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
-                                  getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
-                                  target_item=item)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                self._canvas.push_undo()
-                new_width, new_color, new_head = dlg.result_data()
-                pen = item.pen()
-                pen.setWidth(new_width)
-                pen.setColor(new_color)
-                item.setPen(pen)
-                item.head_style = new_head
-                item.prepareGeometryChange()
-                item.update()
-                self._draw_width = new_width
-                self._draw_color = QColor(new_color)
-                self._arrow_head_style = new_head
-                self._color_preview.setStyleSheet(
-                    f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
-                if hasattr(self, 'spin'):
-                    self.spin.blockSignals(True)
-                    self.spin.setValue(new_width)
-                    self.spin.blockSignals(False)
-            return True
-
-        if isinstance(item, ResizableRectItem):
-            dlg = RectEditDialog(item.pen().width(), item.pen().color(),
-                                 item.corner_radius, self, target_item=item)
-            if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-                new_width, new_color, new_radius = dlg.result_data()
-                dlg.restore_original()          # undo snapshot = state before the edit
-                self._canvas.push_undo()
-                self._apply_rect_settings(item, new_width, new_color, new_radius)
-            return True
-
-        return False  # no dedicated dialog for this type
-
-    def _open_generic_color_picker(self, apply_to_item=None):
-        """Show a plain QColorDialog and apply result to the drawing colour
-        and optionally to *apply_to_item*.
-        Highlight keeps its own alpha; all other tools preserve user-chosen alpha."""
-        is_highlight = isinstance(apply_to_item, HighlightRectItem)
-
-        # Pick the right source color for the current tool so the dialog opens
-        # with whatever the user last chose (including their alpha value).
-        if self._current_tool == self.TOOL_FREEHAND:
-            init_color = QColor(self._freehand_color)
-        elif self._current_tool == self.TOOL_MARKER:
-            init_color = QColor(self._marker_color)
-        elif self._current_tool == self.TOOL_BUBBLE:
-            init_color = QColor(self._bubble_color)
-        else:
-            init_color = QColor(self._draw_color)
-
-        # For non-highlight tools: if alpha is 0 (uninitialised), default to 255.
-        # Otherwise keep whatever the user previously set.
-        if not is_highlight and init_color.alpha() == 0:
-            init_color.setAlpha(255)
-
-        # Use _show_color_dialog so the Linux alpha=0 bug fix is applied.
-        c = _show_color_dialog(init_color, self, alpha=True)
-        if c is not None and c.isValid():
-            # Save color into the correct per-tool slot
-            if self._current_tool == self.TOOL_FREEHAND:
-                self._freehand_color = c
-            elif self._current_tool == self.TOOL_MARKER:
-                self._marker_color = c
-            elif self._current_tool == self.TOOL_BUBBLE:
-                self._bubble_color = c
-            else:
-                self._draw_color = c
-                self._color_preview.setStyleSheet(
-                    f"background:rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); border:1px solid white; border-radius:3px;")
-                if apply_to_item is not None:
-                    self._canvas.push_undo()
-                    # Preserve the item's current pen width instead of resetting to default
-                    current_width = (apply_to_item.pen().width()
-                                     if hasattr(apply_to_item, 'pen')
-                                     else self._draw_width)
-                    self._canvas._apply_props(apply_to_item, c, current_width)
-                    if hasattr(apply_to_item, 'setDefaultTextColor'):
-                        apply_to_item.setDefaultTextColor(c)
-                    apply_to_item.update()
-
-    # ── Rectangle settings (width / colour / corner rounding) ─────────────────
-    def _apply_rect_settings(self, item, width, color, radius):
-        """Apply RectEditDialog results to `item` (may be None = only defaults)
-        and remember them as the Rectangle tool's defaults."""
-        color = QColor(color)
-        if item is not None:
-            pen = item.pen()
-            pen.setWidth(int(width))
-            pen.setColor(color)
-            item.setPen(pen)
-            b = item.brush()
-            if b.style() != Qt.BrushStyle.NoBrush and b.color().alpha() > 0:
-                item.setBrush(QBrush(color))
-            item.corner_radius = float(radius)
-            item.prepareGeometryChange()
-            item.update()
-        self._draw_width = int(width)
-        self._draw_color = QColor(color)
-        self._rect_radius = float(radius)
-        self._color_preview.setStyleSheet(
-            f"background:rgba({color.red()},{color.green()},{color.blue()},{color.alphaF():.2f}); "
-            f"border:1px solid white; border-radius:3px;")
-        if hasattr(self, 'spin'):
-            self.spin.blockSignals(True)
-            self.spin.setValue(int(width))
-            self.spin.blockSignals(False)
-
-    def _open_rect_defaults_dialog(self):
-        dlg = RectEditDialog(self._draw_width, self._draw_color, self._rect_radius, self)
+        """Options window for *item* with live preview. On OK the new values
+        are applied (one undo step) and remembered as that tool's defaults.
+        Returns True if a dialog was shown."""
+        key = _prefs_key_for_item(item)
+        if key is None:
+            return False
+        dlg = _build_options_dialog(key, self, self._prefs, item=item, allow_fill=True)
+        if dlg is None:
+            return False
         if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-            w, c, r = dlg.result_data()
-            self._apply_rect_settings(None, w, c, r)
+            dlg.restore_original()          # undo snapshot = state before the edit
+            if key in ('bubble', 'text') and not dlg.edit.toPlainText().strip():
+                if key == 'text':           # emptied text annotation = delete it
+                    self._canvas.push_undo()
+                    self._canvas._scene.removeItem(item)
+            else:
+                self._canvas.push_undo()
+                _commit_item_dialog(key, dlg, item, allow_fill=True)
+                _store_dialog_in_prefs(key, dlg, self._prefs, allow_fill=True)
+            self._canvas._scene.update()
+        self._refresh_swatch()
+        return True
 
     def _edit_rect(self, item):
         self._open_item_edit_dialog(item)
+
+    def _edit_item(self, item) -> bool:    # public name shared with ImageEditorWindow
+        return self._open_item_edit_dialog(item)
 
     # ── Screen clip tool: cut a piece of the real screen onto the canvas ──────
     def _logical_rect_to_physical(self, global_rect: QRect):
@@ -5610,14 +6152,19 @@ class EnhancedRegionSelector(QWidget):
         self._canvas.push_undo()
 
         if self._current_tool == self.TOOL_FREEHAND:
-            self._canvas.begin_freehand(scene_pos, self._freehand_color, self._freehand_width)
+            self._canvas.begin_freehand(scene_pos, self._prefs.get('freehand', 'color'),
+                                        self._prefs.get('freehand', 'width'))
 
         elif self._current_tool == self.TOOL_MARKER:
-            self._canvas.add_marker(scene_pos, self._marker_color)
+            self._canvas.add_marker(scene_pos, self._prefs.get('marker', 'bg'),
+                                    self._prefs.get('marker', 'fg'),
+                                    self._prefs.get('marker', 'scale'))
 
         elif self._current_tool == self.TOOL_TEXT:
-            dlg = _TextInputDialog(QColor(self._draw_color), self)
+            _tp = self._prefs.all('text')
+            dlg = _TextInputDialog(_tp['color'], self, state=_tp)
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
+                _store_dialog_in_prefs('text', dlg, self._prefs)
                 txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
                 if txt.strip():
                     item = self._canvas.add_text(scene_pos, txt, fsz, col, hl)
@@ -5630,9 +6177,11 @@ class EnhancedRegionSelector(QWidget):
             self._select_tool(self.TOOL_SELECT)
 
         elif self._current_tool == self.TOOL_BUBBLE:
-            dlg = _BubbleInputDialog(QColor(self._bubble_color), self)
+            dlg = _BubbleInputDialog(self._prefs.get('bubble', 'fg'), self,
+                                     self._prefs.get('bubble', 'bg'))
             if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
+                self._prefs.update('bubble', fg=fg_col, bg=bg_col)
                 if txt.strip():
                     self._canvas.add_bubble(scene_pos, txt, fg_col, bg_col)
             # After placing bubble, switch to SELECT so other tools work normally
@@ -5756,12 +6305,15 @@ class EnhancedRegionSelector(QWidget):
                 self._preview_item = None
             if self._current_tool == self.TOOL_RECT:
                 self._preview_item = self._canvas.add_rect(
-                    r, self._draw_color, self._draw_width, self._rect_radius)
+                    r, self._prefs.get('rect', 'color'), self._prefs.get('rect', 'width'),
+                    self._prefs.get('rect', 'radius'),
+                    _prefs_fill_color(self._prefs, 'rect') if self._prefs.get('rect', 'fill') else None)
             elif self._current_tool == self.TOOL_HIGHLIGHT:
-                self._preview_item = self._canvas.add_highlight(r)
+                self._preview_item = self._canvas.add_highlight(r, self._prefs.get('highlight', 'color'))
             elif self._current_tool == self.TOOL_CIRCLE:
                 self._preview_item = self._canvas.add_ellipse(
-                    r, self._draw_color, self._draw_width)
+                    r, self._prefs.get('circle', 'color'), self._prefs.get('circle', 'width'),
+                    _prefs_fill_color(self._prefs, 'circle') if self._prefs.get('circle', 'fill') else None)
             elif self._current_tool == self.TOOL_LINE:
                 end_pos = scene_pos
                 if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -5775,7 +6327,7 @@ class EnhancedRegionSelector(QWidget):
                         self._draw_start_scene.y() + dist * math.sin(math.radians(snapped)))
                 self._preview_item = self._canvas.add_line(
                     QLineF(self._alt_line_start(end_pos, e), end_pos),
-                    self._draw_color, self._draw_width)
+                    self._prefs.get('line', 'color'), self._prefs.get('line', 'width'))
             elif self._current_tool == self.TOOL_ARROW:
                 end_pos = scene_pos
                 if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -5789,7 +6341,8 @@ class EnhancedRegionSelector(QWidget):
                         self._draw_start_scene.y() + dist * math.sin(math.radians(snapped)))
                 self._preview_item = self._canvas.add_arrow(
                     QLineF(self._alt_line_start(end_pos, e), end_pos),
-                    self._draw_color, self._draw_width, self._arrow_head_style)
+                    self._prefs.get('arrow', 'color'), self._prefs.get('arrow', 'width'),
+                    self._prefs.get('arrow', 'head'))
 
     def _alt_line_start(self, end_pos, e):
         """Line/arrow start point: the press point, or (Alt held) its mirror
@@ -5916,30 +6469,12 @@ class EnhancedRegionSelector(QWidget):
             elif isinstance(item, ArrowItem):
                 self._edit_arrow(item)
 
-            elif isinstance(item, ResizableRectItem):
-                self._edit_rect(item)
+            elif isinstance(item, (ResizableRectItem, ResizableEllipseItem, LineItem)):
+                self._open_item_edit_dialog(item)
 
     def _edit_arrow(self, item):
-        """Open ArrowEditDialog for a selected ArrowItem — live-previews
-        head style / width / color onto the item as the dialog is used."""
-        dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
-                              getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
-                              target_item=item)
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-            self._canvas.push_undo()
-            new_width, new_color, new_head = dlg.result_data()
-            pen = item.pen()
-            pen.setWidth(new_width)
-            pen.setColor(new_color)
-            item.setPen(pen)
-            item.head_style = new_head
-            item.prepareGeometryChange()
-            item.update()
-            self._draw_width = new_width
-            self._draw_color = QColor(new_color)
-            self._arrow_head_style = new_head
-            self._color_preview.setStyleSheet(
-                f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
+        """Arrow options window (live preview) — see _open_item_edit_dialog."""
+        self._open_item_edit_dialog(item)
 
     def _straighten_arrow(self, item):
         """Reset the bend/break point so the arrow is a straight line again."""
@@ -5948,91 +6483,11 @@ class EnhancedRegionSelector(QWidget):
         item._bend = QPointF(0.0, 0.0)
         item.update()
 
-    def _edit_freehand(self, item):
-        """Open FreehandEditDialog for a selected FreehandItem — same UI/logic as Image Editor."""
-        dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-            self._canvas.push_undo()
-            new_width, new_color = dlg.result_data()
-            pen = item.pen()
-            pen.setWidth(new_width)
-            pen.setColor(new_color)
-            item.setPen(pen)
-            item.update()
-            # Keep freehand-specific defaults in sync for future strokes
-            self._freehand_width = new_width
-            self._freehand_color = QColor(new_color)
-            # Update color swatch on toolbar
-            self._color_preview.setStyleSheet(
-                f"background:{new_color.name()}; border:1px solid white; border-radius:3px;")
-
-    def _edit_text(self, item):
-        # Pre-fill dialog with existing text item data
-        dlg = _TextInputDialog(item.defaultTextColor(), self)
-        dlg.edit.setPlainText(item.toPlainText())
-        dlg.sz.setValue(item.font().pointSize())
-        if hasattr(item, 'highlight_color'):
-            dlg.highlight = item.highlight_color
-        dlg.chk_hl.setChecked(getattr(item, 'highlight_enabled', True))
-        dlg.hl_pad.setValue(getattr(item, 'highlight_padding', 0))
-        dlg.chk_ol.setChecked(getattr(item, 'outline_enabled', False))
-        dlg.ol_width.setValue(getattr(item, 'outline_width', 2))
-        dlg.outline_color = QColor(getattr(item, 'outline_color', QColor(0, 0, 0)))
-        dlg._update_btn_color()
-
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-            txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
-            self._canvas.push_undo()
-            if txt.strip():
-                item.setPlainText(txt)
-                item.setFont(QFont("Arial", fsz))
-                item.setDefaultTextColor(col)
-                item.highlight_color   = hl
-                item.highlight_enabled = hl_on
-                item.highlight_padding = hl_pad
-                item.outline_enabled   = ol_on
-                item.outline_width     = ol_w
-                item.outline_color     = ol_col
-                item.update()
-            else:
-                self._canvas._scene.removeItem(item)
-
-    def _edit_bubble(self, item):
-        dlg = _BubbleInputDialog(item._fg_color, self)
-        dlg.edit.setPlainText(item._text)
-        dlg.bg_color = item._bg_color
-        dlg._update_btn_styles()
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-            txt, fg_col, bg_col = dlg.result_data()
-            if txt.strip():
-                self._canvas.push_undo()
-                item._text = txt
-                item._fg_color = fg_col
-                item._bg_color = bg_col
-                item.prepareGeometryChange()
-                item.update()
-
-    def _edit_marker(self, item):
-        dlg = _MarkerEditDialog(item._bg_color,
-                                getattr(item, '_text_color', QColor(Qt.GlobalColor.white)),
-                                self)
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-            self._canvas.push_undo()
-            bg, fg = dlg.result_data()
-            item._bg_color = bg
-            item._text_color = fg
-            item.update()
-
-    def _edit_highlight(self, item):
-        dlg = HighlightEditDialog(item._color, self)
-        if self._exec_dialog(dlg) == QDialog.DialogCode.Accepted:
-            self._canvas.push_undo()
-            new_color = dlg.result_color()
-            item._color = new_color
-            border = QColor(new_color.red(), new_color.green(), new_color.blue(), 160)
-            item.setPen(QPen(border, 1.5))
-            item.setBrush(QBrush(new_color))
-            item.update()
+    def _edit_freehand(self, item):   self._open_item_edit_dialog(item)
+    def _edit_text(self, item):       self._open_item_edit_dialog(item)
+    def _edit_bubble(self, item):     self._open_item_edit_dialog(item)
+    def _edit_marker(self, item):     self._open_item_edit_dialog(item)
+    def _edit_highlight(self, item):  self._open_item_edit_dialog(item)
 
     def contextMenuEvent(self, e):
         lpos = e.pos()
@@ -6115,10 +6570,14 @@ class EnhancedRegionSelector(QWidget):
                     self._canvas.push_undo()
                     self._canvas._scene.removeItem(item)
             else:
+                edit_act = (menu.addAction("✏️ Edit")
+                            if _prefs_key_for_item(item) in ('rect', 'circle', 'line') else None)
                 dup_act = menu.addAction("⧉ Duplicate")
                 del_act = menu.addAction("🗑️ Delete")
                 action = menu.exec(e.globalPos())
-                if action == dup_act:
+                if edit_act is not None and action == edit_act:
+                    self._open_item_edit_dialog(item)
+                elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
                     self._canvas.push_undo()
@@ -8479,183 +8938,6 @@ class ImageEditorStartDialog(QDialog):
 #  FINAL IMAGE EDITOR (FIXED SCALING, DELETE, SAVE AS & CTRL PROPORTIONS)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class FreehandEditDialog(QDialog):
-    """Edit dialog for Freehand strokes — line width and color."""
-    def __init__(self, current_width: int, current_color: QColor, parent=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("Edit Freehand")
-        self._width = current_width
-        self._color = QColor(current_color)
-        lay = QVBoxLayout(self)
-
-        # Line width
-        width_row = QHBoxLayout()
-        width_row.addWidget(QLabel("Line width:"))
-        self.spin_width = QSpinBox()
-        self.spin_width.setRange(1, 100)
-        self.spin_width.setValue(current_width)
-        self.spin_width.setSuffix(" px")
-        width_row.addWidget(self.spin_width)
-        lay.addLayout(width_row)
-
-        # Line color
-        color_row = QHBoxLayout()
-        color_row.addWidget(QLabel("Line color:"))
-        self.btn_color = QPushButton()
-        self.btn_color.setFixedSize(80, 28)
-        self.btn_color.clicked.connect(self._pick_color)
-        color_row.addWidget(self.btn_color)
-        lay.addLayout(color_row)
-
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                              QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-        self._update_btn()
-
-    def _pick_color(self):
-        c = _show_color_dialog(self._color, self, force_opaque=True)
-        if c is not None:
-            self._color = c
-            self._update_btn()
-
-    def _update_btn(self):
-        c = self._color
-        self.btn_color.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},1.0); "
-            f"color: {'black' if c.lightness() > 128 else 'white'}; border: 1px solid #888;")
-
-    def result_data(self):
-        return self.spin_width.value(), QColor(self._color)
-
-
-class RectEditDialog(QDialog):
-    """Settings dialog for the Rectangle tool / rectangle items:
-    line width, colour and corner rounding.
-
-    If `target_item` is given, changes are previewed live on that item and
-    restored on Cancel. On OK the caller should call `restore_original()`
-    (so the undo snapshot is taken from the untouched state), push undo, and
-    then apply `result_data()` itself."""
-    def __init__(self, current_width: int, current_color: QColor,
-                 current_radius: float, parent=None, target_item=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("Rectangle settings")
-        self._color = QColor(current_color)
-        self._target = target_item
-        if target_item is not None:
-            self._orig_pen = QPen(target_item.pen())
-            self._orig_radius = float(getattr(target_item, 'corner_radius', 0.0))
-        lay = QVBoxLayout(self)
-
-        # Line width
-        width_row = QHBoxLayout()
-        width_row.addWidget(QLabel("Line width:"))
-        self.spin_width = QSpinBox()
-        self.spin_width.setRange(1, 200)
-        self.spin_width.setValue(max(1, int(current_width)))
-        self.spin_width.setSuffix(" px")
-        width_row.addWidget(self.spin_width)
-        lay.addLayout(width_row)
-
-        # Line color
-        color_row = QHBoxLayout()
-        color_row.addWidget(QLabel("Line color:"))
-        self.btn_color = QPushButton()
-        self.btn_color.setFixedSize(80, 28)
-        self.btn_color.clicked.connect(self._pick_color)
-        color_row.addWidget(self.btn_color)
-        lay.addLayout(color_row)
-
-        # Corner rounding (slider + spinner kept in sync)
-        max_r = 1000
-        if target_item is not None and hasattr(target_item, '_max_radius'):
-            max_r = max(1, int(math.ceil(target_item._max_radius())))
-        rad_row = QHBoxLayout()
-        rad_row.addWidget(QLabel("Corner rounding:"))
-        self.slider_radius = QSlider(Qt.Orientation.Horizontal)
-        self.slider_radius.setRange(0, max_r)
-        self.spin_radius = QSpinBox()
-        self.spin_radius.setRange(0, max_r)
-        self.spin_radius.setSuffix(" px")
-        start_r = max(0, min(max_r, int(round(current_radius))))
-        self.slider_radius.setValue(start_r)
-        self.spin_radius.setValue(start_r)
-        self.slider_radius.setToolTip(
-            "Also adjustable by dragging the purple dot at the top-left corner "
-            "of a selected rectangle (right = rounder)")
-        rad_row.addWidget(self.slider_radius, 1)
-        rad_row.addWidget(self.spin_radius)
-        lay.addLayout(rad_row)
-
-        self.slider_radius.valueChanged.connect(self._on_slider_radius)
-        self.spin_radius.valueChanged.connect(self._on_spin_radius)
-        self.spin_width.valueChanged.connect(self._apply_preview)
-
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                              QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-        self._update_btn()
-
-    def _on_slider_radius(self, v):
-        self.spin_radius.blockSignals(True)
-        self.spin_radius.setValue(v)
-        self.spin_radius.blockSignals(False)
-        self._apply_preview()
-
-    def _on_spin_radius(self, v):
-        self.slider_radius.blockSignals(True)
-        self.slider_radius.setValue(v)
-        self.slider_radius.blockSignals(False)
-        self._apply_preview()
-
-    def _pick_color(self):
-        c = _show_color_dialog(self._color, self, alpha=True)
-        if c is not None and c.isValid():
-            self._color = c
-            self._update_btn()
-            self._apply_preview()
-
-    def _update_btn(self):
-        c = self._color
-        self.btn_color.setStyleSheet(
-            f"background: rgba({c.red()},{c.green()},{c.blue()},{c.alphaF():.2f}); "
-            f"border: 1px solid #888;")
-
-    def _apply_preview(self, *_):
-        it = self._target
-        if it is None:
-            return
-        pen = it.pen()
-        pen.setWidth(self.spin_width.value())
-        pen.setColor(self._color)
-        it.setPen(pen)
-        it.corner_radius = float(self.spin_radius.value())
-        it.prepareGeometryChange()
-        it.update()
-
-    def restore_original(self):
-        it = self._target
-        if it is None:
-            return
-        it.setPen(QPen(self._orig_pen))
-        it.corner_radius = self._orig_radius
-        it.prepareGeometryChange()
-        it.update()
-
-    def reject(self):
-        self.restore_original()
-        super().reject()
-
-    def result_data(self):
-        """(line width, colour, corner radius in px)"""
-        return (self.spin_width.value(), QColor(self._color),
-                float(self.spin_radius.value()))
-
-
 class FreehandItem(QGraphicsPathItem):
     def __init__(self, path, canvas=None):
         super().__init__(path)
@@ -8693,45 +8975,24 @@ class FreehandItem(QGraphicsPathItem):
         self._rect = self._base_path.boundingRect()
 
     def _open_edit_dialog(self, screen_pos=None):
-        """Open FreehandEditDialog above the canvas via the overlay's _exec_dialog."""
-        # Locate the CaptureRegionWindow (overlay) that owns this item
-        overlay = None
-        if self.scene() and self.scene().views():
-            for view in self.scene().views():
-                win = view.window()
-                if win and hasattr(win, '_exec_dialog'):
-                    overlay = win
-                    break
-
-        dlg = FreehandEditDialog(self.pen().width(), self.pen().color(),
-                                 parent=overlay)
-
-        if overlay is not None:
-            result = overlay._exec_dialog(dlg)
-        else:
-            # Fallback when no overlay is found (e.g. standalone ImageEditorWindow)
-            _set_dialog_on_top(dlg)
-            if screen_pos:
-                dlg.move(screen_pos)
-            result = dlg.exec()
-
-        if result == QDialog.DialogCode.Accepted:
+        """Open the shared options window through whichever window owns this
+        item (Capture Region overlay or Image Editor)."""
+        host = _find_options_host(self)
+        if host is not None:
+            host._edit_item(self)
+            return
+        dlg = FreehandEditDialog(self.pen().width(), self.pen().color(), target_item=self)
+        _set_dialog_on_top(dlg)                       # standalone fallback
+        if screen_pos:
+            dlg.move(screen_pos)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            dlg.restore_original()
             new_width, new_color = dlg.result_data()
             pen = self.pen()
             pen.setWidth(new_width)
             pen.setColor(new_color)
             self.setPen(pen)
             self.update()
-            # Sync the Size spinner in the parent window
-            if self.scene() and self.scene().views():
-                win = self.scene().views()[0].window()
-                if win and hasattr(win, 'spin'):
-                    win.spin.blockSignals(True)
-                    win.spin.setValue(new_width)
-                    win.spin.blockSignals(False)
-            # Update _draw_width on the overlay so new strokes use the new width
-            if overlay is not None and hasattr(overlay, '_draw_width'):
-                overlay._draw_width = new_width
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -9378,20 +9639,8 @@ class EditorCanvas(QGraphicsView):
             'scaling': True,   # snapping also applies while resizing objects
         }
         
-        # Drawing Props
-        self.stroke_color = QColor(255, 0, 0, 255)
-        self.fill_color = QColor(255, 0, 0, 0)
-        self.stroke_width = 5
-        self.rect_radius = 0.0      # Rectangle tool corner rounding (px)
-        self.font_size = 40
-        self.is_filled = False
-        self.text_highlight_color = QColor(255, 255, 0, 255)
-        self.highlight_tool_color = QColor(255, 255, 0, 90)
-        # Marker and Bubble tools each keep their own independent color
-        self.marker_color = QColor(255, 0, 0, 255)
-        self.bubble_color = QColor(255, 0, 0, 255)
-        # Arrow tool: default arrowhead style ('single' / 'double' / 'none')
-        self.arrow_head_style = ArrowItem.HEAD_SINGLE
+        # Drawing props: every tool keeps its OWN settings (colour, width, …)
+        self.prefs = _ToolPrefs(width=5, font_size=40)
         self._pan_start = None
         
         # Massive sceneRect allows infinite panning regardless of zoom
@@ -9813,7 +10062,7 @@ class EditorCanvas(QGraphicsView):
         self.push_undo()
         if self.current_tool == "Rectangle": 
             self.current_item = ResizableRectItem()
-            self.current_item.corner_radius = float(self.rect_radius)
+            self.current_item.corner_radius = float(self.prefs.get('rect', 'radius'))
         elif self.current_tool == "Circle": 
             self.current_item = ResizableEllipseItem()
         elif self.current_tool == "Line":
@@ -9825,11 +10074,11 @@ class EditorCanvas(QGraphicsView):
         elif self.current_tool == "Arrow":
             self.current_item = ArrowItem(
                 QLineF(self.start_point, self.start_point), self)
-            self.current_item.head_style = self.arrow_head_style
+            self.current_item.head_style = self.prefs.get('arrow', 'head')
         elif self.current_tool == "Highlight":
             self._hl_item = HighlightRectItem()
             self._hl_item.setRect(QRectF(self.start_point, self.start_point))
-            self._hl_item._color = QColor(self.highlight_tool_color)
+            self._hl_item._color = self.prefs.get('highlight', 'color')
             self._hl_item.setFlags(
                 QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
                 QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
@@ -9853,8 +10102,9 @@ class EditorCanvas(QGraphicsView):
                 (it._scale for it in sorted(existing, key=lambda m: m.number, reverse=True)),
                 1.0)
             marker = _MarkerItem(self.start_point, number)
-            marker._scale = last_scale
-            marker._bg_color = QColor(self.marker_color)
+            marker._scale = float(self.prefs.get('marker', 'scale'))
+            marker._bg_color = self.prefs.get('marker', 'bg')
+            marker._text_color = self.prefs.get('marker', 'fg')
             marker.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
                             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
                             QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -9982,21 +10232,17 @@ class EditorCanvas(QGraphicsView):
         
         if self.current_tool == "Text" and self.start_point:
             _pos = QPointF(self.start_point)
-            _col = QColor(self.stroke_color)
-            _fsz = max(1, int(self.font_size))
+            _tp = self.prefs.all('text')
 
             def _do_text_dialog():
-                dlg = _TextInputDialog(_col, self.window())
-                dlg.sz.setValue(_fsz)
+                dlg = _TextInputDialog(_tp['color'], self.window(), state=_tp)
                 _set_dialog_on_top(dlg)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
+                    _store_dialog_in_prefs('text', dlg, self.prefs)
+                    if hasattr(self.window(), '_refresh_tool_ui'):
+                        self.window()._refresh_tool_ui()
                     txt, new_fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
                     if txt.strip():
-                        self.font_size = new_fsz
-                        if hasattr(self.window(), 'spin'):
-                            self.window().spin.blockSignals(True)
-                            self.window().spin.setValue(new_fsz)
-                            self.window().spin.blockSignals(False)
                         item = HighlightTextItem(txt)
                         item.setPlainText(txt)
                         item.highlight_color   = hl
@@ -10018,10 +10264,14 @@ class EditorCanvas(QGraphicsView):
 
             QTimer.singleShot(0, _do_text_dialog)
         elif self.current_tool == "Bubble" and self.start_point:
-            dlg = _BubbleInputDialog(self.bubble_color, self)
+            dlg = _BubbleInputDialog(self.prefs.get('bubble', 'fg'), self,
+                                     self.prefs.get('bubble', 'bg'))
             _set_dialog_on_top(dlg)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 txt, fg_col, bg_col = dlg.result_data()
+                self.prefs.update('bubble', fg=fg_col, bg=bg_col)
+                if hasattr(self.window(), '_refresh_tool_ui'):
+                    self.window()._refresh_tool_ui()
                 if txt.strip():
                     item = TextBubbleItem(txt, fg_col, bg_col)
                     item.setPos(self.start_point)
@@ -10042,7 +10292,7 @@ class EditorCanvas(QGraphicsView):
             self._hl_item = None
         # Arrow: apply pen props after drawing
         elif self.current_tool == "Arrow" and self.current_item:
-            pen = QPen(self.stroke_color, self.stroke_width)
+            pen = QPen(self.prefs.get('arrow', 'color'), self.prefs.get('arrow', 'width'))
             self.current_item.setPen(pen)
             self.is_dirty = True
         # Marker is fully handled in mousePressEvent — nothing to do on release
@@ -10058,54 +10308,16 @@ class EditorCanvas(QGraphicsView):
     def mouseDoubleClickEvent(self, event):
         scene_pos = self.mapToScene(event.position().toPoint())
         item = self.scene.itemAt(scene_pos, self.transform())
-        if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-            win = self.window()
-            if hasattr(win, '_edit_text_item'):
-                win._edit_text_item(item)
-                return
-        elif isinstance(item, FreehandItem):
-            self.push_undo()
-            item._open_edit_dialog(event.globalPosition().toPoint())
+        win = self.window()
+        key = _prefs_key_for_item(item) if item is not None else None
+        # Same options window as the toolbar ⚙ button. Shapes/lines/arrows only
+        # open it with the Select tool (so double-clicking while drawing is harmless).
+        if (key is not None and hasattr(win, '_edit_item')
+                and (key in ('text', 'freehand', 'highlight', 'bubble', 'marker')
+                     or self.current_tool == "Select")):
+            win._edit_item(item)
             return
-        elif isinstance(item, HighlightRectItem):
-            dlg = HighlightEditDialog(item._color, self)
-            _set_dialog_on_top(dlg)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                self.push_undo()
-                new_color = dlg.result_color()
-                item._color = new_color
-                item.setPen(QPen(Qt.PenStyle.NoPen))
-                item.setBrush(QBrush(new_color))
-                item.update()
-                self.is_dirty = True
-        elif isinstance(item, TextBubbleItem):
-            dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
-            _set_dialog_on_top(dlg)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                txt, fg_col, bg_col = dlg.result_data()
-                if txt.strip():
-                    self.push_undo()
-                    item._text = txt
-                    item._fg_color = fg_col
-                    item._bg_color = bg_col
-                    item._auto_grow()
-                    item.prepareGeometryChange()
-                    item.update()
-                    self.is_dirty = True
-        elif isinstance(item, _MarkerItem):
-            dlg = _MarkerEditDialog(
-                QColor(item._bg_color),
-                QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
-                self)
-            _set_dialog_on_top(dlg)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                self.push_undo()
-                item._bg_color   = dlg.bg_color
-                item._text_color = dlg.text_color
-                item.update()
-                self.is_dirty = True
-        else:
-            super().mouseDoubleClickEvent(event)
+        super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
         scene_pos = self.mapToScene(event.pos())  # QContextMenuEvent uses .pos(), not .position()
@@ -10113,180 +10325,47 @@ class EditorCanvas(QGraphicsView):
         if item in (self.bg_item, self.crop_item) or item is None:
             super().contextMenuEvent(event)
             return
-        if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-            menu = QMenu(self)
-            edit_action = menu.addAction("✏️ Edit Text")
-            dup_action  = menu.addAction("⧉ Duplicate")
-            action = menu.exec(event.globalPos())
-            if action == dup_action:
-                self.push_undo()
-                dup = self._clone_item(item)
-                if dup:
-                    dup.setPos(item.pos() + QPointF(20, 20))
-                    self.scene.addItem(dup)
-                    self.is_dirty = True
-                return
-            if action == edit_action:
-                win = self.window()
-                if hasattr(win, '_edit_text_item'):
-                    win._edit_text_item(item)
-        elif isinstance(item, HighlightRectItem):
-            menu = QMenu(self)
-            edit_act = menu.addAction("✏️ Edit Highlight")
-            dup_act  = menu.addAction("⧉ Duplicate")
-            del_act  = menu.addAction("🗑️ Delete")
-            action = menu.exec(event.globalPos())
-            if action == dup_act:
-                self.push_undo()
-                dup = self._clone_item(item)
-                if dup:
-                    dup.setPos(item.pos() + QPointF(20, 20))
-                    self.scene.addItem(dup)
-                    self.is_dirty = True
-                return
-            if action == edit_act:
-                dlg = HighlightEditDialog(item._color, self)
-                _set_dialog_on_top(dlg)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    self.push_undo()
-                    new_color = dlg.result_color()
-                    item._color = new_color
-                    item.setPen(QPen(Qt.PenStyle.NoPen))
-                    item.setBrush(QBrush(new_color))
-                    item.update()
-                    self.is_dirty = True
-            elif action == del_act:
-                self.push_undo()
-                self.scene.removeItem(item)
-                self.is_dirty = True
-            return
-        elif isinstance(item, TextBubbleItem):
-            menu = QMenu(self)
-            edit_act = menu.addAction("✏️ Edit Bubble")
-            dup_act  = menu.addAction("⧉ Duplicate")
-            del_act  = menu.addAction("🗑️ Delete")
-            action = menu.exec(event.globalPos())
-            if action == dup_act:
-                self.push_undo()
-                dup = self._clone_item(item)
-                if dup:
-                    dup.setPos(item.pos() + QPointF(20, 20))
-                    self.scene.addItem(dup)
-                    self.is_dirty = True
-                return
-            if action == edit_act:
-                dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
-                _set_dialog_on_top(dlg)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    txt, fg_col, bg_col = dlg.result_data()
-                    if txt.strip():
-                        self.push_undo()
-                        item._text = txt
-                        item._fg_color = fg_col
-                        item._bg_color = bg_col
-                        item.prepareGeometryChange()
-                        item.update()
-                        self.is_dirty = True
-            elif action == del_act:
-                self.push_undo()
-                self.scene.removeItem(item)
-                self.is_dirty = True
-            return
-        elif isinstance(item, _MarkerItem):
-            menu = QMenu(self)
-            edit_act = menu.addAction("✏️ Edit Marker")
-            del_act  = menu.addAction("🗑️ Delete")
-            action = menu.exec(event.globalPos())
-            if action == edit_act:
-                dlg = _MarkerEditDialog(
-                    QColor(item._bg_color),
-                    QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
-                    self)
-                _set_dialog_on_top(dlg)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    self.push_undo()
-                    item._bg_color   = dlg.bg_color
-                    item._text_color = dlg.text_color
-                    item.update()
-                    self.is_dirty = True
-            elif action == del_act:
-                self.push_undo()
-                self.scene.removeItem(item)
-                self.is_dirty = True
-        elif isinstance(item, FreehandItem):
-            menu = QMenu(self)
-            edit_act = menu.addAction("✏️ Edit")
-            dup_act  = menu.addAction("⧉ Duplicate")
-            del_act  = menu.addAction("🗑️ Delete")
-            action = menu.exec(event.globalPos())
-            if action == edit_act:
-                self.push_undo()
-                item._open_edit_dialog(event.globalPos())
-                self.is_dirty = True
-            elif action == dup_act:
-                self.push_undo()
-                dup = self._clone_item(item)
-                if dup:
-                    dup.setPos(item.pos() + QPointF(20, 20))
-                    self.scene.addItem(dup)
-                    self.is_dirty = True
-            elif action == del_act:
-                self.push_undo()
-                self.scene.removeItem(item)
-                self.is_dirty = True
-        elif isinstance(item, ArrowItem):
-            menu = QMenu(self)
-            edit_act = menu.addAction("✏️ Edit Arrow")
+        key = _prefs_key_for_item(item)
+        win = self.window()
+        menu = QMenu(self)
+        edit_act = None
+        if key is not None and hasattr(win, '_edit_item'):
+            edit_act = menu.addAction({'text': "✏️ Edit Text", 'highlight': "✏️ Edit Highlight",
+                                       'bubble': "✏️ Edit Bubble", 'marker': "✏️ Edit Marker",
+                                       'arrow': "✏️ Edit Arrow"}.get(key, "✏️ Edit"))
+        straighten_act = None
+        if isinstance(item, ArrowItem):
             straighten_act = menu.addAction("📏 Straighten Arrow")
-            dup_act  = menu.addAction("⧉ Duplicate")
-            del_act  = menu.addAction("🗑️ Delete")
             straighten_act.setEnabled(getattr(item, '_bend', QPointF(0.0, 0.0)) != QPointF(0.0, 0.0))
-            action = menu.exec(event.globalPos())
-            if action == edit_act:
-                dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
-                                      getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
-                                      target_item=item)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    self.push_undo()
-                    new_width, new_color, new_head = dlg.result_data()
-                    pen = item.pen()
-                    pen.setWidth(new_width)
-                    pen.setColor(new_color)
-                    item.setPen(pen)
-                    item.head_style = new_head
-                    item.prepareGeometryChange()
-                    item.update()
-                self.is_dirty = True
-            elif action == straighten_act:
-                self.push_undo()
-                # Reset the bend/break point so the arrow is drawn as a
-                # perfectly straight line from p1 to p2 again.
-                item.prepareGeometryChange()
-                item._bend = QPointF(0.0, 0.0)
-                item.update()
-                self.is_dirty = True
-            elif action == dup_act:
-                self.push_undo()
-                dup = self._clone_item(item)
-                if dup:
-                    dup.setPos(item.pos() + QPointF(20, 20))
+        dup_act = None if isinstance(item, _MarkerItem) else menu.addAction("⧉ Duplicate")
+        del_act = (menu.addAction("🗑️ Delete")
+                   if isinstance(item, (HighlightRectItem, TextBubbleItem, _MarkerItem,
+                                        FreehandItem, ArrowItem)) else None)
+        action = menu.exec(event.globalPos())
+        if action is None:
+            return
+        if action == edit_act:
+            win._edit_item(item)
+        elif action == straighten_act:
+            self.push_undo()
+            # Reset the bend/break point so the arrow is drawn as a
+            # perfectly straight line from p1 to p2 again.
+            item.prepareGeometryChange()
+            item._bend = QPointF(0.0, 0.0)
+            item.update()
+            self.is_dirty = True
+        elif action == dup_act:
+            self.push_undo()
+            dup = self._clone_item(item)
+            if dup:
+                dup.setPos(item.pos() + QPointF(20, 20))
+                if dup.scene() is None:
                     self.scene.addItem(dup)
-                    self.is_dirty = True
-            elif action == del_act:
-                self.push_undo()
-                self.scene.removeItem(item)
                 self.is_dirty = True
-        else:
-            menu = QMenu(self)
-            dup_act = menu.addAction("⧉ Duplicate")
-            action = menu.exec(event.globalPos())
-            if action == dup_act:
-                self.push_undo()
-                dup = self._clone_item(item)
-                if dup:
-                    dup.setPos(item.pos() + QPointF(20, 20))
-                    self.scene.addItem(dup)
-                    self.is_dirty = True
+        elif action == del_act:
+            self.push_undo()
+            self.scene.removeItem(item)
+            self.is_dirty = True
 
     def get_handle_at(self, pos):
         """Returns (item, handle_name) if mouse is over a resize handle of a selected item."""
@@ -10410,7 +10489,7 @@ class EditorCanvas(QGraphicsView):
             item.prepareGeometryChange()
             item.corner_radius = new_r
             item.update()
-            self.rect_radius = new_r    # new rectangles inherit the last value
+            self.prefs.set('rect', 'radius', new_r)    # new rectangles inherit the last value
             self.is_dirty = True
             return
 
@@ -10758,16 +10837,30 @@ class EditorCanvas(QGraphicsView):
                     painter.drawEllipse(p2, 5/self.transform().m11(), 5/self.transform().m11())
 
     def apply_props(self, item):
-        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | 
+        """Give a freshly drawn item the settings of ITS tool (never another's)."""
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
                       QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-        pen = QPen(self.stroke_color, self.stroke_width)
-        brush = QBrush(self.fill_color if self.is_filled else Qt.GlobalColor.transparent)
-        if isinstance(item, QGraphicsTextItem):
-            item.setDefaultTextColor(self.stroke_color)
-            item.setFont(QFont("Arial", int(self.font_size)))
-        else:
-            if hasattr(item, "setPen"): item.setPen(pen)
-            if hasattr(item, "setBrush"): item.setBrush(brush)
+        key = _prefs_key_for_item(item)
+        if key in ('rect', 'circle', 'line', 'arrow', 'freehand'):
+            c = self.prefs.get(key, 'color')
+            if hasattr(item, "setPen"):
+                item.setPen(QPen(c, self.prefs.get(key, 'width')))
+            if hasattr(item, "setBrush"):
+                filled = key in ('rect', 'circle') and self.prefs.get(key, 'fill')
+                if filled:
+                    item._fill_color = _prefs_fill_color(self.prefs, key)
+                    item.setBrush(QBrush(item._fill_color))
+                else:
+                    item.setBrush(QBrush(Qt.GlobalColor.transparent))
+        elif isinstance(item, QGraphicsTextItem):
+            item.setDefaultTextColor(self.prefs.get('text', 'color'))
+            item.setFont(QFont("Arial", int(self.prefs.get('text', 'size'))))
+
+_EDITOR_TOOL_KEYS = {
+    "Rectangle": 'rect', "Circle": 'circle', "Line": 'line', "Arrow": 'arrow',
+    "Highlight": 'highlight', "Freehand": 'freehand', "Bubble": 'bubble',
+    "Text": 'text', "Marker": 'marker',
+}
 
 class ImageEditorWindow(QMainWindow):
     def __init__(self, pixmap, save_callback, default_dir="", parent=None,
@@ -10781,6 +10874,7 @@ class ImageEditorWindow(QMainWindow):
         self.saved = False
         self._annotation_mode = annotation_mode   # True = opened from "Capture Region"
         self._full_pixmap = pixmap                # keep for region-capture compositing
+        self._last_draw_key = 'rect'              # last tool that has options (⚙ with Select active)
 
         central = QWidget(); self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -10914,11 +11008,21 @@ class ImageEditorWindow(QMainWindow):
         
         # Row 2: Props
         pbar = QHBoxLayout()
-        self.btn_c = QPushButton("🎨🔧 Color / Set")
-        self.btn_c.setFixedHeight(36)
-        self.btn_c.setMinimumWidth(140)
+        # Tool options button — same palette + wrench icon as the Capture Region
+        # toolbar; opens the options window of the selected object / active tool.
+        self.btn_c = QPushButton()
+        self.btn_c.setObjectName("colorPickerBtn")
+        self.btn_c.setIcon(_svg_icon(_SVG_COLOR_TOOLS, 104, 48))
+        self.btn_c.setIconSize(QSize(46, 22))
+        self.btn_c.setFixedSize(64, 36)
+        self.btn_c.setToolTip("Tool options — colours, width, … "
+                              "(edits the selected object, or the active tool's defaults)")
         self.btn_c.clicked.connect(self.pick_color)
         pbar.addWidget(self.btn_c)
+
+        # Swatch mirroring the colour(s) that window edits
+        self.color_swatch = _ColorSwatch()
+        pbar.addWidget(self.color_swatch)
         
         self.btn_hc = QPushButton("Text Highlight")
         self.btn_hc.clicked.connect(self.pick_highlight_color)
@@ -10932,14 +11036,7 @@ class ImageEditorWindow(QMainWindow):
         self.spin.valueChanged.connect(self._on_size_spin_changed)
         pbar.addWidget(self.spin)
 
-        # Hidden legacy stroke spinner — kept so existing update_live_props references don't break
-        self.lbl_stroke = QLabel()
-        self.lbl_stroke.hide()
-        self.spin_stroke = QSpinBox(); self.spin_stroke.setRange(1, 100); self.spin_stroke.setValue(5)
-        self.spin_stroke.hide()
-        self.spin_stroke.valueChanged.connect(self.update_live_props)
-
-        self.fill = QCheckBox("Fill Shape"); self.fill.stateChanged.connect(self.update_live_props)
+        self.fill = QCheckBox("Fill Shape"); self.fill.toggled.connect(self.update_live_props)
         pbar.addWidget(self.fill)
         pbar.addStretch()
         layout.addLayout(pbar)
@@ -11118,24 +11215,15 @@ class ImageEditorWindow(QMainWindow):
             QGraphicsView.DragMode.RubberBandDrag if name == "Select"
             else QGraphicsView.DragMode.NoDrag)
 
-        if name in ["Rectangle", "Circle"]:
-            self.fill.show()
-        elif name == "Select" and any(isinstance(i, (ResizableRectItem, ResizableEllipseItem)) for i in self.canvas.scene.selectedItems()):
-            self.fill.show()
-        else:
-            self.fill.hide()
-
         # Text Highlight button removed — highlight is managed via the unified text dialog
         self.btn_hc.hide()
 
-        # Size spinner is always visible — label changes based on tool context
-        # (stroke_tools use it as border width, text tools as font size)
-        self.spin.blockSignals(True)
-        if name == "Text":
-            self.spin.setValue(self.canvas.font_size)
-        else:
-            self.spin.setValue(self.canvas.stroke_width)
-        self.spin.blockSignals(False)
+        # Size spinner, Fill checkbox and colour swatch all follow the newly
+        # selected tool's OWN settings (nothing leaks over from the previous tool).
+        _k = _EDITOR_TOOL_KEYS.get(name)
+        if _k:
+            self._last_draw_key = _k
+        self._refresh_tool_ui()
 
         # Zarządzanie widocznością i cyklem życia nakładki Crop
         if name == "Crop":
@@ -11256,407 +11344,180 @@ class ImageEditorWindow(QMainWindow):
         self.canvas.is_dirty = True
         self.select_tool("Select")
 
+    # ── Tool options ─────────────────────────────────────────────────────────
+    # One options window for every tool (colour tabs + embedded colour panel).
+    # Opened by the ⚙ button, by double-click and by the context menu; always
+    # edits either the selected object or — with nothing selected — the
+    # remembered defaults of the active tool.
+    _STROKE_KEYS = ('rect', 'circle', 'line', 'arrow', 'freehand')
+
+    def _tool_key(self):
+        return _EDITOR_TOOL_KEYS.get(self.canvas.current_tool)
+
+    def _active_key(self):
+        """Tool whose options apply when nothing is selected."""
+        return self._tool_key() or self._last_draw_key
+
+    def _selected_editable_item(self):
+        for it in self.canvas.scene.selectedItems():
+            if _prefs_key_for_item(it):
+                return it
+        return None
+
+    def _refresh_tool_ui(self):
+        """Single place that keeps the Size spinner, Fill checkbox and colour
+        swatch in sync with what is being edited: the selected object if
+        there is one, otherwise the active tool's own remembered settings."""
+        cv = self.canvas
+        item = self._selected_editable_item()
+        key = _prefs_key_for_item(item) if item is not None else self._active_key()
+
+        colors = (_item_swatch_colors(key, item) if item is not None
+                  else _prefs_swatch_colors(key, cv.prefs))
+        self.color_swatch.set_colors(colors or [QColor(128, 128, 128)])
+
+        # Size: font size for Text, line width for stroke tools, else n/a
+        value = None
+        if key == 'text':
+            value = item.font().pointSize() if item is not None else cv.prefs.get('text', 'size')
+        elif key in self._STROKE_KEYS:
+            value = item.pen().width() if item is not None else cv.prefs.get(key, 'width')
+        self.spin.blockSignals(True)
+        if value is not None and value > 0:
+            self.spin.setValue(int(value))
+        self.spin.setEnabled(value is not None)
+        self.spin.blockSignals(False)
+
+        # Fill: only for rectangles / ellipses (selected, or their own tool active)
+        show_fill = key in ('rect', 'circle') and (
+            item is not None or self._tool_key() in ('rect', 'circle'))
+        if show_fill:
+            filled = _item_is_filled(item) if item is not None else bool(cv.prefs.get(key, 'fill'))
+            self.fill.blockSignals(True)
+            self.fill.setChecked(filled)
+            self.fill.blockSignals(False)
+            self.fill.show()
+        else:
+            self.fill.hide()
+
     def pick_color(self):
-        selected = self.canvas.scene.selectedItems()
-
-        # If an item with a dedicated edit dialog is selected, open it
-        if selected:
-            item = selected[0]
-            if isinstance(item, HighlightRectItem):
-                dlg = HighlightEditDialog(item._color, self)
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    self.canvas.push_undo()
-                    new_color = dlg.result_color()
-                    item._color = new_color
-                    item.setPen(QPen(Qt.PenStyle.NoPen))
-                    item.setBrush(QBrush(new_color))
-                    item.update()
-                    self.canvas.is_dirty = True
-                return
-            if isinstance(item, TextBubbleItem):
-                dlg = _BubbleEditDialog(item._fg_color, item._bg_color, item._text, self)
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    txt, fg_col, bg_col = dlg.result_data()
-                    if txt.strip():
-                        self.canvas.push_undo()
-                        item._text = txt
-                        item._fg_color = fg_col
-                        item._bg_color = bg_col
-                        item._auto_grow()
-                        item.prepareGeometryChange()
-                        item.update()
-                        self.canvas.is_dirty = True
-                return
-            if isinstance(item, _MarkerItem):
-                dlg = _MarkerEditDialog(
-                    QColor(item._bg_color),
-                    QColor(getattr(item, '_text_color', QColor(Qt.GlobalColor.white))),
-                    self)
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    self.canvas.push_undo()
-                    item._bg_color   = dlg.bg_color
-                    item._text_color = dlg.text_color
-                    item.update()
-                    self.canvas.is_dirty = True
-                return
-            if isinstance(item, FreehandItem):
-                dlg = FreehandEditDialog(item.pen().width(), item.pen().color(), self)
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    self.canvas.push_undo()
-                    new_width, new_color = dlg.result_data()
-                    pen = item.pen()
-                    pen.setWidth(new_width)
-                    pen.setColor(new_color)
-                    item.setPen(pen)
-                    item.update()
-                    self.canvas.stroke_width = new_width
-                    self.spin.blockSignals(True)
-                    self.spin.setValue(new_width)
-                    self.spin.blockSignals(False)
-                    self.canvas.is_dirty = True
-                return
-            if isinstance(item, ArrowItem):
-                dlg = ArrowEditDialog(item.pen().width(), item.pen().color(),
-                                      getattr(item, 'head_style', ArrowItem.HEAD_SINGLE), self,
-                                      target_item=item)
-                dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    self.canvas.push_undo()
-                    new_width, new_color, new_head = dlg.result_data()
-                    pen = item.pen()
-                    pen.setWidth(new_width)
-                    pen.setColor(new_color)
-                    item.setPen(pen)
-                    item.head_style = new_head
-                    item.prepareGeometryChange()
-                    item.update()
-                    self.canvas.stroke_width = new_width
-                    self.canvas.stroke_color = new_color
-                    self.canvas.arrow_head_style = new_head
-                    self.spin.blockSignals(True)
-                    self.spin.setValue(new_width)
-                    self.spin.blockSignals(False)
-                    rgba = f"rgba({new_color.red()}, {new_color.green()}, {new_color.blue()}, {new_color.alphaF()})"
-                    self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
-                    self.canvas.is_dirty = True
-                return
-            if isinstance(item, ResizableRectItem):
-                self._edit_rect_item(item)
-                return
-            if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-                self._edit_text_item(item)
-                return
-
-        # No special item selected — fall back to highlight tool color or generic picker
-        if not selected and self.canvas.current_tool == "Highlight":
-            dlg = HighlightEditDialog(self.canvas.highlight_tool_color, self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                self.canvas.highlight_tool_color = dlg.result_color()
-                self.canvas.is_dirty = True
-            return
-
-        # Rectangle tool active, nothing selected — edit width / colour / rounding defaults
-        if not selected and self.canvas.current_tool == "Rectangle":
-            self._edit_rect_defaults()
-            return
-
-        # No arrow selected but the Arrow tool is active — edit its defaults
-        if not selected and self.canvas.current_tool == "Arrow":
-            dlg = ArrowEditDialog(self.canvas.stroke_width, self.canvas.stroke_color,
-                                  self.canvas.arrow_head_style, self)
-            dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                new_width, new_color, new_head = dlg.result_data()
-                self.canvas.stroke_width = new_width
-                self.canvas.stroke_color = new_color
-                self.canvas.arrow_head_style = new_head
-                self.spin.blockSignals(True)
-                self.spin.setValue(new_width)
-                self.spin.blockSignals(False)
-                rgba = f"rgba({new_color.red()}, {new_color.green()}, {new_color.blue()}, {new_color.alphaF()})"
-                self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
-            return
-
-        # Pick the right source color for the current tool so the dialog opens
-        # with whatever alpha the user last chose — not a reset to 0.
-        if self.canvas.current_tool == "Marker":
-            init_col = QColor(self.canvas.marker_color)
-        elif self.canvas.current_tool == "Bubble":
-            init_col = QColor(self.canvas.bubble_color)
-        else:
-            init_col = QColor(self.canvas.stroke_color)
-
-        # Only default to fully opaque when alpha was never set (0 = uninitialised).
-        if init_col.alpha() == 0:
-            init_col.setAlpha(255)
-
-        # Use _show_color_dialog so the Linux alpha=0 bug fix is applied consistently.
-        c = _show_color_dialog(init_col, self, alpha=True)
-        if c is not None and c.isValid():
-            # Save color into the correct per-tool slot
-            if self.canvas.current_tool == "Marker":
-                self.canvas.marker_color = c
-            elif self.canvas.current_tool == "Bubble":
-                self.canvas.bubble_color = c
-            else:
-                self.canvas.stroke_color = c
-                self.canvas.fill_color = c
-
-            # Update color preview button
-            rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
-            self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
-            self.update_live_props()
-
-            # Live-apply color to all currently selected items
-            if selected:
-                self.canvas.push_undo()
-            for item in self.canvas.scene.selectedItems():
-                if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-                    item.setDefaultTextColor(c)
-                    self.canvas.is_dirty = True
-                elif isinstance(item, HighlightRectItem):
-                    pass  # Highlight shape has its own dialog
-                else:
-                    if hasattr(item, 'setPen') and hasattr(item, 'pen'):
-                        pen = item.pen()
-                        pen.setColor(c)
-                        item.setPen(pen)
-                    if hasattr(item, 'setBrush') and self.canvas.is_filled and isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
-                        item.setBrush(QBrush(c))
-                    item.update()
-                    self.canvas.is_dirty = True
-
-    # ── Rectangle settings (width / colour / corner rounding) ─────────────────
-    def _apply_rect_settings(self, item, width, color, radius):
-        """Apply RectEditDialog results to `item` (None = only the tool defaults)."""
-        color = QColor(color)
-        cv = self.canvas
+        """⚙ button."""
+        item = self._selected_editable_item()
         if item is not None:
-            pen = item.pen()
-            pen.setWidth(int(width))
-            pen.setColor(color)
-            item.setPen(pen)
-            b = item.brush()
-            if b.style() != Qt.BrushStyle.NoBrush and b.color().alpha() > 0:
-                item.setBrush(QBrush(color))
-            item.corner_radius = float(radius)
-            item.prepareGeometryChange()
-            item.update()
-        cv.stroke_width = int(width)
-        cv.stroke_color = QColor(color)
-        cv.rect_radius = float(radius)
-        if cv.is_filled:
-            cv.fill_color = QColor(color)
-        for w in (self.spin, self.spin_stroke):
-            w.blockSignals(True)
-            w.setValue(int(width))
-            w.blockSignals(False)
-        rgba = f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alphaF()})"
-        self.btn_c.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
-        cv.is_dirty = True
-
-    def _edit_rect_item(self, item):
-        dlg = RectEditDialog(item.pen().width(), item.pen().color(),
-                             item.corner_radius, self, target_item=item)
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            w, c, r = dlg.result_data()
-            dlg.restore_original()          # undo snapshot = state before the edit
-            self.canvas.push_undo()
-            self._apply_rect_settings(item, w, c, r)
-
-    def _edit_rect_defaults(self):
-        cv = self.canvas
-        dlg = RectEditDialog(cv.stroke_width, cv.stroke_color, cv.rect_radius, self)
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            w, c, r = dlg.result_data()
-            self._apply_rect_settings(None, w, c, r)
-
-    def update_live_props(self):
-        self.canvas.stroke_width = self.spin_stroke.value()
-        self.canvas.font_size = self.spin.value()
-        self.canvas.is_filled = self.fill.isChecked()
-        
-        if self.canvas.is_filled:
-            self.canvas.fill_color = QColor(self.canvas.stroke_color)
+            self._edit_item(item)
         else:
-            self.canvas.fill_color = QColor(0, 0, 0, 0)
-            
-        for item in self.canvas.scene.selectedItems():
-            if hasattr(item, 'setBrush') and not isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-                brush = QBrush(self.canvas.fill_color if self.canvas.is_filled else Qt.GlobalColor.transparent)
-                item.setBrush(brush)
-                item.update()
-                self.canvas.is_dirty = True
+            self._open_defaults_dialog(self._active_key())
+
+    @staticmethod
+    def _run_options_dialog(dlg):
+        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        return dlg.exec()
+
+    def _open_defaults_dialog(self, key):
+        dlg = _build_options_dialog(key, self, self.canvas.prefs, allow_fill=True)
+        if dlg is None:
+            return
+        if self._run_options_dialog(dlg) == QDialog.DialogCode.Accepted:
+            _store_dialog_in_prefs(key, dlg, self.canvas.prefs, allow_fill=True)
+        self._refresh_tool_ui()
+
+    def _edit_item(self, item) -> bool:
+        """Options window for *item* with live preview. On OK the values are
+        applied (one undo step) and remembered as that tool's defaults.
+        Returns True if a dialog was shown."""
+        key = _prefs_key_for_item(item)
+        if key is None:
+            return False
+        cv = self.canvas
+        dlg = _build_options_dialog(key, self, cv.prefs, item=item, allow_fill=True)
+        if dlg is None:
+            return False
+        if self._run_options_dialog(dlg) == QDialog.DialogCode.Accepted:
+            dlg.restore_original()          # undo snapshot = state before the edit
+            if key in ('bubble', 'text') and not dlg.edit.toPlainText().strip():
+                if key == 'text':           # emptied text annotation = delete it
+                    cv.push_undo()
+                    cv.scene.removeItem(item)
+                    cv.is_dirty = True
+            else:
+                cv.push_undo()
+                _commit_item_dialog(key, dlg, item, allow_fill=True)
+                _store_dialog_in_prefs(key, dlg, cv.prefs, allow_fill=True)
+                cv.is_dirty = True
+        self._refresh_tool_ui()
+        return True
+
+    def _edit_text_item(self, item):
+        """Kept for callers that still use the old name."""
+        self._edit_item(item)
+
+    def update_live_props(self, *_):
+        """'Fill Shape' checkbox: fills/unfills selected rectangles & ellipses
+        and remembers the choice for the tool(s) concerned."""
+        cv = self.canvas
+        on = self.fill.isChecked()
+        touched = False
+        for it in cv.scene.selectedItems():
+            k = _prefs_key_for_item(it)
+            if k in ('rect', 'circle'):
+                fc = _item_fill_color(it)            # remember before changing
+                it._fill_color = fc
+                it.setBrush(QBrush(fc) if on else QBrush(Qt.GlobalColor.transparent))
+                it.update()
+                cv.prefs.set(k, 'fill', on)
+                cv.is_dirty = True
+                touched = True
+        if not touched:
+            k = self._tool_key()
+            if k in ('rect', 'circle'):
+                cv.prefs.set(k, 'fill', on)
 
     def _on_size_spin_changed(self, value):
-        """Called when the user manually changes the Size spinner.
-        Updates canvas properties AND live-updates any selected items."""
-        selected = self.canvas.scene.selectedItems()
-        text_tools = {"Text"}
-        is_text_tool = self.canvas.current_tool in text_tools
-
-        if selected:
-            for item in selected:
-                if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-                    # Live-update font size
-                    f = item.font()
-                    f.setPointSize(max(1, value))
-                    item.setFont(f)
-                    self.canvas.is_dirty = True
-                elif isinstance(item, FreehandItem):
-                    # Live-update stroke width for freehand items
-                    pen = item.pen()
-                    pen.setWidth(max(1, value))
-                    item.setPen(pen)
-                    item.update()
-                    self.canvas.is_dirty = True
-                elif hasattr(item, 'pen') and hasattr(item, 'setPen'):
-                    # Live-update stroke width for shape/line/arrow items
-                    pen = item.pen()
-                    pen.setWidth(max(1, value))
-                    item.setPen(pen)
-                    if hasattr(item, 'prepareGeometryChange'):
-                        item.prepareGeometryChange()
-                    item.update()
-                    self.canvas.is_dirty = True
-
-        # Always sync canvas props for newly drawn items
-        self.canvas.stroke_width = value
-        self.spin_stroke.setValue(value)   # keep hidden legacy spinner in sync
-        self.canvas.font_size = value
-        self.canvas.is_filled = self.fill.isChecked()
+        """Size spinner: live-updates the selected objects (width / font size)
+        and remembers the value for each of those tools — or, with nothing
+        selected, for the active tool."""
+        cv = self.canvas
+        value = max(1, int(value))
+        items = [i for i in cv.scene.selectedItems() if _prefs_key_for_item(i)]
+        for it in items:
+            k = _prefs_key_for_item(it)
+            if k == 'text':
+                f = it.font(); f.setPointSize(value); it.setFont(f)
+                cv.prefs.set('text', 'size', value)
+            elif k in self._STROKE_KEYS:
+                pen = it.pen(); pen.setWidth(value); it.setPen(pen)
+                if hasattr(it, 'prepareGeometryChange'):
+                    it.prepareGeometryChange()
+                it.update()
+                cv.prefs.set(k, 'width', value)
+            else:
+                continue
+            cv.is_dirty = True
+        if not items:
+            k = self._active_key()
+            if k == 'text':
+                cv.prefs.set('text', 'size', value)
+            elif k in self._STROKE_KEYS:
+                cv.prefs.set(k, 'width', value)
 
     def _sync_spin_from_selection(self):
-        """Read stroke width or font size from selected items and update the Size spinner."""
-        selected = self.canvas.scene.selectedItems()
-
-        # Update Fill Checkbox visibility and state
-        if self.canvas.current_tool == "Select":
-            if selected and isinstance(selected[0], (ResizableRectItem, ResizableEllipseItem)):
-                self.fill.show()
-                brush = selected[0].brush()
-                is_filled = brush.style() != Qt.BrushStyle.NoBrush and brush.color().alpha() > 0
-                self.fill.blockSignals(True)
-                self.fill.setChecked(is_filled)
-                self.fill.blockSignals(False)
-                self.canvas.is_filled = is_filled
-                self.canvas.fill_color = brush.color() if is_filled else QColor(0, 0, 0, 0)
-            else:
-                self.fill.hide()
-
-            # Text Highlight button removed — managed via unified text dialog
-            self.btn_hc.hide()
-
-        for item in selected:
-            if isinstance(item, (HighlightTextItem, QGraphicsTextItem)):
-                # Text item — read font size
-                size = item.font().pointSize()
-                if size > 0:
-                    self.spin.blockSignals(True)
-                    self.spin.setValue(size)
-                    self.spin.blockSignals(False)
-                    self.canvas.font_size = size
-                return
-            elif isinstance(item, FreehandItem):
-                # Freehand item — read pen width
-                width = item.pen().width()
-                if width > 0:
-                    self.spin.blockSignals(True)
-                    self.spin.setValue(width)
-                    self.spin.blockSignals(False)
-                    self.canvas.stroke_width = width
-                    self.spin_stroke.setValue(width)
-                return
-            elif isinstance(item, ResizablePixmapItem):
-                # Images inherit a pen() from QGraphicsRectItem but never
-                # actually draw with it (paint() just draws the pixmap), so
-                # its default width (1) is meaningless here. Reading it into
-                # stroke_width used to "stick" the pencil/shape tools at
-                # width 1 the moment any image on the canvas got selected
-                # (including right after importing or dropping one in).
-                # Leave the Size spinner and stroke_width alone for images.
-                return
-            elif hasattr(item, 'pen') and callable(item.pen):
-                # Shape / line / arrow — read pen width
-                width = item.pen().width()
-                if width > 0:
-                    self.spin.blockSignals(True)
-                    self.spin.setValue(width)
-                    self.spin.blockSignals(False)
-                    self.canvas.stroke_width = width
-                    self.spin_stroke.setValue(width)
-                return
-
-        # No selection — just sync fill colour
-        if not self.canvas.is_filled:
-            self.canvas.fill_color = QColor(0, 0, 0, 0)
-        else:
-            self.canvas.fill_color = self.canvas.stroke_color
-    def _edit_text_item(self, item):
-        """Open the unified text edit dialog (same as Capture Region toolbar) for a HighlightTextItem."""
-        dlg = _TextInputDialog(item.defaultTextColor(), self)
-        dlg.edit.setPlainText(item.toPlainText())
-        dlg.sz.setValue(item.font().pointSize())
-        if hasattr(item, 'highlight_color'):
-            dlg.highlight = QColor(item.highlight_color)
-        dlg.chk_hl.setChecked(getattr(item, 'highlight_enabled', True))
-        dlg.hl_pad.setValue(getattr(item, 'highlight_padding', 0))
-        dlg.chk_ol.setChecked(getattr(item, 'outline_enabled', False))
-        dlg.ol_width.setValue(getattr(item, 'outline_width', 2))
-        dlg.outline_color = QColor(getattr(item, 'outline_color', QColor(0, 0, 0)))
-        dlg._update_btn_color()
-        dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            txt, fsz, col, hl, hl_on, hl_pad, ol_on, ol_w, ol_col = dlg.result_data()
-            self.canvas.push_undo()
-            if txt.strip():
-                item.setPlainText(txt)
-                item.setFont(QFont("Arial", fsz))
-                item.setDefaultTextColor(col)
-                item.highlight_color   = hl
-                item.highlight_enabled = hl_on
-                item.highlight_padding = hl_pad
-                item.outline_enabled   = ol_on
-                item.outline_width     = ol_w
-                item.outline_color     = ol_col
-                item.update()
-                self.canvas.font_size  = fsz
-                if hasattr(self, 'spin'):
-                    self.spin.blockSignals(True)
-                    self.spin.setValue(fsz)
-                    self.spin.blockSignals(False)
-                self.canvas.is_dirty = True
-            else:
-                self.canvas.scene.removeItem(item)
-                self.canvas.is_dirty = True
+        """Selection changed → Size / Fill / swatch show the selected object."""
+        self._refresh_tool_ui()
 
     def pick_highlight_color(self):
-        # Build initial color: preserve user's previously chosen alpha.
-        # Only default to a visible alpha (180) when uninitialised (alpha == 0).
-        init_col = QColor(self.canvas.text_highlight_color)
+        """Legacy (button is hidden): highlight colour of the Text tool."""
+        init_col = self.canvas.prefs.get('text', 'hl')
         if init_col.alpha() == 0:
             init_col.setAlpha(180)
-
-        # Use _show_color_dialog so the Linux alpha=0 bug fix is applied consistently.
         c = _show_color_dialog(init_col, self, alpha=True)
         if c is not None and c.isValid():
-            self.canvas.text_highlight_color = c
-            rgba = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF()})"
-            self.btn_hc.setStyleSheet(f"background-color: {rgba}; border: 1px solid #888;")
-
-            # Immediately apply highlight color to all selected text items
+            self.canvas.prefs.set('text', 'hl', c)
             for item in self.canvas.scene.selectedItems():
                 if isinstance(item, HighlightTextItem):
                     item.highlight_color = c
                     item.update()
             self.canvas.is_dirty = True
+            self._refresh_tool_ui()
 
     def import_image(self):
         from PySide6.QtWidgets import QFileDialog
