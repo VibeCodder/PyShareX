@@ -113,7 +113,8 @@ It works in 2 modes:
 
 You can also use tools from toolbar to attach various annotation objects to the screen.
 
-<img width="1920" height="1080" alt="2026-10-23 23-18-54 mkv_snapshot_11 06 300" src="https://github.com/user-attachments/assets/8bbff79d-e09a-47a9-a2af-f9d485aeadd0" />
+<img width="1920" height="1080" alt="2026-10-24 21-33-35 mkv_snapshot_04 27 200" src="https://github.com/user-attachments/assets/70a3d416-9368-4a7f-bcb3-bd5e8c3f822a" />
+
 
 
 
@@ -130,7 +131,8 @@ You can also use tools from toolbar to attach various annotation objects to the 
 
 ## Image Editor
 
-<img width="1920" height="1020" alt="pythonw_ChupxXgZhQ" src="https://github.com/user-attachments/assets/6ede9da2-dbc0-4819-b55d-aa3677d105ba" />
+<img width="1920" height="1020" alt="pythonw_ChupxXgZhQ" src="https://github.com/user-attachments/assets/85bc15f1-6f86-463a-a771-d079b62ae9fd" />
+
 
 
 
