@@ -6,6 +6,61 @@ Inspired by ShareX, built with Python and PySide6
 
 import sys
 import os
+
+
+def _fast_ipc_client():
+    """`pysharex.py --action <nazwa>` (skróty systemowe): wyślij akcję do
+    działającej instancji przez gniazdo unix ZANIM załadują się Qt i reszta
+    modułów - skrót reaguje natychmiast i nie wymaga drugiego QApplication.
+    Log: ~/.cache/pysharex/hotkey.log"""
+    if os.name == "nt":
+        return
+    action = None
+    for i, a in enumerate(sys.argv):
+        if a == "--action" and i + 1 < len(sys.argv):
+            action = sys.argv[i + 1]
+        elif a.startswith("--action="):
+            action = a.split("=", 1)[1]
+    if not action:
+        return
+    import socket, time as _t
+    cdir = os.path.expanduser("~/.cache/pysharex")
+
+    def log(msg):
+        try:
+            os.makedirs(cdir, exist_ok=True)
+            with open(os.path.join(cdir, "hotkey.log"), "a", encoding="utf-8") as f:
+                f.write(f"{_t.strftime('%H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
+
+    name = "pysharex-" + (os.environ.get("USER") or os.environ.get("USERNAME") or "user")
+    cands = []
+    try:
+        with open(os.path.join(cdir, "ipc-path"), encoding="utf-8") as f:
+            cands.append(f.read().strip())
+    except Exception:
+        pass
+    for d in (os.environ.get("TMPDIR"), "/tmp", os.environ.get("XDG_RUNTIME_DIR")):
+        if d:
+            cands.append(os.path.join(d, name))
+    for path in dict.fromkeys(c for c in cands if c):
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.settimeout(1.5)
+            c.connect(path)
+            c.sendall((action + "\n").encode("utf-8"))
+            c.close()
+            log(f"--action {action}: wysłano do instancji ({path})")
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            log(f"--action {action}: {path}: {e}")
+    log(f"--action {action}: brak działającej instancji - uruchamiam program")
+
+
+_fast_ipc_client()
 import json
 import time
 import threading
@@ -34,7 +89,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     QPointF, Qt, QThread, Signal, QTimer, QSize, QRect, QPoint,
-    QStandardPaths, QElapsedTimer, QLineF, QRectF, QSizeF
+    QStandardPaths, QElapsedTimer, QLineF, QRectF, QSizeF, QObject, QEvent
 )
 from PySide6.QtGui import (
     QIcon, QKeySequence, QAction, QMouseEvent, QPixmap, QPainter, QColor,
@@ -416,6 +471,302 @@ def _is_wayland_session() -> bool:
     # XDG_SESSION_TYPE bywa puste (np. w niektórych DM-ach) - dodatkowy fallback:
     return bool(os.environ.get("WAYLAND_DISPLAY"))
 
+
+def _overlay_window_flags(base=None):
+    """Flagi okien-nakładek (wybór obszaru, edytor zrzutu), które muszą mieć
+    fokus klawiatury (ESC, Ctrl+Z, ...).
+
+    X11: BypassWindowManagerHint (nakładka nad wszystkim, bez WM).
+    Wayland/XWayland: okna 'override-redirect' NIE dostają fokusu klawiatury
+    od kompozytora, więc klawisze (nawet ESC) nie docierają. Tam okno musi
+    być zwykłym, zarządzanym oknem (bez Bypass i bez Tool)."""
+    W = Qt.WindowType
+    flags = W.FramelessWindowHint | W.WindowStaysOnTopHint
+    if not _is_wayland_session():
+        flags |= W.BypassWindowManagerHint
+        if base is not None:
+            flags |= base
+    return flags
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  WAYLAND BACKEND
+#  Na Waylandzie aplikacja nie może czytać pikseli ekranu (mss/X11 zwraca
+#  czerń albo tylko okna XWayland). Jedyna dozwolona droga to portal
+#  xdg-desktop-portal (org.freedesktop.portal.Screenshot) albo narzędzie
+#  kompozytora. Poniżej: (1) pobranie zrzutu całego pulpitu, (2) "zamrożona
+#  klatka" dla nakładki wyboru obszaru, (3) cienka nakładka udająca
+#  `mss.MSS()`, dzięki której cały istniejący kod (ok. 35 miejsc) działa
+#  bez zmian. Na Windows/X11 nic z tego nie jest używane.
+# ══════════════════════════════════════════════════════════════════════════
+import shutil as _shutil
+import json as _json
+from urllib.parse import urlparse as _urlparse, unquote as _unquote
+
+_WL_LOCK    = threading.Lock()
+_WL_FROZEN  = None        # PIL.Image (RGB) zrzutu pulpitu albo None
+_WL_GI_PY   = None        # interpreter, w którym działa `import gi`
+
+
+def _wl_log(msg):
+    print(f"[PyshareX][wayland] {msg}", flush=True)
+
+
+# Pomocnik uruchamiany w osobnym procesie: Gio ma własną pętlę GLib, a sygnał
+# Response portalu jest wysyłany TYLKO do połączenia, które wywołało metodę
+# (dlatego nie da się go złapać przez `gdbus monitor`).
+_WL_PORTAL_HELPER = r'''
+import sys, os, json
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+interactive = sys.argv[1] == "1"
+timeout = int(sys.argv[2])
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+sender = bus.get_unique_name()[1:].replace(".", "_")
+token = "pysharex%d" % os.getpid()
+handle = "/org/freedesktop/portal/desktop/request/%s/%s" % (sender, token)
+loop = GLib.MainLoop()
+result = {"code": None, "uri": None}
+def on_response(conn, sender_name, path, iface, signal, params, *a):
+    code, res = params.unpack()
+    result["code"] = code
+    result["uri"] = res.get("uri")
+    loop.quit()
+bus.signal_subscribe("org.freedesktop.portal.Desktop",
+                     "org.freedesktop.portal.Request", "Response", handle,
+                     None, Gio.DBusSignalFlags.NONE, on_response)
+opts = {"handle_token": GLib.Variant("s", token),
+        "interactive":  GLib.Variant("b", interactive),
+        "modal":        GLib.Variant("b", False)}
+bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+              "org.freedesktop.portal.Screenshot", "Screenshot",
+              GLib.Variant("(sa{sv})", ("", opts)), None,
+              Gio.DBusCallFlags.NONE, -1, None)
+def on_timeout():
+    loop.quit()
+    return False
+GLib.timeout_add_seconds(timeout, on_timeout)
+loop.run()
+print(json.dumps(result))
+'''
+
+
+def _wl_find_gi_python():
+    """Pierwszy interpreter, w którym działa `import gi` (venv z PySide6 często
+    go nie ma, a systemowy /usr/bin/python3 w Mint - tak)."""
+    global _WL_GI_PY
+    if _WL_GI_PY is not None:
+        return _WL_GI_PY or None
+    for py in (sys.executable, "/usr/bin/python3", _shutil.which("python3")):
+        if not py:
+            continue
+        try:
+            r = subprocess.run(
+                [py, "-c", "import gi; gi.require_version('Gio','2.0'); "
+                           "from gi.repository import Gio"],
+                capture_output=True, timeout=10)
+            if r.returncode == 0:
+                _WL_GI_PY = py
+                return py
+        except Exception:
+            pass
+    _WL_GI_PY = ""
+    _wl_log("brak PyGObject (gi) -> sudo apt install python3-gi gir1.2-glib-2.0")
+    return None
+
+
+def _wl_open_image(path, delete=False):
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        with Image.open(path) as im:
+            img = im.convert("RGB")
+            img.load()
+        return img
+    except Exception as e:
+        _wl_log(f"nie mogę otworzyć {path}: {e}")
+        return None
+    finally:
+        if delete:
+            try: os.unlink(path)
+            except Exception: pass
+
+
+def _wl_portal_image(interactive=False, timeout=30):
+    """Zrzut przez xdg-desktop-portal. Zwraca PIL.Image (RGB) albo None.
+    interactive=True: kompozytor pokazuje własny wybór okna/obszaru."""
+    py = _wl_find_gi_python()
+    if not py:
+        return None
+    try:
+        r = subprocess.run(
+            [py, "-c", _WL_PORTAL_HELPER, "1" if interactive else "0", str(timeout)],
+            capture_output=True, text=True, timeout=timeout + 10)
+    except Exception as e:
+        _wl_log(f"portal: wyjątek {e}")
+        return None
+    if r.returncode != 0:
+        _wl_log(f"portal: błąd helpera: {r.stderr.strip()[-300:]}")
+        return None
+    try:
+        res = _json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        _wl_log(f"portal: nieczytelna odpowiedź: {r.stdout!r}")
+        return None
+    if res.get("code") != 0 or not res.get("uri"):
+        _wl_log(f"portal: odmowa/anulowanie (code={res.get('code')})")
+        return None
+    path = _unquote(_urlparse(res["uri"]).path)
+    # Plik zrobił portal na nasze życzenie - po wczytaniu go sprzątamy.
+    return _wl_open_image(path, delete=True)
+
+
+def _wl_cli_image():
+    """Zapasowe narzędzia, gdy portal nie działa (zależnie od pulpitu)."""
+    tmp = str(Path(tempfile.gettempdir()) / f"pysharex_wl_{os.getpid()}_{int(time.time()*1000)}.png")
+    candidates = [
+        ["gnome-screenshot", "-f", tmp],                  # GNOME / Cinnamon (Mint)
+        ["spectacle", "-b", "-n", "-f", "-o", tmp],       # KDE Plasma
+        ["grim", tmp],                                    # sway / Hyprland (wlroots)
+    ]
+    for cmd in candidates:
+        if not _shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=15)
+        except Exception:
+            continue
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            img = _wl_open_image(tmp, delete=True)
+            if img is not None:
+                _wl_log(f"zrzut przez {cmd[0]}")
+                return img
+    return None
+
+
+def _wl_capture_full_image():
+    """Cały pulpit (wszystkie monitory) jako PIL.Image RGB, w pikselach fizycznych."""
+    with _WL_LOCK:
+        img = _wl_portal_image(interactive=False)
+        if img is not None:
+            return img
+        _wl_log("portal nie dał zrzutu - próbuję narzędzi CLI")
+        img = _wl_cli_image()
+        if img is None:
+            _wl_log("NIE UDAŁO SIĘ zrobić zrzutu (portal ani CLI). "
+                    "Sprawdź: xdg-desktop-portal + backend pulpitu "
+                    "(np. xdg-desktop-portal-gtk / -xapp / -gnome).")
+        return img
+
+
+def _wl_freeze():
+    """Robi jeden zrzut i trzyma go, dopóki nakładka jest otwarta - cała
+    seria operacji (wybór obszaru, narzędzie Clip, Pixelate) pracuje na tej
+    samej klatce, a nakładka nie wchodzi do zrzutu."""
+    global _WL_FROZEN
+    try:
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+        time.sleep(0.15)    # daj kompozytorowi odrysować pulpit po ukryciu okna głównego
+    except Exception:
+        pass
+    _WL_FROZEN = _wl_capture_full_image()
+    if _WL_FROZEN is not None:
+        _wl_log(f"zamrożona klatka {_WL_FROZEN.width}x{_WL_FROZEN.height}")
+
+
+def _wl_unfreeze():
+    global _WL_FROZEN
+    _WL_FROZEN = None
+
+
+def _wl_frozen_qimage(logical_size):
+    """Zamrożona klatka jako QImage w rozmiarze logicznym nakładki (albo None)."""
+    img = _WL_FROZEN
+    if img is None:
+        return None
+    try:
+        qi = QImage(img.tobytes(), img.width, img.height, img.width * 3,
+                    QImage.Format.Format_RGB888).copy()
+        return qi.scaled(logical_size, Qt.AspectRatioMode.IgnoreAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+    except Exception as e:
+        _wl_log(f"frozen->QImage: {e}")
+        return None
+
+
+def _wl_screen_geoms():
+    """Prostokąty ekranów w układzie Qt (przy xcb == układ X), jako (x, y, w, h)."""
+    out = []
+    for s in QApplication.screens():
+        g = s.geometry()
+        out.append((g.x(), g.y(), g.width(), g.height()))
+    return out
+
+
+class _WaylandShot:
+    """Minimalny odpowiednik obiektu zwracanego przez mss.grab()."""
+    def __init__(self, pil_rgb):
+        self.size   = (pil_rgb.width, pil_rgb.height)
+        self.width  = pil_rgb.width
+        self.height = pil_rgb.height
+        r, g, b = pil_rgb.split()
+        a = Image.new("L", pil_rgb.size, 255)
+        self.bgra = Image.merge("RGBA", (b, g, r, a)).tobytes()
+        self.rgb  = pil_rgb.tobytes()
+
+
+class _WaylandMSS:
+    """Zamiennik `mss.MSS()` na Waylandzie: monitors[] i grab({...}) w
+    współrzędnych Qt/X, a piksele z portalu (albo z zamrożonej klatki)."""
+
+    def __init__(self):
+        geoms = _wl_screen_geoms() or [(0, 0, 1920, 1080)]
+        ux = min(g[0] for g in geoms); uy = min(g[1] for g in geoms)
+        ur = max(g[0] + g[2] for g in geoms); ub = max(g[1] + g[3] for g in geoms)
+        self._origin = (ux, uy)
+        self._extent = (ur - ux, ub - uy)
+        self.monitors = [{"left": ux, "top": uy, "width": ur - ux, "height": ub - uy}]
+        for (x, y, w, h) in geoms:
+            self.monitors.append({"left": x, "top": y, "width": w, "height": h})
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def close(self):
+        pass
+
+    def grab(self, mon):
+        img = _WL_FROZEN if _WL_FROZEN is not None else _wl_capture_full_image()
+        if img is None:
+            raise RuntimeError("Wayland: brak zrzutu ekranu (portal/CLI)")
+        ux, uy = self._origin
+        ew, eh = self._extent
+        sx, sy = img.width / max(1, ew), img.height / max(1, eh)   # skala fizyczna/logiczna
+        l = int(round((mon["left"] - ux) * sx))
+        t = int(round((mon["top"]  - uy) * sy))
+        r = int(round((mon["left"] + mon["width"]  - ux) * sx))
+        b = int(round((mon["top"]  + mon["height"] - uy) * sy))
+        return _WaylandShot(img.crop((l, t, r, b)))
+
+
+class _WaylandMSSModule:
+    """Udaje moduł `mss` (kod używa wyłącznie `mss.MSS()`)."""
+    MSS = _WaylandMSS
+
+
+if _is_wayland_session() and IS_LINUX:
+    mss = _WaylandMSSModule()
+    MSS_AVAILABLE = PIL_AVAILABLE
+    print("[PyshareX] sesja Wayland: piksele ekranu przez xdg-desktop-portal "
+          "(zamiast mss/X11)", flush=True)
+
+
 _X11_WARNED = set()
 
 def _x11_warn(key, msg):
@@ -578,6 +929,73 @@ def _physical_rects_to_local(phys_rects, geo: QRect):
     return out
 
 
+class _DialogDragMover(QObject):
+    """Lets a window-manager-less dialog be moved with the mouse.
+
+    On Linux the dialogs opened above the Capture overlay use X11BypassWindowManagerHint
+    (otherwise they hide behind it), which also removes the title bar, so they could not
+    be moved at all. While the dialog is shown, pressing the left button on its background,
+    on a label or on a group-box frame and dragging moves the whole window. Buttons,
+    sliders, spin boxes, colour pickers etc. are never hijacked."""
+    _GRAB = (QDialog, QLabel, QGroupBox)
+
+    def __init__(self, dlg):
+        super().__init__(dlg)
+        self._dlg = dlg
+        self._start = None            # (global press point, window pos at press)
+        self._on = True
+        app = QApplication.instance()
+        app.installEventFilter(self)
+        # Bez metody-odbiorcy: ten obiekt jest dzieckiem `dlg`, więc przy niszczeniu okna
+        # bywa już usunięty, zanim dotrze sygnał -> PySide6 wypisywał
+        # "AttributeError: Slot '_DialogDragMover::' not found". Funkcja bez odbiorcy
+        # QObject nie ma tego problemu.
+        dlg.finished.connect(lambda *_a, _s=self: _s._remove())
+        dlg.destroyed.connect(lambda *_a, _s=self: _s._remove())
+
+    def _remove(self, *_):
+        if not self._on:
+            return
+        self._on = False
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except RuntimeError:
+                pass
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t not in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove,
+                     QEvent.Type.MouseButtonRelease):
+            return False
+        try:
+            if not isinstance(obj, QWidget) or obj.window() is not self._dlg or not self._dlg.isVisible():
+                return False
+            if t == QEvent.Type.MouseButtonPress:
+                if ev.button() == Qt.MouseButton.LeftButton and isinstance(obj, self._GRAB):
+                    self._start = (ev.globalPosition().toPoint(), self._dlg.pos())
+                return False                       # the widget still gets its normal press
+            if t == QEvent.Type.MouseMove:
+                if self._start is not None and (ev.buttons() & Qt.MouseButton.LeftButton):
+                    gp = ev.globalPosition().toPoint()
+                    self._dlg.move(self._start[1] + (gp - self._start[0]))
+                    return True
+                self._start = None
+                return False
+            self._start = None                      # release
+            return False
+        except RuntimeError:                        # dialog already deleted
+            self._remove()
+            return False
+
+
+def _install_drag_move(dlg):
+    """Make *dlg* draggable when it has no window-manager title bar (Linux overlay dialogs)."""
+    if IS_LINUX and dlg is not None and getattr(dlg, '_drag_mover', None) is None:
+        dlg._drag_mover = _DialogDragMover(dlg)
+
+
 def _set_dialog_on_top(dlg):
     """Set dialog window flags so it appears above fullscreen overlays on all platforms.
     On Linux, X11BypassWindowManagerHint is required to float above fullscreen windows."""
@@ -585,6 +1003,7 @@ def _set_dialog_on_top(dlg):
     if IS_LINUX:
         flags |= Qt.WindowType.X11BypassWindowManagerHint
     dlg.setWindowFlags(flags)
+    _install_drag_move(dlg)
     dlg.raise_()
     dlg.activateWindow()
 
@@ -611,6 +1030,7 @@ def _show_color_dialog(initial_color: QColor, parent=None,
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.X11BypassWindowManagerHint
         )
+        _install_drag_move(dlg)
         # On Linux the alpha spin-box may still show 0 even after passing a
         # color with alpha=255 to the constructor — set it explicitly.
         if alpha:
@@ -1548,7 +1968,6 @@ def _show_toast(title, msg, pixmap, filepath,
 # ─────────────────────────────────────────────
 
 def physical_to_logical_rect(phys_x, phys_y, phys_w, phys_h) -> QRect:
-    import mss
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import QRect
     
@@ -1823,11 +2242,7 @@ class RegionSelector(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.BypassWindowManagerHint
-        )
+        self.setWindowFlags(_overlay_window_flags())
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -1849,6 +2264,8 @@ class RegionSelector(QWidget):
         QTimer.singleShot(50, self._force_focus)
 
     def _force_focus(self):
+        if _is_wayland_session():
+            self.setGeometry(self._geo)   # zarządzane okno: WM mógł je przesunąć
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
@@ -1922,7 +2339,6 @@ class RegionSelector(QWidget):
                 final_y = int(logical_geom.y() * ratio) + phys_local_y
 
                 try:
-                    import mss
                     with mss.MSS() as sct:
                         # Use _emit_region_from_global_rect logic — match by
                         # physical origin (geometry * ratio) not by list order,
@@ -2025,6 +2441,23 @@ def _emit_region_from_global_rect(r: QRect, signal):
         print(f"[PyshareX] Monitor matching error: {ex}")
 
     signal.emit(final_x, final_y, phys_w, phys_h)
+
+class _SelectionLayer(QWidget):
+    """Transparent, mouse-transparent child of the Capture overlay stacked ABOVE the annotation
+    canvas (but below the toolbar). It paints the selection frame and its size label, so
+    annotation items can never cover them."""
+    def __init__(self, overlay):
+        super().__init__(overlay)
+        self._ov = overlay
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setGeometry(overlay.rect())
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        self._ov._paint_selection_layer(p)
+        p.end()
+
 
 class _OverlayCanvas(QGraphicsView):
     """
@@ -2149,6 +2582,55 @@ class _OverlayCanvas(QGraphicsView):
                       QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self._scene.addItem(item)
         return item
+
+    def add_pixelate_blur(self, rect: QRectF, mode: str = 'pixelate',
+                          pixel_size: int = 12, blur_radius: int = 10):
+        item = PixelateBlurItem()
+        item.setRect(rect)
+        item.mode = mode
+        item.pixel_size = int(pixel_size)
+        item.blur_radius = int(blur_radius)
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self._scene.addItem(item)
+        return item
+
+    def add_smart_eraser(self, rect: QRectF, color: QColor):
+        item = SmartEraserItem()
+        item.setRect(rect)
+        item.fill_color = QColor(color)
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self._scene.addItem(item)
+        return item
+
+    def add_spotlight(self, rect: QRectF, blur_radius: int = 2,
+                      outline_on: bool = False, outline_w: int = 3, outline_color=None,
+                      defer_draw: bool = True):
+        item = SpotlightItem()
+        item.setRect(rect)
+        item.blur_radius = int(blur_radius)
+        item.outline_enabled = bool(outline_on)
+        item.outline_width = int(outline_w)
+        item.defer_draw = bool(defer_draw)
+        if outline_color is not None:
+            item.outline_color = QColor(outline_color)
+        item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self._scene.addItem(item)
+        return item
+
+    def paint_effect_base(self, painter, rect: QRectF) -> bool:
+        """Base layer under Pixelate/Blur items: the desktop as it looked when the
+        overlay opened (scene coords == overlay-local coords == snapshot pixels)."""
+        snap = getattr(self.parent(), '_desktop_snapshot', None)
+        if snap is None or snap.isNull():
+            return False
+        painter.drawImage(rect, snap, rect)
+        return True
 
     def add_arrow(self, line: QLineF, color: QColor, width: int, head_style: str = 'single'):
         item = ArrowItem(line, self)
@@ -2277,9 +2759,11 @@ class _OverlayCanvas(QGraphicsView):
                 if math.hypot(local_pos.x() - rp.x(), local_pos.y() - rp.y()) <= 10:
                     return item, 'RADIUS'
 
-            # Rotation handle — above top edge (all rect/ellipse/pixmap/freehand items)
+            # Rotation handle — above top edge (all rect/ellipse/pixmap/freehand items;
+            # not for Pixelate/Blur, whose effect is always axis-aligned)
             rot_pt = QPointF(rect.center().x(), rect.top() - 30)
-            if (abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
+            if (not isinstance(item, PixelateBlurItem) and
+                    abs(local_pos.x() - rot_pt.x()) < m * 1.5 and
                     abs(local_pos.y() - rot_pt.y()) < m * 1.5):
                 return item, 'ROTATE'
 
@@ -2479,6 +2963,8 @@ class _OverlayCanvas(QGraphicsView):
     # list of annotation items.
     def _clone_item(self, item):
         """Return a standalone (detached) copy of a supported annotation item."""
+        if isinstance(item, PixelateBlurItem):
+            return _clone_pixblur(item)
         if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
             cls = type(item)
             dup = cls()
@@ -2689,6 +3175,8 @@ class _ToolPrefs:
                           'head': ArrowItem.HEAD_SINGLE},
             'freehand':  {'color': QColor(red), 'width': round(width * 1.6)},
             'highlight': {'color': QColor(255, 255, 0, 100)},
+            'pixelate_blur': {'mode': 'pixelate', 'pixel': 12, 'blur': 10},
+            'spotlight': {'blur': 2, 'ol_on': False, 'ol_w': 3, 'ol': QColor(255, 0, 0), 'defer': True},
             'bubble':    {'fg': QColor(red), 'bg': QColor(230, 230, 230, 240)},
             'marker':    {'bg': QColor(255, 0, 0), 'fg': QColor(255, 255, 255), 'scale': 1.0},
             'text':      {'color': QColor(red), 'size': font_size,
@@ -2721,6 +3209,9 @@ def _prefs_key_for_item(item):
     if isinstance(item, LineItem):              return 'line'
     if isinstance(item, FreehandItem):          return 'freehand'
     if isinstance(item, HighlightRectItem):     return 'highlight'
+    if isinstance(item, SmartEraserItem):       return None      # no options
+    if isinstance(item, SpotlightItem):         return 'spotlight'
+    if isinstance(item, PixelateBlurItem):      return 'pixelate_blur'
     if isinstance(item, TextBubbleItem):        return 'bubble'
     if isinstance(item, _MarkerItem):           return 'marker'
     if isinstance(item, ResizableEllipseItem):  return 'circle'
@@ -3727,6 +4218,24 @@ def _build_options_dialog(key, parent, prefs, item=None, allow_fill=False):
         if item is not None:
             return HighlightEditDialog(item._color, parent, target_item=item)
         return HighlightEditDialog(prefs.get('highlight', 'color'), parent)
+    if key == 'spotlight':
+        if item is not None:
+            return SpotlightEditDialog(item.blur_radius, parent, target_item=item,
+                                       outline_on=item.outline_enabled,
+                                       outline_width=item.outline_width,
+                                       outline_color=item.outline_color,
+                                       defer_draw=item.defer_draw)
+        return SpotlightEditDialog(prefs.get('spotlight', 'blur'), parent,
+                                   outline_on=prefs.get('spotlight', 'ol_on'),
+                                   outline_width=prefs.get('spotlight', 'ol_w'),
+                                   outline_color=prefs.get('spotlight', 'ol'),
+                                   defer_draw=prefs.get('spotlight', 'defer'))
+    if key == 'pixelate_blur':
+        if item is not None:
+            return PixelateBlurEditDialog(item.mode, item.pixel_size, item.blur_radius,
+                                          parent, target_item=item)
+        p = prefs.all('pixelate_blur')
+        return PixelateBlurEditDialog(p['mode'], p['pixel'], p['blur'], parent)
     if key == 'bubble':
         if item is not None:
             return _BubbleEditDialog(item._fg_color, item._bg_color, item._text,
@@ -3785,6 +4294,13 @@ def _store_dialog_in_prefs(key, dlg, prefs, allow_fill=False):
         prefs.update('arrow', width=int(w), color=c, head=h)
     elif key == 'highlight':
         prefs.set('highlight', 'color', dlg.result_color())
+    elif key == 'spotlight':
+        b, ol_on, ol_w, ol_c, dfr = dlg.result_data()
+        prefs.update('spotlight', blur=int(b), ol_on=bool(ol_on), ol_w=int(ol_w), ol=ol_c,
+                     defer=bool(dfr))
+    elif key == 'pixelate_blur':
+        m, px, br = dlg.result_data()
+        prefs.update('pixelate_blur', mode=m, pixel=int(px), blur=int(br))
     elif key == 'bubble':
         _t, fg, bg = dlg.result_data()
         prefs.update('bubble', fg=fg, bg=bg)
@@ -3825,6 +4341,17 @@ def _commit_item_dialog(key, dlg, item, allow_fill=False):
         pen = item.pen(); pen.setWidth(int(w)); pen.setColor(QColor(c)); item.setPen(pen)
         item.head_style = h
         item.prepareGeometryChange(); item.update()
+    elif key == 'spotlight':
+        b, ol_on, ol_w, ol_c, dfr = dlg.result_data()
+        item.prepareGeometryChange()
+        item.defer_draw = bool(dfr)
+        item.blur_radius = int(b)
+        item.outline_enabled, item.outline_width, item.outline_color = bool(ol_on), int(ol_w), QColor(ol_c)
+        item.update()
+    elif key == 'pixelate_blur':
+        m, px, br = dlg.result_data()
+        item.mode, item.pixel_size, item.blur_radius = m, int(px), int(br)
+        item.update()
     elif key == 'highlight':
         c = dlg.result_color()
         item._color = c
@@ -3982,6 +4509,667 @@ class HighlightRectItem(QGraphicsRectItem):
             self.setPen(Qt.PenStyle.NoPen)
             self.setBrush(QBrush(self._color))
             self.update()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Pixelate / Blur tool
+#  ---------------------------------------------------------------------------
+#  A rectangle that pixelates or blurs *whatever lies underneath it*:
+#    • Capture Region overlay → the desktop snapshot taken when the overlay
+#      opened (plus any annotations drawn below the rectangle),
+#    • Image Editor           → the background image and every item below it.
+#  The effect is computed live in paint(), so moving / resizing the rectangle,
+#  or changing whatever is under it, always shows the correct result — and it
+#  ends up in the saved image / screen grab exactly as it is shown.
+# ═════════════════════════════════════════════════════════════════════════════
+_pixblur_depth = [0]      # guards against runaway recursion between stacked effect items
+
+_OVERLAY_DIM_ALPHA = 90   # darkening the Capture Region overlay lays over the desktop while annotating
+
+
+def _overlay_dim_active(item) -> bool:
+    """True while *item* sits on the Capture Region overlay and its dark dimming layer is
+    visible. Annotations that reproduce the desktop (Smart Eraser, Pixelate/Blur, Spotlight)
+    are computed from the UNdimmed snapshot, so on screen they must be dimmed too —
+    otherwise they look lighter than their surroundings. (The dim is hidden before the real
+    capture, so the saved image is unaffected.)"""
+    sc = item.scene()
+    if sc is None:
+        return False
+    for v in sc.views():
+        ov = v.parent()
+        if ov is not None and getattr(ov, '_desktop_snapshot', None) is not None:
+            return not getattr(ov, '_hide_bg', True)
+    return False
+
+
+def _is_screen_painter(painter) -> bool:
+    """On-screen painting (a widget viewport) as opposed to export / backdrop images."""
+    return not isinstance(painter.device(), (QImage, QPixmap))
+
+
+def _pixblur_effect_backdrop(item, scene_rect: QRectF):
+    """Pixels lying UNDER *item* inside *scene_rect* (1 image px = 1 scene unit).
+
+    Paints the host's base layer (desktop snapshot in the overlay; nothing in
+    the editor, where the background image is an ordinary item) and then every
+    item stacked BELOW *item*, so annotations above the effect stay crisp.
+    Returns a QImage, or None when no base layer is available.
+    """
+    if _pixblur_depth[0] > 4:
+        return None
+    sc = item.scene()
+    if sc is None or scene_rect.width() <= 0 or scene_rect.height() <= 0:
+        return None
+    from PySide6.QtWidgets import QStyleOptionGraphicsItem
+    w = max(1, int(math.ceil(scene_rect.width())))
+    h = max(1, int(math.ceil(scene_rect.height())))
+    img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    p.scale(w / scene_rect.width(), h / scene_rect.height())
+    p.translate(-scene_rect.topLeft())
+    _pixblur_depth[0] += 1
+    try:
+        for view in sc.views():
+            hook = getattr(view, 'paint_effect_base', None)
+            if hook is not None:
+                if not hook(p, scene_rect):
+                    return None
+                break
+        for it in sc.items(Qt.SortOrder.AscendingOrder):      # back → front
+            if it is item:
+                break                                          # everything above stays untouched
+            # NOTE: do NOT call it.parentItem() here. In PySide6 it makes shiboken
+            # drop ownership of a top-level item that only the scene references,
+            # so Python then DELETES it → every annotation (Smart Eraser, rectangles…)
+            # silently vanished the first time a Pixelate/Spotlight/Smart-Eraser
+            # backdrop was computed. topLevelItem() is side-effect free.
+            if (not it.isVisible() or it.topLevelItem() is not it
+                    or isinstance(it, CropOverlayItem)):
+                continue
+            if not it.sceneBoundingRect().intersects(scene_rect):
+                continue
+            opt = QStyleOptionGraphicsItem()
+            opt.exposedRect = it.boundingRect()
+            p.save()
+            p.setOpacity(it.opacity())
+            p.setTransform(it.sceneTransform(), True)
+            it.paint(p, opt, None)
+            p.restore()
+    finally:
+        _pixblur_depth[0] -= 1
+        p.end()
+    return img
+
+
+def _pixblur_pixelate(img: QImage, block: int) -> QImage:
+    """Mosaic: average every block×block cell, then blow it up with no smoothing."""
+    w, h = img.width(), img.height()
+    block = max(2, int(block))
+    nx = max(1, int(round(w / block)))
+    ny = max(1, int(round(h / block)))
+    small = img.scaled(nx, ny, Qt.AspectRatioMode.IgnoreAspectRatio,
+                       Qt.TransformationMode.SmoothTransformation)
+    return small.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                        Qt.TransformationMode.FastTransformation)
+
+
+def _pixblur_blur(img: QImage, radius: int) -> QImage:
+    """Gaussian blur (Pillow when available, a Qt down/up-scale fallback otherwise).
+    The region is edge-extended first, so its borders don't fade out."""
+    w, h = img.width(), img.height()
+    f = 1.0
+    if w * h > 2_500_000:                  # huge region: blur a reduced copy (keeps dragging smooth)
+        f = math.sqrt(w * h / 2_500_000.0)
+    if radius >= 8:                        # a wide Gaussian is smooth anyway → blur a reduced copy (~4px sigma)
+        f = max(f, float(radius) / 4.0)
+    work = img
+    if f > 1.0:
+        work = img.scaled(max(1, int(w / f)), max(1, int(h / f)),
+                          Qt.AspectRatioMode.IgnoreAspectRatio,
+                          Qt.TransformationMode.SmoothTransformation)
+    r = max(0.5, float(radius) / f)
+    pad = int(math.ceil(r * 3)) + 1
+    ww, wh = work.width(), work.height()
+
+    padded = QImage(ww + 2 * pad, wh + 2 * pad, QImage.Format.Format_ARGB32_Premultiplied)
+    padded.fill(Qt.GlobalColor.transparent)
+    pp = QPainter(padded)
+    pp.drawImage(pad, pad, work)
+    pp.drawImage(QRect(pad, 0, ww, pad),             work, QRect(0, 0, ww, 1))
+    pp.drawImage(QRect(pad, pad + wh, ww, pad),      work, QRect(0, wh - 1, ww, 1))
+    pp.drawImage(QRect(0, pad, pad, wh),             work, QRect(0, 0, 1, wh))
+    pp.drawImage(QRect(pad + ww, pad, pad, wh),      work, QRect(ww - 1, 0, 1, wh))
+    for dx, dy, sx, sy in ((0, 0, 0, 0), (pad + ww, 0, ww - 1, 0),
+                           (0, pad + wh, 0, wh - 1), (pad + ww, pad + wh, ww - 1, wh - 1)):
+        pp.drawImage(QRect(dx, dy, pad, pad), work, QRect(sx, sy, 1, 1))
+    pp.end()
+
+    blurred = None
+    if PIL_AVAILABLE:
+        try:
+            from PIL import ImageFilter
+            rgba = padded.convertToFormat(QImage.Format.Format_RGBA8888)
+            pil = Image.frombytes("RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()))
+            pil = pil.filter(ImageFilter.GaussianBlur(r))
+            blurred = QImage(pil.tobytes(), pil.width, pil.height, pil.width * 4,
+                             QImage.Format.Format_RGBA8888).copy()
+        except Exception as ex:
+            print(f"[PyshareX] blur (Pillow) failed, using Qt fallback: {ex}")
+            blurred = None
+    if blurred is None:
+        s = max(1.0, r)
+        small = padded.scaled(max(1, int(padded.width() / s)), max(1, int(padded.height() / s)),
+                              Qt.AspectRatioMode.IgnoreAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+        blurred = small.scaled(padded.width(), padded.height(),
+                               Qt.AspectRatioMode.IgnoreAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+    out = blurred.copy(pad, pad, ww, wh)
+    if f > 1.0:
+        out = out.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+    return out
+
+
+def _pixblur_draw_replacing(item, painter, target: QRectF, img: QImage, source: QRectF = None):
+    """Draw an effect image so that it REPLACES what lies below instead of being laid on top.
+
+    The effect is computed from the items underneath; with plain SourceOver, wherever the
+    base is transparent (Image Editor canvas without a background picture) the effect
+    comes out semi-transparent and the original sharp content shines through it — a
+    "ghost" of the un-pixelated/un-blurred pixels. Alpha-capable targets (export /
+    clipboard / backdrop images) therefore use CompositionMode_Source; the on-screen
+    viewport (no alpha) first gets the view's own transparency background re-painted
+    in the region (view hook ``paint_effect_clear``) and the effect is drawn over that.
+    """
+    painter.save()
+    try:
+        dev = painter.device()
+        if isinstance(dev, (QImage, QPixmap)) and dev.hasAlphaChannel():
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        else:
+            sc = item.scene()
+            hook = None
+            for v in (sc.views() if sc is not None else ()):
+                hook = getattr(v, 'paint_effect_clear', None)
+                if hook is not None:
+                    break
+            if hook is not None:
+                inv, ok = item.sceneTransform().inverted()
+                if ok:
+                    painter.save()
+                    painter.setClipRect(target, Qt.ClipOperation.IntersectClip)
+                    painter.setWorldTransform(inv * painter.worldTransform())
+                    hook(painter, item.mapRectToScene(target))
+                    painter.restore()
+        if source is not None:
+            painter.drawImage(target, img, source)
+        else:
+            painter.drawImage(target, img)
+        if _is_screen_painter(painter) and _overlay_dim_active(item):
+            painter.fillRect(target, QColor(0, 0, 0, _OVERLAY_DIM_ALPHA))
+    finally:
+        painter.restore()
+
+
+class PixelateBlurItem(QGraphicsRectItem):
+    """Rectangle that pixelates ('pixelate') or blurs ('blur') everything below it.
+
+    ``pixel_size`` = mosaic block size in px, ``blur_radius`` = Gaussian radius in px
+    (both are the tool's "intensity"). Not rotatable — the effect is always
+    axis-aligned — but movable and resizable like the other rectangles.
+    """
+    MODE_PIXELATE = 'pixelate'
+    MODE_BLUR = 'blur'
+
+    def __init__(self, rect=QRectF(), parent=None):
+        super().__init__(rect, parent)
+        self.mode = self.MODE_PIXELATE
+        self.pixel_size = 12
+        self.blur_radius = 10
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+
+    def boundingRect(self):
+        r = super().boundingRect()
+        if r.width() < 1 or r.height() < 1:          # zero-size guard (see HighlightRectItem)
+            return QRectF(r.x() - 8, r.y() - 8, 16, 16)
+        return r.adjusted(-8, -8, 8, 8)              # room for the selection handles
+
+    def _effect_image(self):
+        r = self.rect()
+        if r.width() < 1 or r.height() < 1:
+            return None
+        base = _pixblur_effect_backdrop(self, self.mapRectToScene(r))
+        if base is None:
+            return None
+        if self.mode == self.MODE_BLUR:
+            return _pixblur_blur(base, self.blur_radius)
+        return _pixblur_pixelate(base, self.pixel_size)
+
+    def paint(self, painter, option, widget=None):
+        r = self.rect()
+        if r.width() >= 1 and r.height() >= 1:
+            img = self._effect_image()
+            painter.save()
+            if img is not None:
+                _pixblur_draw_replacing(self, painter, r, img)
+            else:                                     # no backdrop available → neutral placeholder
+                painter.fillRect(r, QColor(110, 110, 110, 200))
+            painter.restore()
+        self._paint_selection(painter, r)
+
+    def _paint_selection(self, painter, r):
+        """Selection frame + resize handles (shared with SpotlightItem)."""
+        if self.isSelected() and _pixblur_depth[0] == 0:   # never bake the frame/handles into a backdrop
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(0, 0, 0, 170), 1))
+            painter.drawRect(r)
+            sel_pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
+            sel_pen.setDashPattern([4, 3])
+            painter.setPen(sel_pen)
+            painter.drawRect(r)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            for hp in (r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight(),
+                       QPointF(r.center().x(), r.top()), QPointF(r.center().x(), r.bottom()),
+                       QPointF(r.left(), r.center().y()), QPointF(r.right(), r.center().y())):
+                painter.setBrush(QBrush(Qt.GlobalColor.white))
+                painter.setPen(QPen(QColor(60, 120, 255), 1.5))
+                painter.drawEllipse(hp, 5, 5)
+            painter.restore()
+
+
+def _clone_pixblur(item):
+    """Detached copy of a PixelateBlurItem (used by every _clone_item)."""
+    dup = type(item)()
+    dup.setRect(QRectF(item.rect()))
+    dup.mode = item.mode
+    dup.pixel_size = int(item.pixel_size)
+    dup.blur_radius = int(item.blur_radius)
+    if hasattr(item, 'fill_color'):
+        dup.fill_color = QColor(item.fill_color)
+    if isinstance(item, SpotlightItem):
+        dup.outline_enabled = bool(item.outline_enabled)
+        dup.outline_width = int(item.outline_width)
+        dup.outline_color = QColor(item.outline_color)
+        dup.defer_draw = bool(item.defer_draw)
+    dup.setFlags(item.flags())
+    dup.setPos(item.pos())
+    return dup
+
+
+def _pixblur_add_mode_actions(menu, item):
+    """Context-menu block:   Mode / ✓ Pixelate / Blur / ───.
+    Returns (pixelate_action, blur_action); the active mode carries the check mark."""
+    hdr = menu.addAction("Mode")
+    hdr.setEnabled(False)
+    act_pix = menu.addAction("Pixelate")
+    act_pix.setCheckable(True)
+    act_pix.setChecked(item.mode != PixelateBlurItem.MODE_BLUR)
+    act_blur = menu.addAction("Blur")
+    act_blur.setCheckable(True)
+    act_blur.setChecked(item.mode == PixelateBlurItem.MODE_BLUR)
+    menu.addSeparator()
+    return act_pix, act_blur
+
+
+def _pixblur_set_mode(item, mode, prefs=None):
+    """Switch one item's mode (and remember it as the tool's default for new ones)."""
+    item.mode = mode
+    item.update()
+    if prefs is not None:
+        prefs.set('pixelate_blur', 'mode', mode)
+
+
+class PixelateBlurEditDialog(_ToolOptionsDialog):
+    """Pixelate / Blur: mode + one intensity slider for each mode."""
+    SHOW_OPACITY = False
+
+    def __init__(self, mode, pixel_size, blur_radius, parent=None, target_item=None):
+        super().__init__("Pixelate / Blur", parent, target_item)
+        self._orig = (mode, int(pixel_size), int(blur_radius))
+
+        self.main_lay.addWidget(QLabel("Mode:"))
+        mode_row = QHBoxLayout()
+        self.rb_pixelate = QRadioButton("Pixelate")
+        self.rb_blur = QRadioButton("Blur")
+        (self.rb_blur if mode == PixelateBlurItem.MODE_BLUR else self.rb_pixelate).setChecked(True)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self.rb_pixelate)
+        self._mode_group.addButton(self.rb_blur)
+        mode_row.addWidget(self.rb_pixelate)
+        mode_row.addWidget(self.rb_blur)
+        mode_row.addStretch(1)
+        self.main_lay.addLayout(mode_row)
+
+        _, self.spin_pixel = self._make_width_row("Pixelate intensity (block size):",
+                                                  pixel_size, 2, 100)
+        _, self.spin_blur = self._make_width_row("Blur intensity (radius):",
+                                                 blur_radius, 1, 100)
+        self.rb_pixelate.toggled.connect(self._apply_preview)
+        self.finish()
+        self._tabs.hide()            # no colours here → no (empty) tab strip
+
+    def current_mode(self) -> str:
+        return PixelateBlurItem.MODE_BLUR if self.rb_blur.isChecked() else PixelateBlurItem.MODE_PIXELATE
+
+    def result_data(self):
+        """(mode, pixelate block size px, blur radius px)"""
+        return (self.current_mode(), self.spin_pixel.value(), self.spin_blur.value())
+
+    def _apply_preview(self, *_):
+        it = self._target_item
+        if it is None:
+            return
+        it.mode, it.pixel_size, it.blur_radius = self.result_data()
+        it.update()
+
+    def restore_original(self):
+        it = self._target_item
+        if it is None:
+            return
+        it.mode, it.pixel_size, it.blur_radius = self._orig
+        it.update()
+
+    _restore_original = restore_original
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Spotlight tool
+#  ---------------------------------------------------------------------------
+#  The inverse of Pixelate / Blur: the rectangle itself stays sharp, while
+#  EVERYTHING ELSE on the canvas (the whole scene rect) is blurred. Built on
+#  PixelateBlurItem so that handles, resizing, cloning, undo/redo and deleting
+#  all work exactly like they do for the Pixelate / Blur rectangle.
+#  Annotations stacked above the spotlight stay crisp, those below get blurred.
+# ═════════════════════════════════════════════════════════════════════════════
+def _spotlight_area(sc) -> QRectF:
+    """Area a Spotlight blurs: the background image in the Image Editor (whose scene rect
+    is a huge 100000×100000 free-pan rect — far too big to render), else the scene rect
+    (Capture Region overlay: the overlay itself)."""
+    for v in sc.views():
+        bg = getattr(v, 'bg_item', None)
+        if bg is not None:
+            return bg.sceneBoundingRect()
+    return sc.sceneRect()
+
+
+class SpotlightItem(PixelateBlurItem):
+    """Sharp rectangle; everything outside it (inside the scene rect) is blurred.
+    ``blur_radius`` is the intensity."""
+    MODE_SPOTLIGHT = 'spotlight'
+
+    def __init__(self, rect=QRectF(), parent=None):
+        super().__init__(rect, parent)
+        self.mode = self.MODE_SPOTLIGHT
+        self.blur_radius = 2
+        self.outline_enabled = False            # optional frame around the sharp rectangle
+        self.outline_width = 3
+        self.outline_color = QColor(255, 0, 0)
+        self.defer_draw = True       # while dragging: only a white dashed frame, blur on release
+        self._manip = False          # True while the rectangle is being drawn / moved / resized
+        self._last_geom = None
+        self._poll_on = False
+        self._blur_cache = None      # (radius, backdrop QImage, blurred QImage)
+
+    def _canvas_rect(self):
+        """Whole scene rect expressed in this item's own coordinates."""
+        sc = self.scene()
+        if sc is None:
+            return QRectF()
+        return self.mapRectFromScene(_spotlight_area(sc))
+
+    def boundingRect(self):
+        r = self.rect()
+        if r.width() < 1 or r.height() < 1:
+            base = QRectF(r.x() - 8, r.y() - 8, 16, 16)
+        else:
+            m = 8 + (self.outline_width if self.outline_enabled else 0)
+            base = r.adjusted(-m, -m, m, m)
+        c = self._canvas_rect()
+        return base.united(c) if not c.isNull() else base
+
+    def shape(self):
+        # Only the sharp rectangle is clickable — the blurred surroundings must
+        # not swallow clicks meant for other items or for the Select tool.
+        path = QPainterPath()
+        path.addRect(self.rect())
+        return path
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            self.prepareGeometryChange()      # bounding rect follows the scene rect
+        return super().itemChange(change, value)
+
+    def _blurred(self, base: QImage) -> QImage:
+        """Blurred copy of *base*, reused while neither the content underneath nor the
+        intensity changed. Moving / resizing the spotlight rectangle does not change what
+        is blurred (only which part is cut out), so dragging costs no blur at all."""
+        radius = int(self.blur_radius)
+        c = self._blur_cache
+        if c is not None and c[0] == radius and c[1].size() == base.size() and c[1] == base:
+            return c[2]
+        img = _pixblur_blur(base, radius)
+        self._blur_cache = (radius, base, img)
+        return img
+
+    def _poll_release(self):
+        """Runs while a drag is in progress; repaints with the real effect once the left
+        mouse button is let go (nothing else would trigger a repaint on release)."""
+        try:
+            if self.scene() is None:      # preview copy already replaced / removed → stop polling
+                self._poll_on = False
+                return
+            if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+                QTimer.singleShot(30, self._poll_release)
+                return
+            self._poll_on = False
+            self._manip = False
+            self.update()
+        except RuntimeError:              # item already deleted
+            self._poll_on = False
+
+    def _dragging_now(self) -> bool:
+        """True while this spotlight's geometry changes with the left button held down."""
+        pos = self.pos()
+        r = self.rect()
+        geom = (r.x(), r.y(), r.width(), r.height(), pos.x(), pos.y())
+        down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+        # First paint with the button already held = the item is being drawn right now
+        # (the Capture overlay builds a fresh preview item on every mouse move, so it
+        # never has a previous geometry to compare with).
+        if down and (self._last_geom is None or geom != self._last_geom):
+            self._manip = True
+        self._last_geom = geom
+        if not down:
+            self._manip = False
+        if self._manip and not self._poll_on:
+            self._poll_on = True
+            QTimer.singleShot(30, self._poll_release)
+        return self._manip
+
+    def paint(self, painter, option, widget=None):
+        r = self.rect()
+        sc = self.scene()
+        if (self.defer_draw and _pixblur_depth[0] == 0 and _is_screen_painter(painter)
+                and self._dragging_now()):
+            # fast path: no backdrop render, no blur — just the frame
+            if r.width() >= 1 and r.height() >= 1 and not self.isSelected():
+                painter.save()
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(0, 0, 0, 170), 1))
+                painter.drawRect(r)
+                dash = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine)
+                dash.setDashPattern([4, 3])
+                painter.setPen(dash)
+                painter.drawRect(r)
+                painter.restore()
+            self._paint_selection(painter, r)
+            return
+        if sc is not None and r.width() >= 1 and r.height() >= 1:
+            scene_rect = _spotlight_area(sc)
+            c = self.mapRectFromScene(scene_rect)
+            # Only the part Qt actually asks for needs drawing (a drag repaints small areas)
+            exp = option.exposedRect.intersected(c) if option is not None else c
+            if not exp.isEmpty() and not (exp.width() <= r.width() and exp.height() <= r.height()
+                                          and r.contains(exp)):      # fully inside the sharp rect → nothing to blur
+                _t0 = time.monotonic()
+                base = _pixblur_effect_backdrop(self, scene_rect)
+                if base is not None:
+                    img = self._blurred(base)
+                    _dt = time.monotonic() - _t0
+                    if _dt > 0.3:
+                        print(f"[PyshareX] Spotlight: przeliczenie rozmycia {base.width()}x{base.height()} "
+                              f"zajęło {_dt:.2f}s (po undo/redo liczone od nowa)", flush=True)
+                    sx = img.width() / max(c.width(), 1e-6)
+                    sy = img.height() / max(c.height(), 1e-6)
+                    src = QRectF((exp.x() - c.x()) * sx, (exp.y() - c.y()) * sy,
+                                 exp.width() * sx, exp.height() * sy)
+                    outside = QPainterPath()
+                    outside.setFillRule(Qt.FillRule.OddEvenFill)
+                    outside.addRect(c)
+                    outside.addRect(r)
+                    painter.save()
+                    painter.setClipPath(outside, Qt.ClipOperation.IntersectClip)
+                    _pixblur_draw_replacing(self, painter, exp, img, src)
+                    painter.restore()
+        if self.outline_enabled and r.width() >= 1 and r.height() >= 1:
+            # frame sits just OUTSIDE the sharp area, so the spotlight content stays uncovered
+            w = float(max(1, int(self.outline_width)))
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            pen = QPen(QColor(self.outline_color), w)
+            pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+            painter.setPen(pen)
+            painter.drawRect(r.adjusted(-w / 2, -w / 2, w / 2, w / 2))
+            painter.restore()
+        self._paint_selection(painter, r)
+
+
+class SpotlightEditDialog(_ToolOptionsDialog):
+    """Spotlight options: blur intensity of everything outside the selection,
+    plus an optional outline (on/off, width, colour) around the sharp area."""
+    SHOW_OPACITY = True
+
+    def __init__(self, blur_radius, parent=None, target_item=None,
+                 outline_on=False, outline_width=3, outline_color=None, defer_draw=True):
+        super().__init__("Spotlight", parent, target_item)
+        self._orig = (int(blur_radius), bool(outline_on), int(outline_width),
+                      QColor(outline_color) if outline_color is not None else QColor(255, 0, 0),
+                      bool(defer_draw))
+        self.main_lay.addWidget(QLabel("Everything outside the selected area is blurred."))
+        _, self.spin_blur = self._make_width_row("Blur intensity (radius):",
+                                                 blur_radius, 1, 100)
+        self.chk_defer = QCheckBox("Fast drawing: blur only after releasing the mouse "
+                                   "(white dashed frame while dragging)")
+        self.chk_defer.setChecked(bool(defer_draw))
+        self.chk_defer.toggled.connect(self._apply_preview)
+        self.main_lay.addWidget(self.chk_defer)
+        self.chk_outline = QCheckBox("Outline around the selected area")
+        self.chk_outline.setChecked(bool(outline_on))
+        self.chk_outline.toggled.connect(self._apply_preview)
+        self.main_lay.addWidget(self.chk_outline)
+        _, self.spin_ol = self._make_width_row("Outline width:", outline_width, 1, 50)
+        self.add_color_slot('ol', "Outline color", self._orig[3], alpha=True)
+        self.finish()
+
+    def result_data(self):
+        """(blur radius px, outline on, outline width px, outline colour, deferred drawing)"""
+        return (self.spin_blur.value(), self.chk_outline.isChecked(),
+                self.spin_ol.value(), self.slot_color('ol'), self.chk_defer.isChecked())
+
+    def _push(self, it, vals):
+        b, on, w, c, dfr = vals
+        it.prepareGeometryChange()
+        it.defer_draw = bool(dfr)
+        it.blur_radius = int(b)
+        it.outline_enabled, it.outline_width, it.outline_color = bool(on), int(w), QColor(c)
+        it.update()
+
+    def _apply_preview(self, *_):
+        it = self._target_item
+        if it is None or not self._finished:
+            return
+        self._push(it, self.result_data())
+
+    def restore_original(self):
+        it = self._target_item
+        if it is None:
+            return
+        self._push(it, self._orig)
+
+    _restore_original = restore_original
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Smart Eraser tool
+#  ---------------------------------------------------------------------------
+#  Click = sample the colour of the pixel under the cursor (as currently shown,
+#  annotations included); drag = a rectangle filled with exactly that colour,
+#  drawn without antialiasing / outline so it blends seamlessly into flat areas.
+#  Built on PixelateBlurItem → same handles, resizing, cloning, undo and delete.
+# ═════════════════════════════════════════════════════════════════════════════
+class SmartEraserItem(PixelateBlurItem):
+    """Rectangle filled with one sampled colour (``fill_color``). No options."""
+    MODE_SMART_ERASER = 'smart_eraser'
+
+    def __init__(self, rect=QRectF(), parent=None):
+        super().__init__(rect, parent)
+        self.mode = self.MODE_SMART_ERASER
+        self.fill_color = QColor(128, 128, 128)
+
+    def paint(self, painter, option, widget=None):
+        r = self.rect()
+        if r.width() >= 1 and r.height() >= 1:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            painter.fillRect(r.toAlignedRect(), self.fill_color)
+            if _is_screen_painter(painter) and _overlay_dim_active(self):
+                painter.fillRect(r.toAlignedRect(), QColor(0, 0, 0, _OVERLAY_DIM_ALPHA))
+            painter.restore()
+        self._paint_selection(painter, r)
+
+
+_SMART_ERASER_SAMPLE_RADIUS = 3      # sampling window = (2*r+1)² px around the click
+
+
+def _smart_eraser_sample(scene, pt: QPointF) -> QColor:
+    """Background colour at scene point *pt* as currently displayed (host base layer +
+    every item in the scene).
+
+    A single pixel is a poor sample: anti-aliased text edges, JPEG noise or a soft
+    gradient make it differ from the surrounding flat area, so the patch stood out.
+    Instead a small window around the click is read and the per-channel MEDIAN is used —
+    stray text/edge pixels are ignored and the dominant background colour wins."""
+    rad = _SMART_ERASER_SAMPLE_RADIUS
+    fx, fy = math.floor(pt.x()), math.floor(pt.y())
+    n = 2 * rad + 1
+    probe = SmartEraserItem()
+    probe.setRect(QRectF(pt.x(), pt.y(), 1, 1))
+    scene.addItem(probe)                    # topmost → everything else is "below" it
+    try:
+        img = _pixblur_effect_backdrop(probe, QRectF(fx - rad, fy - rad, n, n))
+    finally:
+        scene.removeItem(probe)
+    if img is None or img.isNull():
+        return QColor(128, 128, 128)
+    rs, gs, bs = [], [], []
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = img.pixelColor(x, y)          # un-premultiplied
+            if c.alpha() < 200:               # outside the image / transparent → ignore
+                continue
+            rs.append(c.red()); gs.append(c.green()); bs.append(c.blue())
+    if not rs:
+        return QColor(128, 128, 128)
+    mid = len(rs) // 2
+    return QColor(sorted(rs)[mid], sorted(gs)[mid], sorted(bs)[mid])
 
 
 class ArrowItem(QGraphicsLineItem):
@@ -4884,10 +6072,12 @@ class StandardRegionSnapshotThread(QThread):
     error        = Signal(str)
     region_ready = Signal(int, int, int, int)
 
-    def __init__(self, region, output_path: str):
+    def __init__(self, region, output_path: str, overlay_rgba=None, overlay_origin=(0, 0)):
         super().__init__()
         self.region      = region   # (x, y, w, h) in absolute physical pixels
         self.output_path = output_path
+        self.overlay_rgba   = overlay_rgba     # Wayland: adnotacje (PIL RGBA, układ nakładki)
+        self.overlay_origin = overlay_origin   # lewy-górny róg nakładki w układzie pulpitu
 
     def run(self):
         try:
@@ -4912,6 +6102,14 @@ class StandardRegionSnapshotThread(QThread):
             shot = sct.grab({"left": int(x), "top": int(y),
                               "width": int(w), "height": int(h)})
             img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
+        if self.overlay_rgba is not None:
+            ox, oy = self.overlay_origin
+            lx, ly = int(x) - ox, int(y) - oy
+            part = self.overlay_rgba.crop((lx, ly, lx + int(w), ly + int(h)))
+            if part.size != img.size:
+                part = part.resize(img.size, Image.LANCZOS)
+            img = Image.alpha_composite(img.convert("RGBA"), part).convert("RGB")
 
         # NOTE: region_ready (which draws the green dashed RecordingBorder)
         # is intentionally emitted AFTER the pixel grab above, not before.
@@ -4952,6 +6150,9 @@ class EnhancedRegionSelector(QWidget):
     TOOL_LINE      = "line"
     TOOL_ARROW     = "arrow"
     TOOL_HIGHLIGHT = "highlight"
+    TOOL_PIXBLUR   = "pixelate_blur"
+    TOOL_SPOTLIGHT = "spotlight"
+    TOOL_SMART_ERASER = "smart_eraser"
     TOOL_BUBBLE    = "bubble"
     TOOL_MARKER    = "marker"
     TOOL_TEXT      = "text"
@@ -4961,12 +6162,7 @@ class EnhancedRegionSelector(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool |
-            Qt.WindowType.BypassWindowManagerHint
-        )
+        self.setWindowFlags(_overlay_window_flags(Qt.WindowType.Tool))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -4977,6 +6173,14 @@ class EnhancedRegionSelector(QWidget):
         for s in QApplication.screens():
             self._geo = self._geo.united(s.geometry())
         self.setGeometry(self._geo)
+
+        # Wayland: jedna zamrożona klatka pulpitu (portal), zanim nakładka się pokaże.
+        if _is_wayland_session():
+            _wl_freeze()
+
+        # Desktop as it looks right now (before the overlay is shown) — the base
+        # layer the Pixelate / Blur tool works on.
+        self._desktop_snapshot = self._grab_desktop_snapshot()
 
         # ── State ──────────────────────────────────────────────────────────────
         self._current_tool      = self.TOOL_RECT
@@ -5008,7 +6212,9 @@ class EnhancedRegionSelector(QWidget):
         # ── Annotation canvas ─────────────────────────────────────────────────
         self._canvas = _OverlayCanvas(self)
         self._canvas.sync_geometry()
+        self._sel_layer = _SelectionLayer(self)      # selection frame above all annotations
         self._canvas.raise_()
+        self._raise_toolbar()
         # Sync color swatch and freehand defaults when selection changes
         self._canvas._scene.selectionChanged.connect(self._on_selection_changed)
 
@@ -5040,6 +6246,7 @@ class EnhancedRegionSelector(QWidget):
         ty = screen_geo.y() - self._geo.y() + 8
         self._toolbar.move(tx, ty)
         self._toolbar.show()
+        self._raise_toolbar()
 
         # Open directly in "drag to select a region and capture it" mode —
         # the same mode as the 📷 Capture ▾ → "Region" menu item — instead
@@ -5066,10 +6273,58 @@ class EnhancedRegionSelector(QWidget):
         # until the user clicked, which finally made Qt the active window).
         self._esc_sig.connect(self._esc_pressed)
         self._close_sig.connect(self.close)
+        self._raise_toolbar()
         QTimer.singleShot(150, self._activate_and_grab)
         QTimer.singleShot(80, self._update_detection_at_cursor)
 
+    def _grab_desktop_snapshot(self):
+        """Logical-resolution image of the whole overlay area (all monitors), or None
+        when the platform won't let us grab the screen (e.g. Wayland)."""
+        if _is_wayland_session():
+            frozen = _wl_frozen_qimage(self._geo.size())
+            if frozen is not None:
+                return frozen
+        try:
+            snap = QImage(self._geo.size(), QImage.Format.Format_RGB32)
+            snap.fill(Qt.GlobalColor.black)
+            p = QPainter(snap)
+            got = False
+            for scr in QApplication.screens():
+                pm = scr.grabWindow(0)
+                if pm.isNull():
+                    continue
+                g = scr.geometry()
+                p.drawPixmap(QRect(g.x() - self._geo.x(), g.y() - self._geo.y(),
+                                   g.width(), g.height()), pm)
+                got = True
+            p.end()
+            return snap if got else None
+        except Exception as ex:
+            print(f"[PyshareX] desktop snapshot failed: {ex}")
+            return None
+
+    def _raise_toolbar(self):
+        """Keep the toolbar above the annotation canvas (and every item in it).
+
+        The toolbar and the canvas are sibling child widgets of this overlay, so
+        whichever was raised last wins. Every canvas.raise_() / toolbar.show()
+        must therefore be followed by this call, otherwise annotation items
+        end up painted over the toolbar.
+        """
+        layer = getattr(self, "_sel_layer", None)
+        if layer is not None:
+            layer.setGeometry(self.rect())
+            layer.raise_()                           # above the canvas, below the toolbar
+        tb = getattr(self, "_toolbar", None)
+        if tb is not None:
+            tb.raise_()
+            drag_icon = getattr(tb, "_drag_icon", None)
+            if drag_icon is not None and drag_icon.isVisible():
+                drag_icon.raise_()
+
     def _activate_and_grab(self):
+        if _is_wayland_session():
+            self.setGeometry(self._geo)   # zarządzane okno: WM mógł je przesunąć
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
@@ -5287,6 +6542,7 @@ class EnhancedRegionSelector(QWidget):
     _TOOL_KEYS = {
         TOOL_RECT: 'rect', TOOL_CIRCLE: 'circle', TOOL_LINE: 'line',
         TOOL_ARROW: 'arrow', TOOL_FREEHAND: 'freehand', TOOL_HIGHLIGHT: 'highlight',
+        TOOL_PIXBLUR: 'pixelate_blur', TOOL_SPOTLIGHT: 'spotlight',
         TOOL_BUBBLE: 'bubble', TOOL_MARKER: 'marker', TOOL_TEXT: 'text',
     }
 
@@ -5448,6 +6704,9 @@ class EnhancedRegionSelector(QWidget):
             (self.TOOL_RECT,      None,  "Draw rectangle annotation (Ctrl = square, Alt = from center, Shift = move)"),
             (self.TOOL_CIRCLE,    "⭕",  "Draw ellipse annotation (Ctrl = circle, Alt = from center, Shift = move)"),
             (self.TOOL_HIGHLIGHT, "🟨",  "Draw highlight (semi-transparent yellow rectangle) (Ctrl = square, Alt = from center, Shift = move)"),
+            (self.TOOL_PIXBLUR,   None,  "Pixelate / Blur an area (mode + intensity: ⚙ options or right-click) (Ctrl = square, Alt = from center, Shift = move)"),
+            (self.TOOL_SPOTLIGHT, None,  "Spotlight — blur everything OUTSIDE the selected area (intensity: ⚙ options) (Ctrl = square, Alt = from center, Shift = move)"),
+            (self.TOOL_SMART_ERASER, None, "Smart Eraser — click picks the colour under the cursor, drag fills a rectangle with exactly that colour (Ctrl = square, Alt = from center, Shift = move)"),
             (self.TOOL_FREEHAND,  "✏️",  "Freehand drawing"),
             (self.TOOL_LINE,      "📏",  "Draw straight line (Ctrl = snap 45°, Alt = from center, Shift = move)"),
             (self.TOOL_ARROW,     None,  "Draw arrow (Ctrl = snap 45°, Alt = from center, Shift = move)"),
@@ -5472,6 +6731,15 @@ class EnhancedRegionSelector(QWidget):
                 btn.setIconSize(QSize(28, 28))
             elif tid == self.TOOL_CIRCLE:
                 btn.setIcon(_svg_icon(_SVG_CIRCLE_TOOL, 32))
+                btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_PIXBLUR:
+                btn.setIcon(_svg_icon(_SVG_PIXELATE_TOOL, 32))
+                btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_SPOTLIGHT:
+                btn.setIcon(_svg_icon(_SVG_SPOTLIGHT_TOOL, 32))
+                btn.setIconSize(QSize(28, 28))
+            elif tid == self.TOOL_SMART_ERASER:
+                btn.setIcon(_svg_icon(_SVG_SMART_ERASER_TOOL, 32))
                 btn.setIconSize(QSize(28, 28))
             elif tid == self.TOOL_LINE:
                 btn.setIcon(_svg_icon(_SVG_LINE_TOOL, 32))
@@ -5564,7 +6832,7 @@ class EnhancedRegionSelector(QWidget):
     def _is_draw_tool(self, tid=None):
         t = tid if tid is not None else self._current_tool
         return t in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_FREEHAND,
-                     self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
+                     self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT, self.TOOL_PIXBLUR, self.TOOL_SPOTLIGHT, self.TOOL_SMART_ERASER,
                      self.TOOL_BUBBLE, self.TOOL_MARKER, self.TOOL_TEXT,
                      self.TOOL_IMAGE, self.TOOL_CLIP, self.TOOL_SELECT)
 
@@ -5607,7 +6875,7 @@ class EnhancedRegionSelector(QWidget):
         # Canvas is ALWAYS transparent — mouse routing is done manually
 
         cross = (self.TOOL_DETECT, self.TOOL_RECT, self.TOOL_CIRCLE,
-                 self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
+                 self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT, self.TOOL_PIXBLUR, self.TOOL_SPOTLIGHT, self.TOOL_SMART_ERASER,
                  self.TOOL_FREEHAND, self.TOOL_CLIP)
         cur = Qt.CursorShape.CrossCursor if tool_id in cross else Qt.CursorShape.ArrowCursor
         self.setCursor(QCursor(cur))
@@ -5639,6 +6907,7 @@ class EnhancedRegionSelector(QWidget):
         if IS_LINUX:
             flags |= Qt.WindowType.X11BypassWindowManagerHint
         dlg.setWindowFlags(flags)
+        _install_drag_move(dlg)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -5659,13 +6928,14 @@ class EnhancedRegionSelector(QWidget):
                 if btn.isCheckable():
                     btn.setChecked(tid == prev_tool)
             cross = (self.TOOL_DETECT, self.TOOL_RECT, self.TOOL_CIRCLE,
-                     self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT,
+                     self.TOOL_LINE, self.TOOL_ARROW, self.TOOL_HIGHLIGHT, self.TOOL_PIXBLUR, self.TOOL_SPOTLIGHT, self.TOOL_SMART_ERASER,
                      self.TOOL_FREEHAND, self.TOOL_CLIP)
             cur = Qt.CursorShape.CrossCursor if prev_tool in cross else Qt.CursorShape.ArrowCursor
             self.setCursor(QCursor(cur))
         else:
             self._current_tool = self.TOOL_SELECT
         self._toolbar.show()
+        self._raise_toolbar()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
         self.grabKeyboard()
@@ -5792,10 +7062,12 @@ class EnhancedRegionSelector(QWidget):
         self.show()
         self.raise_()
         self._canvas.raise_()
+        self._raise_toolbar()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
         self.grabKeyboard()
         self._toolbar.show()
+        self._raise_toolbar()
 
         if pix is not None and not pix.isNull():
             # Item is sized in logical units (so it covers exactly the area it
@@ -5810,54 +7082,44 @@ class EnhancedRegionSelector(QWidget):
         else:
             self._select_tool(self.TOOL_SELECT)
 
+    def _place_imported_image(self, path: str):
+        """Put the picture at *path* in the middle of the overlay as a movable item."""
+        pix = QPixmap(path)
+        if not pix.isNull():
+            center = QPointF(self._geo.width() / 2 - pix.width()  / 2,
+                             self._geo.height()/ 2 - pix.height() / 2)
+            self._canvas.push_undo()
+            self._canvas.add_pixmap(center, pix)
+
     def _import_image(self):
+        """Pick a picture with the normal file dialog (the same one the Image Editor uses)
+        and drop it in the middle of the overlay."""
         self._toolbar.hide()
         self.releaseKeyboard()
-        # Make the entire overlay pass-through so the file dialog gets mouse events
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        # Briefly lower the overlay so the dialog can paint on top
-        self.lower()
-        QApplication.processEvents()
-
-        # Parent MUST be 'self' so it inherits the overlay's z-index and bypasses modality block
-        dlg = QFileDialog(self, "Import Image", "",
-                          "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
-        dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        flags = (Qt.WindowType.Window |
-                 Qt.WindowType.WindowStaysOnTopHint |
-                 Qt.WindowType.Dialog)
         if IS_LINUX:
-            flags |= Qt.WindowType.X11BypassWindowManagerHint
-        dlg.setWindowFlags(flags)
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
-        QApplication.processEvents()
-
-        # Restore mouse events only AFTER dialog closes (exec is blocking)
-        result = dlg.exec()
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        # Canvas MUST remain transparent so the parent overlay can route mouse events properly
-        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        # Raise the overlay back after the dialog closes
-        self.raise_()
-        self._canvas.raise_()
-
-        if result == QFileDialog.DialogCode.Accepted:
-            files = dlg.selectedFiles()
-            if files:
-                pix = QPixmap(files[0])
-                if not pix.isNull():
-                    center = QPointF(self._geo.width() / 2 - pix.width()  / 2,
-                                     self._geo.height()/ 2 - pix.height() / 2)
-                    self._canvas.push_undo()
-                    self._canvas.add_pixmap(center, pix)
-
-        # Always switch to SELECT after image import so user can move/resize it
+            # The overlay is a topmost window without a window manager, so a regular dialog
+            # would open BEHIND it. Hide the overlay while the dialog is open (the same way
+            # the screen-clip tool does) and bring it back afterwards.
+            self.hide()
+            QApplication.processEvents()
+            dlg_parent = None
+        else:
+            # Windows / macOS: a dialog owned by the topmost overlay is always shown above it.
+            dlg_parent = self
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                dlg_parent, "Import Image", getattr(self, 'import_dir', ""),
+                "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        finally:
+            if IS_LINUX:
+                self.show()
+                self.raise_()
+                self._canvas.raise_()
+        if path:
+            self._place_imported_image(path)
         self._select_tool(self.TOOL_SELECT)
         self._toolbar.show()
+        self._raise_toolbar()
         self.activateWindow(); self.setFocus()
         self.grabKeyboard()
 
@@ -5961,6 +7223,7 @@ class EnhancedRegionSelector(QWidget):
         self.setFocus()
         self.grabKeyboard()
         self._toolbar.show()
+        self._raise_toolbar()
 
     def _on_sub_region_selected(self, x, y, w, h):
         """
@@ -6014,74 +7277,75 @@ class EnhancedRegionSelector(QWidget):
     #  Paint (background overlay only — annotations are drawn by _canvas)
     # ══════════════════════════════════════════════════════════════════════════
 
-    def paintEvent(self, e):
-        if self._hide_bg:
-            return
-        p = QPainter(self)
-        p.fillRect(self.rect(), QColor(0, 0, 0, 90))
-
-        # ── Window / UI-element detection highlight (dashed rectangle) ─────────
-        # Shown only while hovering before a drag starts (ShareX-style).
+    def _selection_geometries(self):
+        """Selection-like rectangles currently shown, in overlay-local coords:
+        [(kind, QRect)] with kind 'detect' | 'inline' | 'clip' | 'drag'."""
+        out = []
         if (self._current_tool == "_capture_select" and self._detect_windows_enabled
                 and not self._inline_dragging and self._detected_rect.isValid()
                 and self._detected_rect.width() > 0 and self._detected_rect.height() > 0):
-            dr = self._detected_rect
-            pen = QPen(QColor(0, 220, 130), 2, Qt.PenStyle.DashLine)
-            pen.setDashPattern([6, 4])
-            p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(dr)
-            p.setPen(QColor(255, 255, 255))
-            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
-            label = f"{dr.width()} × {dr.height()} px — click to capture or hold LMB -> drag and release for a custom region capture"
-            ty = dr.y() - 6 if dr.y() > 20 else dr.bottom() + 14
-            p.drawText(dr.x() + 4, ty, label)
-
-        # ── Draw inline capture selection rectangle ────────────────────────────
+            out.append(('detect', QRect(self._detected_rect)))
         if (self._current_tool == "_capture_select" and
                 self._inline_start and self._inline_end):
-            # _inline_start/end are in global Qt coords — convert to widget-local for painting
-            r = QRect(self.mapFromGlobal(self._inline_start),
-                      self.mapFromGlobal(self._inline_end)).normalized()
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-            p.fillRect(r, QColor(0, 0, 0, 1))
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            p.setPen(QPen(QColor(0, 200, 255), 2))
-            p.drawRect(r)
-            p.setPen(QColor(255, 255, 255))
-            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
-            p.drawText(r.x() + 4, r.y() - 6 if r.y() > 20 else r.bottom() + 14,
-                       f"{r.width()} × {r.height()} px")
-
-        # ── Screen-clip tool: dashed selection rectangle ───────────────────────
+            # _inline_start/end are in global Qt coords — convert to widget-local
+            out.append(('inline', QRect(self.mapFromGlobal(self._inline_start),
+                                        self.mapFromGlobal(self._inline_end)).normalized()))
         if (self._current_tool == self.TOOL_CLIP and
                 self._clip_start is not None and self._clip_end is not None):
-            r = QRect(self.mapFromGlobal(self._clip_start),
-                      self.mapFromGlobal(self._clip_end)).normalized()
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-            p.fillRect(r, QColor(0, 0, 0, 1))
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            pen = QPen(QColor(0, 200, 255), 2, Qt.PenStyle.DashLine)
-            pen.setDashPattern([6, 4])
+            out.append(('clip', QRect(self.mapFromGlobal(self._clip_start),
+                                      self.mapFromGlobal(self._clip_end)).normalized()))
+        if self._dragging and self._drag_start and self._drag_end:
+            out.append(('drag', QRect(self._drag_start, self._drag_end).normalized()))
+        return out
+
+    def paintEvent(self, e):
+        # The selection frames + size labels live on _sel_layer (above the annotation
+        # canvas) so no annotation can cover them; this widget only dims the desktop and
+        # cuts the near-transparent "holes" that keep the selected area clickable.
+        layer = getattr(self, '_sel_layer', None)
+        if layer is not None:
+            layer.update()
+        if self._hide_bg:
+            return
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, _OVERLAY_DIM_ALPHA))
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        for kind, r in self._selection_geometries():
+            if kind != 'detect':
+                p.fillRect(r, QColor(0, 0, 0, 1))
+        p.end()
+
+    def _paint_selection_layer(self, p):
+        """Frames and labels of every selection-like rectangle (drawn topmost)."""
+        if self._hide_bg:
+            return
+        font = QFont("Consolas", 11, QFont.Weight.Bold)
+        for kind, r in self._selection_geometries():
+            if kind == 'detect':
+                # Window / UI-element detection highlight — shown while hovering before a drag
+                pen = QPen(QColor(0, 220, 130), 2, Qt.PenStyle.DashLine)
+                pen.setDashPattern([6, 4])
+                label = (f"{r.width()} × {r.height()} px — click to capture or hold LMB -> "
+                         f"drag and release for a custom region capture")
+                ty = r.y() - 6 if r.y() > 20 else r.bottom() + 14
+            elif kind == 'inline':
+                pen = QPen(QColor(0, 200, 255), 2)
+                label = f"{r.width()} × {r.height()} px"
+                ty = r.y() - 6 if r.y() > 20 else r.bottom() + 14
+            elif kind == 'clip':
+                pen = QPen(QColor(0, 200, 255), 2, Qt.PenStyle.DashLine)
+                pen.setDashPattern([6, 4])
+                label = f"{r.width()} × {r.height()} px — release to cut"
+                ty = r.y() - 6 if r.y() > 20 else r.bottom() + 14
+            else:   # 'drag'
+                pen = QPen(QColor(0, 174, 255), 2)
+                label = f"{r.width()} × {r.height()} px"
+                ty = r.y() - 6 if r.y() > 20 else r.bottom() + 14
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(r)
             p.setPen(QColor(255, 255, 255))
-            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
-            p.drawText(r.x() + 4, r.y() - 6 if r.y() > 20 else r.bottom() + 14,
-                       f"{r.width()} × {r.height()} px — release to cut")
-
-        if self._dragging and self._drag_start and self._drag_end:
-            r = QRect(self._drag_start, self._drag_end).normalized()
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-            p.fillRect(r, QColor(0, 0, 0, 1))
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            p.setPen(QPen(QColor(0, 174, 255), 2))
-            p.drawRect(r)
-            p.setPen(QColor(255, 255, 255))
-            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
-            label = f"{r.width()} × {r.height()} px"
-            ty = r.y() - 6 if r.y() > 20 else r.bottom() + 14
+            p.setFont(font)
             p.drawText(r.x() + 4, ty, label)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -6150,6 +7414,10 @@ class EnhancedRegionSelector(QWidget):
         self._last_move_scene = scene_pos
         self._preview_item = None
         self._canvas.push_undo()
+
+        if self._current_tool == self.TOOL_SMART_ERASER:
+            # first click: pick the colour under the cursor
+            self._eraser_color = _smart_eraser_sample(self._canvas._scene, scene_pos)
 
         if self._current_tool == self.TOOL_FREEHAND:
             self._canvas.begin_freehand(scene_pos, self._prefs.get('freehand', 'color'),
@@ -6275,7 +7543,8 @@ class EnhancedRegionSelector(QWidget):
         if self._current_tool == self.TOOL_FREEHAND:
             self._canvas.extend_freehand(scene_pos)
 
-        elif self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_LINE, self.TOOL_HIGHLIGHT, self.TOOL_ARROW):
+        elif self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_LINE, self.TOOL_HIGHLIGHT, self.TOOL_ARROW,
+                                    self.TOOL_PIXBLUR, self.TOOL_SPOTLIGHT, self.TOOL_SMART_ERASER):
             if self._draw_start_scene is None:
                 return
             # Shift held: drag the whole shape (start point follows the mouse)
@@ -6285,7 +7554,8 @@ class EnhancedRegionSelector(QWidget):
                 self._draw_start_scene = self._draw_start_scene + (scene_pos - last)
             end_scene = scene_pos
             # Ctrl held: constrain rect/circle to equal width and height (perfect square/circle)
-            if (self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE) and
+            if (self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_PIXBLUR,
+                                         self.TOOL_SPOTLIGHT, self.TOOL_SMART_ERASER) and
                     e.modifiers() & Qt.KeyboardModifier.ControlModifier):
                 dx = end_scene.x() - self._draw_start_scene.x()
                 dy = end_scene.y() - self._draw_start_scene.y()
@@ -6295,13 +7565,18 @@ class EnhancedRegionSelector(QWidget):
                     self._draw_start_scene.y() + math.copysign(side, dy))
             r = QRectF(self._draw_start_scene, end_scene).normalized()
             # Alt held: the start point is the CENTER of the shape (works with Ctrl too)
-            if (self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_HIGHLIGHT) and
+            if (self._current_tool in (self.TOOL_RECT, self.TOOL_CIRCLE, self.TOOL_HIGHLIGHT,
+                                       self.TOOL_PIXBLUR, self.TOOL_SPOTLIGHT, self.TOOL_SMART_ERASER) and
                     e.modifiers() & Qt.KeyboardModifier.AltModifier):
                 c = self._draw_start_scene
                 r = QRectF(c.x() - r.width(), c.y() - r.height(),
                            r.width() * 2, r.height() * 2)
             if self._preview_item is not None:
-                self._canvas._scene.removeItem(self._preview_item)
+                try:
+                    if self._preview_item.scene() is self._canvas._scene:
+                        self._canvas._scene.removeItem(self._preview_item)
+                except RuntimeError:
+                    pass                      # element już usunięty (np. przez undo)
                 self._preview_item = None
             if self._current_tool == self.TOOL_RECT:
                 self._preview_item = self._canvas.add_rect(
@@ -6310,6 +7585,21 @@ class EnhancedRegionSelector(QWidget):
                     _prefs_fill_color(self._prefs, 'rect') if self._prefs.get('rect', 'fill') else None)
             elif self._current_tool == self.TOOL_HIGHLIGHT:
                 self._preview_item = self._canvas.add_highlight(r, self._prefs.get('highlight', 'color'))
+            elif self._current_tool == self.TOOL_SMART_ERASER:
+                self._preview_item = self._canvas.add_smart_eraser(
+                    r, getattr(self, '_eraser_color', QColor(128, 128, 128)))
+            elif self._current_tool == self.TOOL_SPOTLIGHT:
+                self._preview_item = self._canvas.add_spotlight(
+                    r, self._prefs.get('spotlight', 'blur'),
+                    self._prefs.get('spotlight', 'ol_on'),
+                    self._prefs.get('spotlight', 'ol_w'),
+                    self._prefs.get('spotlight', 'ol'),
+                    self._prefs.get('spotlight', 'defer'))
+            elif self._current_tool == self.TOOL_PIXBLUR:
+                self._preview_item = self._canvas.add_pixelate_blur(
+                    r, self._prefs.get('pixelate_blur', 'mode'),
+                    self._prefs.get('pixelate_blur', 'pixel'),
+                    self._prefs.get('pixelate_blur', 'blur'))
             elif self._current_tool == self.TOOL_CIRCLE:
                 self._preview_item = self._canvas.add_ellipse(
                     r, self._prefs.get('circle', 'color'), self._prefs.get('circle', 'width'),
@@ -6396,6 +7686,7 @@ class EnhancedRegionSelector(QWidget):
             self._inline_end = None
             self._inline_dragging = False
             self._toolbar.show()
+            self._raise_toolbar()
             self.activateWindow()
             self.setFocus()
             self.grabKeyboard()
@@ -6437,6 +7728,9 @@ class EnhancedRegionSelector(QWidget):
             return
 
         # ── Draw tools — finalise ─────────────────────────────────────────────
+        _pv = self._preview_item
+        if isinstance(_pv, PixelateBlurItem) and (_pv.rect().width() < 3 or _pv.rect().height() < 3):
+            self._canvas._scene.removeItem(_pv)     # a plain click, not a drag
         if self._current_tool == self.TOOL_FREEHAND:
             self._canvas.end_freehand()
         self._preview_item     = None
@@ -6456,6 +7750,9 @@ class EnhancedRegionSelector(QWidget):
 
             elif isinstance(item, HighlightRectItem):
                 self._edit_highlight(item)
+
+            elif isinstance(item, PixelateBlurItem):
+                self._open_item_edit_dialog(item)
 
             elif isinstance(item, TextBubbleItem):
                 self._edit_bubble(item)
@@ -6536,6 +7833,44 @@ class EnhancedRegionSelector(QWidget):
                 action = menu.exec(e.globalPos())
                 if action == edit_act:
                     self._edit_highlight(item)
+                elif action == dup_act:
+                    self._duplicate_item_beside(item)
+                elif action == del_act:
+                    self._canvas.push_undo()
+                    self._canvas._scene.removeItem(item)
+            elif isinstance(item, SmartEraserItem):
+                dup_act  = menu.addAction("⧉ Duplicate")
+                del_act  = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action == dup_act:
+                    self._duplicate_item_beside(item)
+                elif action == del_act:
+                    self._canvas.push_undo()
+                    self._canvas._scene.removeItem(item)
+            elif isinstance(item, SpotlightItem):
+                edit_act = menu.addAction("✏️ Edit Spotlight")
+                dup_act  = menu.addAction("⧉ Duplicate")
+                del_act  = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action == edit_act:
+                    self._open_item_edit_dialog(item)
+                elif action == dup_act:
+                    self._duplicate_item_beside(item)
+                elif action == del_act:
+                    self._canvas.push_undo()
+                    self._canvas._scene.removeItem(item)
+            elif isinstance(item, PixelateBlurItem):
+                pix_act, blur_act = _pixblur_add_mode_actions(menu, item)
+                edit_act = menu.addAction("✏️ Edit Pixelate / Blur")
+                dup_act  = menu.addAction("⧉ Duplicate")
+                del_act  = menu.addAction("🗑️ Delete")
+                action = menu.exec(e.globalPos())
+                if action in (pix_act, blur_act):
+                    self._canvas.push_undo()
+                    _pixblur_set_mode(item, PixelateBlurItem.MODE_PIXELATE if action == pix_act
+                                      else PixelateBlurItem.MODE_BLUR, self._prefs)
+                elif action == edit_act:
+                    self._open_item_edit_dialog(item)
                 elif action == dup_act:
                     self._duplicate_item_beside(item)
                 elif action == del_act:
@@ -6632,13 +7967,49 @@ class EnhancedRegionSelector(QWidget):
                 return
         super().keyPressEvent(e)
 
+    def _abort_inprogress_draw(self) -> bool:
+        """Undo/Redo wciśnięte, gdy rysowanie trwa (przycisk myszy wciąż trzymany):
+        undo usuwało wtedy podgląd ze sceny, a obsługa myszy dalej na nim operowała
+        (stary, odłączony element -> błędy sceny, "duchy" po puszczeniu przycisku).
+        Zamiast tego anulujemy bieżący rysunek i zdejmujemy wpis undo z chwili
+        naciśnięcia. Zwraca True, jeśli coś anulowano."""
+        if getattr(self, "_draw_start_scene", None) is None and self._preview_item is None:
+            return False
+        sc = self._canvas._scene
+        pv = self._preview_item
+        if pv is not None:
+            try:
+                if pv.scene() is sc:
+                    sc.removeItem(pv)
+            except RuntimeError:
+                pass
+        cur = getattr(self._canvas, "_current_freehand_item", None)
+        if cur is not None:
+            try:
+                if cur.scene() is sc:
+                    sc.removeItem(cur)
+            except RuntimeError:
+                pass
+            self._canvas._current_freehand_item = None
+            self._canvas._freehand_path = None
+        self._preview_item = None
+        self._draw_start_scene = None
+        if self._canvas._undo_stack:
+            self._canvas._undo_stack.pop()
+        self._canvas._notify_history_changed()
+        return True
+
     def canvas_undo(self):
         """Undo last annotation action (keyboard shortcut / toolbar helper)."""
+        if self._abort_inprogress_draw():
+            return
         if hasattr(self._canvas, 'undo'):
             self._canvas.undo()
 
     def canvas_redo(self):
         """Redo last undone annotation action (keyboard shortcut / toolbar helper)."""
+        if self._abort_inprogress_draw():
+            return
         if hasattr(self._canvas, 'redo'):
             self._canvas.redo()
 
@@ -6694,6 +8065,8 @@ class EnhancedRegionSelector(QWidget):
 
     def _clone_item(self, item):
         """Return a deep copy of a supported annotation item."""
+        if isinstance(item, PixelateBlurItem):
+            return _clone_pixblur(item)
         if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
             cls = type(item)
             dup = cls()
@@ -6768,6 +8141,8 @@ class EnhancedRegionSelector(QWidget):
 
     def closeEvent(self, e):
         self._stop_esc_listener()
+        if _is_wayland_session():
+            _wl_unfreeze()
         try:
             self._cache_timer.stop()
         except Exception:
@@ -6806,6 +8181,7 @@ class EnhancedRegionSelector(QWidget):
         self.setFocus()
         self.grabKeyboard()
         self._toolbar.show()
+        self._raise_toolbar()
 
     def _on_sub_region_selected(self, x, y, w, h):
         """
@@ -6944,6 +8320,8 @@ class EnhancedRegionSelector(QWidget):
                 capture_method = engine_ref.config.get("region_capture_method", "standard")
         except Exception:
             pass
+        if _is_wayland_session():
+            capture_method = "standard"   # x11grab na Waylandzie zwraca czerń
 
         # ── 3. No pre-render needed — the screen is grabbed directly, so any
         #      canvas/annotation objects still on screen are captured as-is ──
@@ -7048,6 +8426,8 @@ class EnhancedRegionSelector(QWidget):
             self._snap_th = StandardRegionSnapshotThread(
                 region      = (final_x, final_y, phys_w, phys_h),
                 output_path = snap_path,
+                overlay_rgba = self._wl_render_annotations() if _is_wayland_session() else None,
+                overlay_origin = (self._geo.x(), self._geo.y()),
             )
         else:
             self._snap_th = RecordingThread(
@@ -7061,6 +8441,27 @@ class EnhancedRegionSelector(QWidget):
         self._snap_th.finished.connect(_on_snap_done)
         self._snap_th.error.connect(_on_snap_err)
         self._snap_th.start()
+
+    def _wl_render_annotations(self):
+        """Wayland: zrzut pochodzi z zamrożonej klatki, więc adnotacje z płótna
+        (strzałki, prostokąty, tekst) trzeba dokleić osobno. Zwraca PIL RGBA o
+        rozmiarze nakładki (układ lokalny) albo None, gdy nie ma adnotacji."""
+        try:
+            scene = self._canvas._scene
+            if not scene.items():
+                return None
+            scene.clearSelection()
+            w, h = self.width(), self.height()
+            qi = QImage(w, h, QImage.Format.Format_RGBA8888)
+            qi.fill(Qt.GlobalColor.transparent)
+            p = QPainter(qi)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            scene.render(p, QRectF(0, 0, w, h), QRectF(0, 0, w, h))
+            p.end()
+            return Image.frombytes("RGBA", (w, h), bytes(qi.constBits()))
+        except Exception as ex:
+            print(f"[PyshareX][wayland] render adnotacji nie powiódł się: {ex}")
+            return None
 
     def _emit_and_close(self, global_rect: QRect):
         """Kept for compatibility — delegates to _grab_composite_and_close."""
@@ -7131,8 +8532,11 @@ class CaptureEngine:
         else:
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             img.save(tmp.name); tmp.close()
-            for cmd in [["xclip", "-selection", "clipboard", "-t", "image/png", "-i", tmp.name],
-                        ["wl-copy", "--type", "image/png"]]:
+            _clip_cmds = [["xclip", "-selection", "clipboard", "-t", "image/png", "-i", tmp.name],
+                          ["wl-copy", "--type", "image/png"]]
+            if _is_wayland_session():
+                _clip_cmds.reverse()     # natywny schowek Wayland ma pierwszeństwo
+            for cmd in _clip_cmds:
                 try:
                     if _run(["which", cmd[0]], timeout=1).returncode == 0:
                         if cmd[0] == "wl-copy":
@@ -7227,24 +8631,14 @@ class CaptureEngine:
         except Exception:
             pass
 
-        # 2) Interaktywny portal (wymaga jednego kliknięcia/wyboru użytkownika)
+        # 2) Interaktywny portal - kompozytor pokazuje własny wybór okna/obszaru
+        #    (jedno kliknięcie użytkownika), wynik wczytujemy z pliku portalu.
         try:
-            r = subprocess.run(
-                ["gdbus", "call", "--session",
-                 "--dest", "org.freedesktop.portal.Desktop",
-                 "--object-path", "/org/freedesktop/portal/desktop",
-                 "--method", "org.freedesktop.portal.Screenshot.Screenshot",
-                 "", "{'interactive': <true>}"],
-                capture_output=True, text=True, timeout=30)
-            if r.returncode == 0:
-                # Portal zwraca ścieżkę do obiektu Request; wynikowy plik trafia
-                # do niego asynchronicznie przez sygnał D-Bus - pełna obsługa
-                # wymagałaby nasłuchiwania na org.freedesktop.portal.Request::Response.
-                # Na razie sygnalizujemy sukces wywołania, ale bez pliku - zostaw
-                # to jako punkt rozbudowy, gdy portal będzie realnym wymaganiem.
-                pass
-        except Exception:
-            pass
+            img = _wl_portal_image(interactive=True, timeout=60)
+            if img is not None:
+                return self._save(img, "window")
+        except Exception as ex:
+            print(f"[PyshareX][wayland] portal interaktywny: {ex}")
 
         return None
 
@@ -7865,6 +9259,13 @@ class RecordingThread(QThread):
 
     def run(self):
         try:
+            if _is_wayland_session() and not self.snapshot_mode:
+                self.error.emit(
+                    "Nagrywanie wideo/GIF nie działa jeszcze na Waylandzie "
+                    "(x11grab i grabowanie klatka-po-klatce nie widzą ekranu; "
+                    "potrzebny jest portal ScreenCast + PipeWire). "
+                    "Zaloguj się do sesji X11, żeby nagrywać.")
+                return
             if self.gif_mode:      self._gif()
             elif self.snapshot_mode: self._snapshot()
             else:                  self._video()
@@ -8268,7 +9669,93 @@ class ShortcutEditDialog(QDialog):
         self.data["enabled"]  = self.en.isChecked()
         self.accept()
 
+    def done(self, r):
+        try: self.ke._stop_capture()
+        except Exception: pass
+        super().done(r)
+
     def get_data(self): return self.data
+
+
+class _KeyCatchLine(QLineEdit):
+    """Pole, które w trybie nagrywania przechwytuje kombinację klawiszy przez
+    Qt (działa pod Waylandem/XWayland, gdzie pynput widzi tylko pojedyncze
+    klawisze albo nic)."""
+    combo_done = Signal(str)     # pełna kombinacja (zakończona klawiszem głównym)
+    combo_live = Signal(str)     # podgląd: aktualnie trzymane modyfikatory
+
+    _MODS_ONLY = None  # wypełniane leniwie (enumy Qt)
+
+    @staticmethod
+    def _mod_keys():
+        K = Qt.Key
+        return {int(K.Key_Control), int(K.Key_Alt), int(K.Key_Shift),
+                int(K.Key_Meta), int(K.Key_AltGr), int(K.Key_Super_L),
+                int(K.Key_Super_R), int(K.Key_Hyper_L), int(K.Key_Hyper_R)}
+
+    @staticmethod
+    def _key_name(k: int) -> str:
+        K = Qt.Key
+        if int(K.Key_A) <= k <= int(K.Key_Z) or int(K.Key_0) <= k <= int(K.Key_9):
+            return chr(k)
+        if int(K.Key_F1) <= k <= int(K.Key_F35):
+            return f"F{k - int(K.Key_F1) + 1}"
+        table = {
+            K.Key_Print: "Print Screen", K.Key_SysReq: "Print Screen",
+            K.Key_Insert: "Insert", K.Key_Delete: "Delete", K.Key_Home: "Home",
+            K.Key_End: "End", K.Key_PageUp: "PgUp", K.Key_PageDown: "PgDown",
+            K.Key_Up: "Up", K.Key_Down: "Down", K.Key_Left: "Left",
+            K.Key_Right: "Right", K.Key_Space: "Space", K.Key_Tab: "Tab",
+            K.Key_Backtab: "Tab", K.Key_Return: "Return", K.Key_Enter: "Return",
+            K.Key_Backspace: "Backspace", K.Key_Escape: "Escape",
+            K.Key_NumLock: "Num Lock", K.Key_ScrollLock: "Scroll Lock",
+            K.Key_Pause: "Pause", K.Key_CapsLock: "Caps Lock",
+        }
+        for qk, nm in table.items():
+            if int(qk) == k:
+                return nm
+        try:
+            return QKeySequence(k).toString().upper()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _mods_list(mods) -> list:
+        M = Qt.KeyboardModifier
+        out = []
+        if mods & M.ControlModifier: out.append("Ctrl")
+        if mods & M.AltModifier:     out.append("Alt")
+        if mods & M.ShiftModifier:   out.append("Shift")
+        if mods & M.MetaModifier:    out.append("Meta")
+        return out
+
+    def focusNextPrevChild(self, nxt):      # Tab ma trafić do nas, nie zmieniać fokusu
+        return False if getattr(self, "_capturing", False) else super().focusNextPrevChild(nxt)
+
+    def event(self, e):
+        if getattr(self, "_capturing", False):
+            t = e.type()
+            if t == QEvent.Type.ShortcutOverride:
+                e.accept(); return True
+            if t == QEvent.Type.KeyPress:
+                self._on_key(e); return True
+            if t == QEvent.Type.KeyRelease:
+                self.combo_live.emit("+".join(self._mods_list(e.modifiers())))
+                return True
+        return super().event(e)
+
+    def _on_key(self, e):
+        if e.isAutoRepeat():
+            return
+        k = int(e.key())
+        mods = self._mods_list(e.modifiers())
+        if k in self._mod_keys() or k == 0:
+            self.combo_live.emit("+".join(mods))
+            return
+        name = self._key_name(k)
+        if not name:
+            return
+        self.combo_done.emit("+".join(mods + [name]))
 
 
 class _HotkeyEdit(QWidget):
@@ -8291,8 +9778,8 @@ class _HotkeyEdit(QWidget):
         "num_lock": "Num Lock", "scroll_lock": "Scroll Lock",
         "pause": "Pause", "caps_lock": "Caps Lock",
     }
-    _MOD_NAMES = {"ctrl_l", "ctrl_r", "alt_l", "alt_r", "alt_gr",
-                  "shift_l", "shift_r", "cmd", "cmd_l", "cmd_r"}
+    _MOD_NAMES = {"ctrl", "ctrl_l", "ctrl_r", "alt", "alt_l", "alt_r", "alt_gr",
+                  "shift", "shift_l", "shift_r", "cmd", "cmd_l", "cmd_r"}
 
     def __init__(self, initial: str = "", parent=None):
         super().__init__(parent)
@@ -8304,9 +9791,12 @@ class _HotkeyEdit(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self._display = QLineEdit(initial)
+        self._display = _KeyCatchLine(initial)
         self._display.setReadOnly(True)
         self._display.setPlaceholderText("Press Capture, then press your key combination")
+        self._display.combo_done.connect(self._accept_combo)
+        self._display.combo_live.connect(
+            lambda t: self._display.setText((t + "+…") if t else "… press keys …"))
         lay.addWidget(self._display)
 
         self._btn = QPushButton("Capture")
@@ -8322,6 +9812,16 @@ class _HotkeyEdit(QWidget):
             self._stop_capture()
 
     def _start_capture(self):
+        if not IS_WINDOWS:
+            # Linux (X11/Wayland): przechwytywanie przez Qt - widzi pełne
+            # kombinacje z modyfikatorami także pod XWayland.
+            self._display.setText("… press keys …")
+            self._btn.setText("Stop")
+            self._display._capturing = True
+            self._display.setFocus()
+            try: self._display.grabKeyboard()
+            except Exception: pass
+            return
         if not PYNPUT_AVAILABLE:
             self._display.setPlaceholderText("pynput not installed — type shortcut manually")
             self._display.setReadOnly(False)
@@ -8350,6 +9850,10 @@ class _HotkeyEdit(QWidget):
         self._listener.start()
 
     def _stop_capture(self):
+        if getattr(self._display, "_capturing", False):
+            self._display._capturing = False
+            try: self._display.releaseKeyboard()
+            except Exception: pass
         if self._listener:
             try: self._listener.stop()
             except Exception: pass
@@ -8372,11 +9876,11 @@ class _HotkeyEdit(QWidget):
     def _build_combo(self, key) -> str:
         parts = []
         # Modifiers held at the time the main key was pressed
-        if any(m in self._held_mods for m in ("ctrl_l", "ctrl_r")):
+        if any(m in self._held_mods for m in ("ctrl", "ctrl_l", "ctrl_r")):
             parts.append("Ctrl")
-        if any(m in self._held_mods for m in ("alt_l", "alt_r", "alt_gr")):
+        if any(m in self._held_mods for m in ("alt", "alt_l", "alt_r", "alt_gr")):
             parts.append("Alt")
-        if any(m in self._held_mods for m in ("shift_l", "shift_r")):
+        if any(m in self._held_mods for m in ("shift", "shift_l", "shift_r")):
             parts.append("Shift")
         if any(m in self._held_mods for m in ("cmd", "cmd_l", "cmd_r")):
             parts.append("Meta")
@@ -8514,12 +10018,31 @@ class OcrResultDialog(QDialog):
 #  STYLESHEET
 # ─────────────────────────────────────────────
 
+def _css_with_menubar_font(css: str, font=None) -> str:
+    """Pin the menu-bar font size in every item state.
+
+    Once ``QMenuBar::item:selected`` is styled, Qt draws the hovered item with the
+    stylesheet font (13px from the QWidget rule) while the other items keep the platform's
+    menu-bar font, so the hovered title shrinks. Giving all states the platform menu-bar
+    size (read from the style, not hard-coded) keeps the text identical on hover."""
+    f = font if font is not None else QApplication.font("QMenuBar")
+    if f.pointSizeF() > 0:
+        size = f"{f.pointSizeF():g}pt"
+    elif f.pixelSize() > 0:
+        size = f"{f.pixelSize()}px"
+    else:
+        size = "9pt"
+    return css.replace("__MBFONT__", size)
+
+
 CSS = """
 QWidget { background:#1e1e2e; color:#cdd6f4;
     font-family:'Segoe UI','Ubuntu',sans-serif; font-size:13px; }
 QMainWindow { background:#1e1e2e; }
-QMenuBar { background:#181825; color:#cdd6f4; border-bottom:1px solid #313244; padding:2px; }
-QMenuBar::item:selected { background:#313244; border-radius:4px; }
+QMenuBar { background:#181825; color:#cdd6f4; border-bottom:1px solid #313244; padding:2px;
+    font-size:__MBFONT__; }
+QMenuBar::item { font-size:__MBFONT__; }
+QMenuBar::item:selected { background:#313244; border-radius:4px; font-size:__MBFONT__; }
 QMenu { background:#181825; color:#cdd6f4; border:1px solid #313244; padding:4px; }
 QMenu::item { padding:6px 24px 6px 12px; border-radius:4px; }
 QMenu::item:selected { background:#313244; }
@@ -9712,6 +11235,8 @@ class EditorCanvas(QGraphicsView):
 
     def _clone_item(self, item):
         """Return a copy of a supported annotation item."""
+        if isinstance(item, PixelateBlurItem):
+            return _clone_pixblur(item)
         if isinstance(item, (ResizableRectItem, ResizableEllipseItem)):
             cls = type(item)
             dup = cls()
@@ -10088,6 +11613,44 @@ class EditorCanvas(QGraphicsView):
             # keep drawing — mouseRelease will finalize
             self.start_point = scene_pos
             return
+        elif self.current_tool == "Smart Eraser":
+            fx = SmartEraserItem()
+            fx.setRect(QRectF(self.start_point, self.start_point))
+            fx.fill_color = _smart_eraser_sample(self.scene, self.start_point)
+            fx.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                        QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                        QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+            self.scene.addItem(fx)
+            self._fx_item = fx
+            self.current_item = fx
+        elif self.current_tool == "Spotlight":
+            fx = SpotlightItem()
+            fx.setRect(QRectF(self.start_point, self.start_point))
+            fx.blur_radius = int(self.prefs.get('spotlight', 'blur'))
+            fx.outline_enabled = bool(self.prefs.get('spotlight', 'ol_on'))
+            fx.outline_width = int(self.prefs.get('spotlight', 'ol_w'))
+            fx.outline_color = QColor(self.prefs.get('spotlight', 'ol'))
+            fx.defer_draw = bool(self.prefs.get('spotlight', 'defer'))
+            fx.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                        QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                        QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+            self.scene.addItem(fx)
+            self._fx_item = fx
+            self.current_item = fx
+        elif self.current_tool == "Pixelate/Blur":
+            fx = PixelateBlurItem()
+            fx.setRect(QRectF(self.start_point, self.start_point))
+            fx.mode = self.prefs.get('pixelate_blur', 'mode')
+            fx.pixel_size = int(self.prefs.get('pixelate_blur', 'pixel'))
+            fx.blur_radius = int(self.prefs.get('pixelate_blur', 'blur'))
+            fx.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+                        QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+                        QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+            self.scene.addItem(fx)
+            self._fx_item = fx
+            self.current_item = fx
+            self.start_point = scene_pos
+            return   # keep dragging — mouseRelease finalizes
         elif self.current_tool == "Bubble":
             # Bubble is completed on mouseRelease — nothing to create yet
             pass
@@ -10161,7 +11724,8 @@ class EditorCanvas(QGraphicsView):
         self._last_move_scene = scene_pos
         if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier and last is not None
                 and self.start_point is not None
-                and self.current_tool in ("Rectangle", "Circle", "Highlight", "Line", "Arrow")):
+                and self.current_tool in ("Rectangle", "Circle", "Highlight", "Pixelate/Blur", "Spotlight", "Smart Eraser",
+                                          "Line", "Arrow")):
             self.start_point = self.start_point + (scene_pos - last)
 
         # Regular Drawing
@@ -10175,7 +11739,7 @@ class EditorCanvas(QGraphicsView):
 
         # Alt held: the start point is the CENTER of the shape (works with Ctrl too)
         if (event.modifiers() & Qt.KeyboardModifier.AltModifier
-                and self.current_tool in ("Rectangle", "Circle", "Highlight")):
+                and self.current_tool in ("Rectangle", "Circle", "Highlight", "Pixelate/Blur", "Spotlight", "Smart Eraser")):
             c = self.start_point
             rect = QRectF(c.x() - rect.width(), c.y() - rect.height(),
                           rect.width() * 2, rect.height() * 2)
@@ -10184,6 +11748,9 @@ class EditorCanvas(QGraphicsView):
         elif self.current_tool == "Highlight":
             if getattr(self, '_hl_item', None):
                 self._hl_item.setRect(rect)
+        elif self.current_tool in ("Pixelate/Blur", "Spotlight", "Smart Eraser"):
+            if getattr(self, '_fx_item', None):
+                self._fx_item.setRect(rect)
         elif self.current_tool == "Line":
             end_pos = scene_pos
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -10290,6 +11857,16 @@ class EditorCanvas(QGraphicsView):
                 else:
                     self.is_dirty = True
             self._hl_item = None
+        # Pixelate/Blur: finalize — drop accidental click-sized rectangles
+        elif self.current_tool in ("Pixelate/Blur", "Spotlight", "Smart Eraser"):
+            fx = getattr(self, '_fx_item', None)
+            if fx:
+                r = fx.rect()
+                if r.width() < 3 or r.height() < 3:
+                    self.scene.removeItem(fx)
+                else:
+                    self.is_dirty = True
+            self._fx_item = None
         # Arrow: apply pen props after drawing
         elif self.current_tool == "Arrow" and self.current_item:
             pen = QPen(self.prefs.get('arrow', 'color'), self.prefs.get('arrow', 'width'))
@@ -10313,7 +11890,7 @@ class EditorCanvas(QGraphicsView):
         # Same options window as the toolbar ⚙ button. Shapes/lines/arrows only
         # open it with the Select tool (so double-clicking while drawing is harmless).
         if (key is not None and hasattr(win, '_edit_item')
-                and (key in ('text', 'freehand', 'highlight', 'bubble', 'marker')
+                and (key in ('text', 'freehand', 'highlight', 'bubble', 'marker', 'pixelate_blur', 'spotlight')
                      or self.current_tool == "Select")):
             win._edit_item(item)
             return
@@ -10329,6 +11906,9 @@ class EditorCanvas(QGraphicsView):
         win = self.window()
         menu = QMenu(self)
         edit_act = None
+        pix_act = blur_act = None
+        if isinstance(item, PixelateBlurItem) and not isinstance(item, (SpotlightItem, SmartEraserItem)):
+            pix_act, blur_act = _pixblur_add_mode_actions(menu, item)
         if key is not None and hasattr(win, '_edit_item'):
             edit_act = menu.addAction({'text': "✏️ Edit Text", 'highlight': "✏️ Edit Highlight",
                                        'bubble': "✏️ Edit Bubble", 'marker': "✏️ Edit Marker",
@@ -10340,9 +11920,17 @@ class EditorCanvas(QGraphicsView):
         dup_act = None if isinstance(item, _MarkerItem) else menu.addAction("⧉ Duplicate")
         del_act = (menu.addAction("🗑️ Delete")
                    if isinstance(item, (HighlightRectItem, TextBubbleItem, _MarkerItem,
-                                        FreehandItem, ArrowItem)) else None)
+                                        FreehandItem, ArrowItem, PixelateBlurItem)) else None)
         action = menu.exec(event.globalPos())
         if action is None:
+            return
+        if pix_act is not None and action in (pix_act, blur_act):
+            self.push_undo()
+            _pixblur_set_mode(item, PixelateBlurItem.MODE_PIXELATE if action == pix_act
+                              else PixelateBlurItem.MODE_BLUR, self.prefs)
+            self.is_dirty = True
+            if hasattr(win, '_refresh_tool_ui'):
+                win._refresh_tool_ui()
             return
         if action == edit_act:
             win._edit_item(item)
@@ -10417,7 +12005,7 @@ class EditorCanvas(QGraphicsView):
                         return item, 'WIDTH'
                 
                 # Rotation handle — disabled for markers (they scale uniformly instead)
-                if not isinstance(item, (CropOverlayItem, _MarkerItem)):
+                if not isinstance(item, (CropOverlayItem, _MarkerItem, PixelateBlurItem)):
                     rot_pt = QPointF(rect.center().x(), rect.top() - 30)
                     if abs(local_pos.x() - rot_pt.x()) < m * 1.5 and abs(local_pos.y() - rot_pt.y()) < m * 1.5:
                         return item, 'ROTATE'
@@ -10775,6 +12363,15 @@ class EditorCanvas(QGraphicsView):
         # preview was misleading). That mask now lives in drawForeground()
         # below, where it is guaranteed to paint on top of every item.
 
+    def paint_effect_clear(self, painter, rect):
+        """Called by Pixelate/Blur/Spotlight items before they draw their effect on screen:
+        re-paint the canvas background (checkerboard) so the effect replaces the original
+        content instead of being laid over it. `painter` is in scene coords, clipped."""
+        bg_rect = self.bg_item.sceneBoundingRect()
+        w, h = int(bg_rect.width()), int(bg_rect.height())
+        if w > 0 and h > 0:
+            painter.drawPixmap(bg_rect.topLeft(), self._get_checker_cache(w, h))
+
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
         # Włączamy wysoką jakość rysowania, aby uniknąć rozmazania
@@ -10809,7 +12406,12 @@ class EditorCanvas(QGraphicsView):
         # ─────────────────────────────────────────────────────────────────────
 
         for item in self.scene.selectedItems():
-            if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, ResizablePixmapItem, FreehandItem)) and not isinstance(item, CropOverlayItem):
+            # Pixelate/Blur, Spotlight and Smart Eraser are axis-aligned only: they have no rotation
+            # handle (see get_handle_at). Drawing one here put a guide line + green dot 30px above
+            # the item — outside its boundingRect, so Qt never repainted it and every move/resize
+            # left stale dotted trails on the canvas.
+            if (isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, ResizablePixmapItem, FreehandItem))
+                    and not isinstance(item, (CropOverlayItem, PixelateBlurItem))):
                 r = item.rect()
                 # Punkty w układzie lokalnym
                 top_center_local = QPointF(r.center().x(), r.top())
@@ -10858,7 +12460,8 @@ class EditorCanvas(QGraphicsView):
 
 _EDITOR_TOOL_KEYS = {
     "Rectangle": 'rect', "Circle": 'circle', "Line": 'line', "Arrow": 'arrow',
-    "Highlight": 'highlight', "Freehand": 'freehand', "Bubble": 'bubble',
+    "Highlight": 'highlight', "Pixelate/Blur": 'pixelate_blur', "Spotlight": 'spotlight',
+    "Freehand": 'freehand', "Bubble": 'bubble',
     "Text": 'text', "Marker": 'marker',
 }
 
@@ -10900,7 +12503,8 @@ class ImageEditorWindow(QMainWindow):
             tbar.addSpacing(8)
 
         for n, i in [("Select", None), ("Crop", None), ("Rectangle", None), ("Circle", "⭕"),
-                     ("Line", "📏"), ("Arrow", None), ("Highlight", "🟨"), ("Freehand", "✏️"),
+                     ("Line", "📏"), ("Arrow", None), ("Highlight", "🟨"), ("Pixelate/Blur", None), ("Spotlight", None), ("Smart Eraser", None),
+                     ("Freehand", "✏️"),
                      ("Bubble", "💬"), ("Text", "T"), ("Marker", "📍"), ("Eraser", None)]:
             b = QPushButton(); b.setCheckable(True)
             b.setFixedSize(40, 40)
@@ -10940,6 +12544,18 @@ class ImageEditorWindow(QMainWindow):
                 b.setIcon(_svg_icon(_SVG_ARROW_TOOL, 32))
                 b.setIconSize(QSize(32, 32))
                 b.setToolTip("Arrow (Ctrl = snap 45°, Alt = from center, Shift = move)")
+            elif n == "Pixelate/Blur":
+                b.setIcon(_svg_icon(_SVG_PIXELATE_TOOL, 32))
+                b.setIconSize(QSize(32, 32))
+                b.setToolTip("Pixelate / Blur an area (mode + intensity: ⚙ options or right-click) (Ctrl = square, Alt = from center, Shift = move)")
+            elif n == "Smart Eraser":
+                b.setIcon(_svg_icon(_SVG_SMART_ERASER_TOOL, 32))
+                b.setIconSize(QSize(32, 32))
+                b.setToolTip("Smart Eraser — click picks the colour under the cursor, drag fills a rectangle with exactly that colour (Ctrl = square, Alt = from center, Shift = move)")
+            elif n == "Spotlight":
+                b.setIcon(_svg_icon(_SVG_SPOTLIGHT_TOOL, 32))
+                b.setIconSize(QSize(32, 32))
+                b.setToolTip("Spotlight — blur everything OUTSIDE the selected area (intensity: ⚙ options) (Ctrl = square, Alt = from center, Shift = move)")
             elif n == "Eraser":
                 b.setIcon(_svg_icon(_SVG_ERASER, 32))
                 b.setIconSize(QSize(32, 32))
@@ -12054,6 +13670,182 @@ class OcrQrToolboxDialog(QDialog):
 #  MAIN WINDOW  (settings embedded)
 # ─────────────────────────────────────────────
 
+# ══════════════════════════════════════════════════════════════════════════
+#  SKRÓTY SYSTEMOWE CINNAMON (Wayland)
+#  Pod Waylandem pynput nie widzi klawiszy poza oknami XWayland, więc
+#  rejestrujemy skróty w Cinnamonie (gsettings) - każdy wywołuje
+#  `pysharex.py --action <akcja>`, które trafia do działającej instancji (IPC).
+# ══════════════════════════════════════════════════════════════════════════
+_CIN_SCHEMA = "org.cinnamon.desktop.keybindings"
+_CIN_ITEM_SCHEMA = "org.cinnamon.desktop.keybindings.custom-keybinding"
+_CIN_PATH = "/org/cinnamon/desktop/keybindings/custom-keybindings/"
+_CIN_PREFIX = "pysharex-"
+_cin_lock = threading.Lock()
+_cin_last_sig = None
+
+
+def _cinnamon_available() -> bool:
+    if IS_WINDOWS or not _shutil.which("gsettings"):
+        return False
+    if "cinnamon" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
+        return False
+    try:
+        r = subprocess.run(["gsettings", "get", _CIN_SCHEMA, "custom-list"],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _shortcut_to_gtk_accel(sc: str) -> str:
+    """'Ctrl+Alt+P' -> '<Control><Alt>p', 'Alt+Print Screen' -> '<Alt>Print'."""
+    sc = sc.strip().replace("++", "+Plus")
+    if not sc:
+        return ""
+    keymap = {
+        "Print Screen": "Print", "PgUp": "Page_Up", "PgDown": "Page_Down",
+        "Return": "Return", "Backspace": "BackSpace", "Escape": "Escape",
+        "Space": "space", "Tab": "Tab", "Num Lock": "Num_Lock",
+        "Scroll Lock": "Scroll_Lock", "Caps Lock": "Caps_Lock",
+        "Plus": "plus", "Insert": "Insert", "Delete": "Delete", "Home": "Home",
+        "End": "End", "Up": "Up", "Down": "Down", "Left": "Left",
+        "Right": "Right", "Pause": "Pause",
+    }
+    modmap = {"Ctrl": "<Control>", "Alt": "<Alt>", "Shift": "<Shift>", "Meta": "<Super>"}
+    mods, key = "", ""
+    for part in [p.strip() for p in sc.split("+") if p.strip()]:
+        if part in modmap:
+            mods += modmap[part]
+        else:
+            key = keymap.get(part, part.lower() if len(part) == 1 else part)
+    return (mods + key) if key else ""
+
+
+def _cinnamon_sync_shortcuts(shortcuts) -> None:
+    """Idempotentnie zapisuje skróty PyshareX jako własne skróty Cinnamona.
+    Rusza wyłącznie wpisy o id zaczynającym się od 'pysharex-'."""
+    import ast, shlex
+    global _cin_last_sig
+    sig = json.dumps(shortcuts or [], sort_keys=True, default=str)
+    with _cin_lock:
+        if sig == _cin_last_sig:
+            return
+        _cin_last_sig = sig
+        _cinnamon_sync_locked(shortcuts)
+
+
+def _cinnamon_sync_locked(shortcuts) -> None:
+    import ast, shlex
+
+    def gs(*args):
+        return subprocess.run(["gsettings", *args], capture_output=True,
+                              text=True, timeout=5)
+    try:
+        r = gs("get", _CIN_SCHEMA, "custom-list")
+        txt = r.stdout.strip()
+        if txt.startswith("@as"):
+            txt = txt[3:].strip()
+        cur = ast.literal_eval(txt) if txt else []
+        keep = [x for x in cur if not str(x).startswith(_CIN_PREFIX)]
+        old_ours = [x for x in cur if str(x).startswith(_CIN_PREFIX)]
+
+        base = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+        ours, used = [], set()
+        for i, sc in enumerate(shortcuts or []):
+            if not sc.get("enabled", True):
+                continue
+            action = sc.get("action", "")
+            accel = _shortcut_to_gtk_accel(sc.get("shortcut", ""))
+            if not action or not accel or accel in used:
+                continue
+            used.add(accel)
+            sid = f"{_CIN_PREFIX}{i}-{action}"
+            path = f"{_CIN_ITEM_SCHEMA}:{_CIN_PATH}{sid}/"
+            gs("set", path, "name", f"PyshareX: {sc.get('name') or action}")
+            gs("set", path, "command", f"{base} --action {action}")
+            gs("set", path, "binding", str([accel]))
+            ours.append(sid)
+            print(f"[Hotkeys] Cinnamon: {sc.get('shortcut')} -> {accel} -> --action {action}", flush=True)
+
+        for sid in old_ours:
+            if sid not in ours:
+                path = f"{_CIN_ITEM_SCHEMA}:{_CIN_PATH}{sid}/"
+                for k in ("name", "command", "binding"):
+                    gs("reset", path, k)
+        new_list = keep + ours
+        gs("set", _CIN_SCHEMA, "custom-list", str(new_list))
+        print(f"[Hotkeys] Cinnamon: zarejestrowano {len(ours)} skrótów systemowych", flush=True)
+    except Exception as e:
+        print(f"[Hotkeys] Cinnamon: błąd rejestracji skrótów: {e}", flush=True)
+
+
+class _TrayMenu(QMenu):
+    """Menu zasobnika odporne na Wayland/XWayland (Cinnamon).
+
+    Problemy, które naprawia:
+    - Qt dostaje od panelu współrzędne kliknięcia, które pod XWayland są
+      błędne -> menu pojawiało się w losowym miejscu. Na Linuksie ustawiamy
+      je przy prawej krawędzi ekranu, nad panelem.
+    - XWayland nie daje popupowi 'grab', więc kliknięcie poza menu go nie
+      zamyka, a kolejne PPM na ikonce nie robiło nic (menu już 'jest').
+      Zamykamy je sami: po opuszczeniu kursora i po timeoucie bezczynności."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._idle = QTimer(self); self._idle.setSingleShot(True)
+        self._idle.timeout.connect(self._idle_check)
+        self._life = QTimer(self); self._life.setSingleShot(True)
+        self._life.timeout.connect(self._force_close)
+
+    def _submenu_open(self):
+        return any(m.isVisible() for m in self.findChildren(QMenu))
+
+    def _force_close(self):
+        for m in self.findChildren(QMenu):
+            m.hide()
+        self.hide()
+
+    def _idle_check(self):
+        if not self.isVisible():
+            return
+        if self.underMouse() or self._submenu_open():
+            self._idle.start(1200)
+        else:
+            self._force_close()
+
+    def _place(self):
+        if IS_WINDOWS or not self.isVisible():
+            return
+        scr = QApplication.primaryScreen()
+        if scr is None:
+            return
+        g, av = scr.geometry(), scr.availableGeometry()
+        bottom = av.bottom() if av.height() < g.height() else g.bottom() - 60
+        x = g.right() - self.width() - 8
+        y = bottom - self.height() - 4
+        self.move(max(g.left(), x), max(g.top(), y))
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if not IS_WINDOWS:
+            QTimer.singleShot(0, self._place)
+            self._idle.start(2500)    # zamknij, jeśli kursor nie wejdzie w menu
+            self._life.start(15000)   # twardy limit życia menu
+
+    def enterEvent(self, e):
+        self._idle.stop()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        if not IS_WINDOWS:
+            self._idle.start(1200)
+        super().leaveEvent(e)
+
+    def hideEvent(self, e):
+        self._idle.stop(); self._life.stop()
+        super().hideEvent(e)
+
+
 class MainWindow(QMainWindow):
     status_sig    = Signal(str)
     _notify_sig   = Signal(str, object)  # filepath — must run on main thread
@@ -12087,12 +13879,14 @@ class MainWindow(QMainWindow):
         self.last_rec_pixmap = None  # Tu będziemy trzymać miniaturkę
         self.setWindowTitle("PyshareX")
         self.setMinimumSize(780, 540)
-        self.setStyleSheet(CSS)
+        # read the menu bar's real (platform) font BEFORE the stylesheet touches it
+        self.setStyleSheet(_css_with_menubar_font(CSS, self.menuBar().font()))
         self._app_icon = load_app_icon()
         self.setWindowIcon(self._app_icon)
         self._build()
         self._build_tray()
         self._hotkeys_start()
+        self._ipc_start()
         self.status_sig.connect(self._status)
         self._notify_sig.connect(self._on_notify)
 
@@ -12566,7 +14360,34 @@ class MainWindow(QMainWindow):
     def _build_tray(self):
         self.tray = QSystemTrayIcon(self._app_icon, self)
         self.tray.setToolTip("PyshareX")
-        menu = QMenu(); menu.setStyleSheet(CSS)
+        self._tray_menu = None
+        # Cinnamon pod Waylandem: panel sam rysuje menu z DBus (dbusmenu) i robi
+        # to źle (zła pozycja, drugi PPM nic nie robi). Tam rysujemy menu sami.
+        # PYSHAREX_TRAY_NATIVE=1 wymusza menu rysowane przez panel.
+        self._tray_custom = (not IS_WINDOWS and _is_wayland_session()
+                             and "cinnamon" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+                             and os.environ.get("PYSHAREX_TRAY_NATIVE") != "1")
+        self._install_tray_menu()
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _refresh_tray_menu(self):
+        """Po każdym użyciu menu budujemy je od nowa: pod XWayland stare
+        QMenu potrafi zostać w stanie 'otwarte' i drugi PPM nic nie robi."""
+        old = self._tray_menu
+        if old is not None and old.isVisible():
+            return
+        self._install_tray_menu()
+        if old is not None:
+            old.deleteLater()
+
+    def _install_tray_menu(self):
+        menu = _TrayMenu(); menu.setStyleSheet(_css_with_menubar_font(CSS))
+        menu.aboutToHide.connect(lambda: QTimer.singleShot(400, self._refresh_tray_menu))
+        self._tray_menu = menu
+        if self._tray_custom:
+            menu.addAction("Show / hide window").triggered.connect(self.toggle_win)
+            menu.addSeparator()
 
         csub = menu.addMenu("Capture")
         csub.addAction("Region").triggered.connect(self.act_region)
@@ -12599,11 +14420,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("Quit").triggered.connect(self._quit)
 
-        self.tray.setContextMenu(menu)
-        self.tray.activated.connect(
-            lambda r: self.show_win()
-            if r == QSystemTrayIcon.ActivationReason.DoubleClick else None)
-        self.tray.show()
+        if not self._tray_custom:
+            self.tray.setContextMenu(menu)
 
     # ════════════════════════════════════════
     #  SIDEBAR NAV
@@ -12819,8 +14637,43 @@ class MainWindow(QMainWindow):
         self.status_lbl.setText(msg)
         QTimer.singleShot(6000, lambda: self.status_lbl.setText("Ready"))
 
+    def _show_tray_menu(self):
+        m = self._tray_menu
+        if m is None:
+            return
+        if m.isVisible():
+            m.hide()
+            return
+        m.popup(QCursor.pos())      # _TrayMenu sam ustawia pozycję przy ikonie
+
+    def _on_tray_activated(self, reason):
+        R = QSystemTrayIcon.ActivationReason
+        if getattr(self, "_tray_custom", False):
+            print(f"[Tray] activated: {reason}", flush=True)
+            if reason in (R.Trigger, R.Context):
+                self._show_tray_menu()
+            elif reason in (R.MiddleClick, R.DoubleClick):
+                self.toggle_win()
+            return
+        # Linux (Cinnamon/XApp): left click = Trigger, DoubleClick often not emitted.
+        # Windows: keep double-click.
+        trigger = R.DoubleClick if IS_WINDOWS else R.Trigger
+        if reason == trigger:
+            self.toggle_win()
+
+    def toggle_win(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.show_win()
+
     def show_win(self):
-        self.show(); self.raise_(); self.activateWindow()
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowState.WindowMinimized)
+            | Qt.WindowState.WindowActive)
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def closeEvent(self, e):
         e.ignore(); self.hide()   # no tray notification
@@ -12860,6 +14713,22 @@ class MainWindow(QMainWindow):
     }
 
     def _hotkeys_start(self):
+        if _is_wayland_session() and not getattr(self, "_wl_hotkey_warned", False):
+            self._wl_hotkey_warned = True
+            print("[Hotkeys] Wayland: pynput nie widzi klawiszy poza oknami XWayland. "
+                  "Ustaw skróty w systemie (Cinnamon: Ustawienia > Klawiatura > Skróty > "
+                  "Własne) na polecenie:\n"
+                  f"          python3 {os.path.abspath(__file__)} --action capture_region\n"
+                  "          (lista akcji: --list-actions)")
+        if (_is_wayland_session() and os.environ.get("PYSHAREX_NO_AUTOKEYS") != "1"
+                and _cinnamon_available()):
+            # Skróty obsługuje Cinnamon; pynput pod Waylandem i tak nie działa
+            # poza oknami XWayland (a podwójne wyzwalanie byłoby gorsze).
+            import threading
+            threading.Thread(target=_cinnamon_sync_shortcuts,
+                             args=(list(self.config.get("shortcuts", [])),),
+                             daemon=True).start()
+            return
         if not PYNPUT_AVAILABLE:
             print("[Hotkeys] pynput not available — global hotkeys disabled")
             return
@@ -12898,6 +14767,55 @@ class MainWindow(QMainWindow):
         fn = getattr(self, method_name, None)
         if fn:
             fn()
+
+    # ════════════════════════════════════════
+    #  IPC: `pysharex.py --action <nazwa>` steruje działającą instancją
+    #  (skróty systemowe zamiast pynput - działa też na Waylandzie)
+    # ════════════════════════════════════════
+    def _ipc_start(self):
+        try:
+            from PySide6.QtNetwork import QLocalServer
+        except Exception as e:
+            print(f"[IPC] brak QtNetwork: {e}"); return
+        srv = QLocalServer(self)
+        if not srv.listen(_IPC_NAME):
+            if _ipc_send(None, probe_only=True):
+                print("[IPC] inna instancja PyshareX już nasłuchuje - pomijam IPC")
+                return
+            QLocalServer.removeServer(_IPC_NAME)       # martwe gniazdo po awarii
+            if not srv.listen(_IPC_NAME):
+                print(f"[IPC] nie mogę nasłuchiwać: {srv.errorString()}"); return
+        srv.newConnection.connect(self._ipc_on_connection)
+        self._ipc_server = srv
+        try:
+            cdir = os.path.expanduser("~/.cache/pysharex")
+            os.makedirs(cdir, exist_ok=True)
+            with open(os.path.join(cdir, "ipc-path"), "w", encoding="utf-8") as f:
+                f.write(srv.fullServerName())
+            print(f"[IPC] nasłuchuję: {srv.fullServerName()}", flush=True)
+        except Exception as e:
+            print(f"[IPC] nie zapisano ścieżki gniazda: {e}")
+
+    def _ipc_on_connection(self):
+        sock = self._ipc_server.nextPendingConnection()
+        if sock is None:
+            return
+        def _read():
+            data = bytes(sock.readAll()).decode("utf-8", "ignore")
+            for line in data.splitlines():
+                self._ipc_handle(line.strip())
+            sock.disconnectFromServer()
+        sock.readyRead.connect(_read)
+        if sock.bytesAvailable():
+            _read()
+
+    def _ipc_handle(self, name):
+        print(f"[IPC] odebrano akcję: {name!r}", flush=True)
+        method = self._ACTION_MAP.get(name)
+        if method:
+            self._hotkey_sig.emit(method)
+        elif name:
+            print(f"[IPC] nieznana akcja: {name!r} (dostępne: {', '.join(self._ACTION_MAP)})")
 
     def _hotkeys_stop(self):
         if self._hkl:
@@ -13063,6 +14981,13 @@ class MainWindow(QMainWindow):
 
     def _do_region(self):
         self._sel = EnhancedRegionSelector()
+        # same start folder as the Image Editor's Import dialog
+        try:
+            self._sel.import_dir = str(_month_folder(self.config.get(
+                "save_folder", str(QStandardPaths.writableLocation(
+                    QStandardPaths.StandardLocation.PicturesLocation)))))
+        except Exception:
+            self._sel.import_dir = ""
         self._sel.region_selected.connect(self._on_region)
         self._sel.cancelled.connect(self._on_region_cancelled)
         # Force focus after the selector is fully constructed
@@ -13633,6 +15558,40 @@ _SVG_ARROW_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" xmlns="http
 # (matches the universal crop-tool icon used by most photo editors),
 # replacing the previous generic "📐" ruler emoji which didn't read as
 # a crop action.
+# SVG source for the Pixelate / Blur tool — a small mosaic of grey cells inside the same red
+# frame as the other shape tools.
+_SVG_PIXELATE_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+ <rect x="3" y="3" width="6" height="6" fill="#4a4a4a"/><rect x="9" y="3" width="6" height="6" fill="#9a9a9a"/><rect x="15" y="3" width="6" height="6" fill="#d0d0d0"/>
+ <rect x="3" y="9" width="6" height="6" fill="#9a9a9a"/><rect x="9" y="9" width="6" height="6" fill="#d0d0d0"/><rect x="15" y="9" width="6" height="6" fill="#4a4a4a"/>
+ <rect x="3" y="15" width="6" height="6" fill="#d0d0d0"/><rect x="9" y="15" width="6" height="6" fill="#4a4a4a"/><rect x="15" y="15" width="6" height="6" fill="#9a9a9a"/>
+ <rect x="1.8" y="1.8" width="20.4" height="20.4" stroke="#ea3323" stroke-width="1.6"/>
+</svg>"""
+
+# SVG source for the Spotlight tool — a grey disc with three italic "A" letters
+# (drawn as paths, so no font is needed) inside a dashed yellow ring.
+_SVG_SPOTLIGHT_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+ <circle cx="12" cy="12" r="8.6" fill="#b3b3b3"/>
+ <g stroke="#333333" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5.8 15.4 L9.2 8.6 L10.2 15.4 M7.3 12.9 H9.9"/>
+  <path d="M10.2 15.4 L13.6 8.6 L14.6 15.4 M11.7 12.9 H14.3"/>
+  <path d="M14.6 15.4 L18 8.6 L19 15.4 M16.1 12.9 H18.7"/>
+ </g>
+ <circle cx="12" cy="12" r="9.3" stroke="#ffff00" stroke-width="1.7" stroke-dasharray="3.6 2.3"/>
+</svg>"""
+
+# SVG source for the Smart Eraser tool — a grey band with dark letters, partly
+# covered by a flat grey rectangle with a dashed green outline.
+_SVG_SMART_ERASER_TOOL = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+ <rect x="0.5" y="4" width="23" height="16" fill="#666666"/>
+ <g stroke="#333333" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M3 18.5 L6.2 8.5 L7.6 18.5 M4.2 15.5 H7.2"/>
+  <path d="M8.5 18.5 L11.7 8.5 L13.1 18.5 M9.7 15.5 H12.7"/>
+  <ellipse cx="16.4" cy="15.2" rx="1.9" ry="2.6"/>
+  <ellipse cx="21" cy="15.2" rx="1.9" ry="2.6"/>
+ </g>
+ <rect x="2.2" y="5.2" width="12.6" height="10.6" fill="#666666" stroke="#2fd10b" stroke-width="1.6" stroke-dasharray="3.2 2"/>
+</svg>"""
+
 _SVG_CROP = """<svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
  <path d="M6 1v15a2 2 0 0 0 2 2h15" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
  <path d="M18 23V8a2 2 0 0 0-2-2H1" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -13808,7 +15767,55 @@ def _dump_screen_layout():
         print(f"[screens] dump failed: {e}")
 
 
+_IPC_NAME = "pysharex-" + (os.environ.get("USER") or os.environ.get("USERNAME") or "user")
+
+
+def _ipc_send(action, probe_only=False, timeout_ms=800):
+    """Wysyła nazwę akcji do działającej instancji. True = dostarczono."""
+    try:
+        from PySide6.QtNetwork import QLocalSocket
+    except Exception:
+        return False
+    s = QLocalSocket()
+    s.connectToServer(_IPC_NAME)
+    if not s.waitForConnected(timeout_ms):
+        return False
+    if not probe_only and action:
+        s.write((action + "\n").encode("utf-8"))
+        s.flush()
+        s.waitForBytesWritten(timeout_ms)
+    s.disconnectFromServer()
+    return True
+
+
+def _cli_action():
+    """Wartość --action <nazwa> z linii poleceń (albo None)."""
+    for i, a in enumerate(sys.argv):
+        if a == "--action" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith("--action="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _install_hang_diagnostics():
+    """Linux: `kill -USR1 <pid>` wypisuje w terminalu, gdzie dokładnie stoi
+    program (stos każdego wątku) - do diagnozy zawieszeń."""
+    if not IS_LINUX:
+        return
+    try:
+        import faulthandler, signal
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+        print(f"[PyshareX] diagnostyka zawieszeń: w razie zacięcia uruchom  kill -USR1 {os.getpid()}", flush=True)
+    except Exception:
+        pass
+
+
 def main():
+    _install_hang_diagnostics()
+    if "--list-actions" in sys.argv:
+        print("\n".join(MainWindow._ACTION_MAP))
+        return
     _set_windows_dpi_awareness()
 
     if IS_WINDOWS and os.environ.get("PYSHAREX_HIGHDPI") != "1":
@@ -13826,6 +15833,14 @@ def main():
         os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
     app = QApplication(sys.argv)
+    cli_action = _cli_action()
+    if cli_action:
+        if cli_action not in MainWindow._ACTION_MAP:
+            print(f"Nieznana akcja {cli_action!r}. Dostępne:\n  " + "\n  ".join(MainWindow._ACTION_MAP))
+            sys.exit(2)
+        if _ipc_send(cli_action):
+            sys.exit(0)          # przekazano do działającej instancji
+        print("[IPC] brak działającej instancji - uruchamiam program i wykonam akcję")
     _dump_screen_layout()
     app.setApplicationName("PyshareX")
     app.setQuitOnLastWindowClosed(False)
@@ -13835,6 +15850,8 @@ def main():
     config = Config()
     win = MainWindow(config)
     win.show()
+    if cli_action:
+        QTimer.singleShot(1500, lambda: win._ipc_handle(cli_action))
     sys.exit(app.exec())
 
 
