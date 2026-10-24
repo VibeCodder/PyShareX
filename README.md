@@ -117,6 +117,7 @@ You can also use tools from toolbar to attach various annotation objects to the 
 
 
 
+<img width="1920" height="1080" alt="2026-10-24 21-55-43 mkv_snapshot_01 03 366" src="https://github.com/user-attachments/assets/abe02936-b066-4d5e-9c8a-f4a08488abe3" />
 
 
 
