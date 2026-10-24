@@ -111,12 +111,15 @@ It works in 2 modes:
 
 <br><br>
 
-You can also use tools from toolbar to attach various annotation objects to the screen.
+#### You can also use tools from toolbar to attach various annotation objects to the screen.
 
+<br>
 <img width="1920" height="1080" alt="2026-10-24 21-33-35 mkv_snapshot_04 27 200" src="https://github.com/user-attachments/assets/70a3d416-9368-4a7f-bcb3-bd5e8c3f822a" />
+<br>
 
+#### Spotlight (couldn't be show on first screenshot) 
 
-
+<br>
 <img width="1920" height="1080" alt="2026-10-24 21-55-43 mkv_snapshot_01 03 366" src="https://github.com/user-attachments/assets/abe02936-b066-4d5e-9c8a-f4a08488abe3" />
 
 
