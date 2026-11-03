@@ -99,17 +99,21 @@ from PySide6.QtGui import (
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import QShortcut
 
+_IMPORT_ERRORS = {}      # name -> real reason the import failed (shown in the startup notice)
+
 try:
     from PIL import Image, ImageDraw
     PIL_AVAILABLE = True
-except ImportError:
+except ImportError as _ex:
     PIL_AVAILABLE = False
+    _IMPORT_ERRORS["Pillow"] = f"{type(_ex).__name__}: {_ex}"
 
 try:
     import mss
     MSS_AVAILABLE = True
-except ImportError:
+except ImportError as _ex:
     MSS_AVAILABLE = False
+    _IMPORT_ERRORS["mss"] = f"{type(_ex).__name__}: {_ex}"
 
 try:
     from pynput import keyboard as _pynput_kb
@@ -578,6 +582,11 @@ def _wl_find_gi_python():
 
 def _wl_open_image(path, delete=False):
     if not PIL_AVAILABLE:
+        _wl_log("Pillow is missing - cannot load the screenshot "
+                f"({sys.executable} -m pip install --user --ignore-installed pillow --break-system-packages)")
+        if delete:
+            try: os.unlink(path)
+            except Exception: pass
         return None
     try:
         with Image.open(path) as im:
@@ -630,34 +639,81 @@ def _wl_cli_image():
         ["spectacle", "-b", "-n", "-f", "-o", tmp],       # KDE Plasma
         ["grim", tmp],                                    # sway / Hyprland (wlroots)
     ]
+    missing = []
     for cmd in candidates:
         if not _shutil.which(cmd[0]):
+            missing.append(cmd[0])
             continue
         try:
-            subprocess.run(cmd, capture_output=True, timeout=15)
-        except Exception:
+            r = subprocess.run(cmd, capture_output=True, timeout=20)
+            if r.returncode != 0:
+                _wl_log(f"{cmd[0]}: exit code {r.returncode}: "
+                        f"{(r.stderr or b'').decode(errors='replace').strip()[-300:]}")
+        except Exception as e:
+            _wl_log(f"{cmd[0]}: exception {e}")
             continue
         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
             img = _wl_open_image(tmp, delete=True)
             if img is not None:
                 _wl_log(f"zrzut przez {cmd[0]}")
                 return img
+        else:
+            _wl_log(f"{cmd[0]}: no screenshot file was produced")
+    if missing:
+        _wl_log("screenshot tools not installed: " + ", ".join(missing))
     return None
 
 
 def _wl_capture_full_image():
     """Cały pulpit (wszystkie monitory) jako PIL.Image RGB, w pikselach fizycznych."""
     with _WL_LOCK:
+        # KDE Plasma: the portal asks for permission / can stall for a long time, while
+        # Spectacle is allowed to use KWin's screenshot interface directly -> CLI first.
+        _kde = "kde" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        if _kde:
+            img = _wl_cli_image()
+            if img is not None:
+                return img
+            _wl_log("KDE: spectacle gave no screenshot - trying the portal")
         img = _wl_portal_image(interactive=False)
         if img is not None:
             return img
-        _wl_log("portal nie dał zrzutu - próbuję narzędzi CLI")
-        img = _wl_cli_image()
+        if not _kde:
+            _wl_log("portal gave no screenshot - trying the CLI tools")
+            img = _wl_cli_image()
+        else:
+            img = None
         if img is None:
             _wl_log("NIE UDAŁO SIĘ zrobić zrzutu (portal ani CLI). "
                     "Sprawdź: xdg-desktop-portal + backend pulpitu "
                     "(np. xdg-desktop-portal-gtk / -xapp / -gnome).")
         return img
+
+
+def _wl_grant_screenshot_permission():
+    """Best effort, once: tell xdg-desktop-portal that this (non-sandboxed) app may take
+    screenshots, so the compositor stops asking every time. Equivalent to
+    `flatpak permission-set screenshot screenshot '' yes`. A marker file makes sure it is
+    done only once, so a later revoke by the user is respected."""
+    try:
+        marker = Path.home() / ".cache" / "pysharex" / "screenshot_permission_set"
+        if marker.exists() or not _shutil.which("gdbus"):
+            return
+        r = subprocess.run(
+            ["gdbus", "call", "--session",
+             "--dest", "org.freedesktop.impl.portal.PermissionStore",
+             "--object-path", "/org/freedesktop/impl/portal/PermissionStore",
+             "--method", "org.freedesktop.impl.portal.PermissionStore.SetPermission",
+             "screenshot", "true", "screenshot", "''", "['yes']"],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("ok")
+            _wl_log("screenshot permission saved in xdg-desktop-portal")
+        else:
+            _wl_log(f"could not save the screenshot permission: {r.stderr.strip()[-200:]}")
+    except Exception as e:
+        _wl_log(f"screenshot permission: exception {e}")
 
 
 def _wl_freeze():
@@ -1702,6 +1758,12 @@ class Config:
             # immediately. Holding the left button and dragging still falls
             # back to the normal manual rectangle-selection mode.
             "detect_windows_on_capture": True,
+            # "Capture region": colour of the (almost transparent) layer that lies over the
+            # screen while annotating. When "region_overlay_colored" is off the layer is fully
+            # transparent. The colour is [R, G, B, A] (alpha supported); default = the
+            # dark dim (black, alpha 45).
+            "region_overlay_colored": True,
+            "region_overlay_color":   [0, 0, 0, 45],
         }
 
     def _load(self):
@@ -4524,7 +4586,30 @@ class HighlightRectItem(QGraphicsRectItem):
 # ═════════════════════════════════════════════════════════════════════════════
 _pixblur_depth = [0]      # guards against runaway recursion between stacked effect items
 
-_OVERLAY_DIM_ALPHA = 90   # darkening the Capture Region overlay lays over the desktop while annotating
+_OVERLAY_DIM_ALPHA = 45   # darkening the Capture Region overlay lays over the desktop while annotating
+
+
+def _region_overlay_dim_color(cfg) -> QColor:
+    """Colour of the Capture Region layer from the settings (alpha 0 = fully transparent)."""
+    if not cfg.get("region_overlay_colored", True):
+        return QColor(0, 0, 0, 0)
+    try:
+        r, g, b, a = (max(0, min(255, int(x))) for x in cfg.get("region_overlay_color"))
+        return QColor(r, g, b, a)
+    except Exception:
+        return QColor(0, 0, 0, _OVERLAY_DIM_ALPHA)
+
+
+def _overlay_dim_color(item) -> QColor:
+    """Dim colour of the Capture Region overlay *item* sits on (see _overlay_dim_active)."""
+    sc = item.scene()
+    if sc is not None:
+        for v in sc.views():
+            ov = v.parent()
+            c = getattr(ov, '_dim_color', None)
+            if c is not None:
+                return QColor(c)
+    return QColor(0, 0, 0, _OVERLAY_DIM_ALPHA)
 
 
 def _overlay_dim_active(item) -> bool:
@@ -4710,7 +4795,7 @@ def _pixblur_draw_replacing(item, painter, target: QRectF, img: QImage, source: 
         else:
             painter.drawImage(target, img)
         if _is_screen_painter(painter) and _overlay_dim_active(item):
-            painter.fillRect(target, QColor(0, 0, 0, _OVERLAY_DIM_ALPHA))
+            painter.fillRect(target, _overlay_dim_color(item))
     finally:
         painter.restore()
 
@@ -5131,7 +5216,7 @@ class SmartEraserItem(PixelateBlurItem):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
             painter.fillRect(r.toAlignedRect(), self.fill_color)
             if _is_screen_painter(painter) and _overlay_dim_active(self):
-                painter.fillRect(r.toAlignedRect(), QColor(0, 0, 0, _OVERLAY_DIM_ALPHA))
+                painter.fillRect(r.toAlignedRect(), _overlay_dim_color(self))
             painter.restore()
         self._paint_selection(painter, r)
 
@@ -6220,7 +6305,10 @@ class EnhancedRegionSelector(QWidget):
 
         # ── Window / UI-element detection (hover-to-outline, click-to-capture) ──
         # Enabled by default; can be turned off in Settings → "Capture Region method".
-        self._detect_windows_enabled = Config().get("detect_windows_on_capture", True)
+        _cfg = Config()
+        self._detect_windows_enabled = _cfg.get("detect_windows_on_capture", True)
+        # Colour of the layer over the screen (alpha 0 when "colored layout" is off)
+        self._dim_color = _region_overlay_dim_color(_cfg)
         self._inline_dragging   = False   # True once a real drag (not just a click) starts
         self._win_rects: list[QRect] = []
         self._win_tops: list = []           # [(hwnd, QRect)] z-order, Windows
@@ -6284,6 +6372,13 @@ class EnhancedRegionSelector(QWidget):
             frozen = _wl_frozen_qimage(self._geo.size())
             if frozen is not None:
                 return frozen
+            # Wayland: QScreen.grabWindow(0) returns an empty/black pixmap that is NOT
+            # null, so falling through would give a pure-black "desktop" (Pixelate/Blur
+            # then draws black rectangles). Without a real frame there is no base layer;
+            # the tools show their neutral placeholder instead.
+            _wl_log("no frozen desktop frame - Pixelate/Blur/Spotlight will have no base "
+                    "image (neither the portal nor the CLI tools returned a screenshot)")
+            return None
         try:
             snap = QImage(self._geo.size(), QImage.Format.Format_RGB32)
             snap.fill(Qt.GlobalColor.black)
@@ -7308,7 +7403,12 @@ class EnhancedRegionSelector(QWidget):
         if self._hide_bg:
             return
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(0, 0, 0, _OVERLAY_DIM_ALPHA))
+        # Alpha is kept >= 1: a fully transparent layered window lets mouse clicks fall
+        # through to the desktop, so a "transparent" layer is really alpha 1 (invisible).
+        _dc = QColor(getattr(self, '_dim_color', None) or QColor(0, 0, 0, _OVERLAY_DIM_ALPHA))
+        if _dc.alpha() < 1:
+            _dc = QColor(0, 0, 0, 1)
+        p.fillRect(self.rect(), _dc)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         for kind, r in self._selection_geometries():
             if kind != 'detect':
@@ -14305,6 +14405,58 @@ class MainWindow(QMainWindow):
         detect_hint.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
         crl.addWidget(detect_hint)
 
+        # Colour of the layer lying over the screen while annotating in "Capture region"
+        self._overlay_colored_cb = QCheckBox("Use colored screen canvas layout for Capture Region")
+        self._overlay_colored_cb.setChecked(bool(self.config.get("region_overlay_colored", True)))
+        crl.addWidget(self._overlay_colored_cb)
+        _oc = self.config.get("region_overlay_color", [0, 0, 0, 45])
+        try:
+            self._overlay_color = QColor(*[max(0, min(255, int(x))) for x in _oc])
+        except Exception:
+            self._overlay_color = QColor(0, 0, 0, 45)
+        ov_row = QHBoxLayout()
+        ov_row.setContentsMargins(22, 0, 0, 0)
+        self._overlay_color_btn = QPushButton("Canvas color (with transparency)…")
+        self._overlay_color_btn.setToolTip(
+            "Colour and transparency of the layer that lies over the screen in Capture region")
+        self._overlay_color_btn.setStyleSheet(
+            "QPushButton:disabled { background:#2b2b2b; color:#555555; border:1px solid #444444; }")
+        ov_row.addWidget(self._overlay_color_btn)
+        self._overlay_reset_btn = QPushButton("Reset to default")
+        self._overlay_reset_btn.setToolTip("Restore the default colour (slightly darkening black)")
+        self._overlay_reset_btn.setStyleSheet(
+            "QPushButton:disabled { background:#2b2b2b; color:#555555; border:1px solid #444444; }")
+        ov_row.addWidget(self._overlay_reset_btn)
+        ov_row.addStretch()
+        crl.addLayout(ov_row)
+        ov_hint = QLabel(
+            "When disabled, the screen layer in \"Capture region\" is completely transparent. "
+            "When enabled, it uses the colour below (default: a slightly darkening black).")
+        ov_hint.setWordWrap(True)
+        ov_hint.setStyleSheet("font-size:11px; color:#a6adc8; padding-left:4px;")
+        crl.addWidget(ov_hint)
+
+        def _refresh_overlay_btn():
+            self._overlay_color_btn.setIcon(_swatch_icon(self._overlay_color, 18))
+            _on = self._overlay_colored_cb.isChecked()
+            self._overlay_color_btn.setEnabled(_on)
+            self._overlay_reset_btn.setEnabled(_on and self._overlay_color.getRgb() != (0, 0, 0, 45))
+
+        def _pick_overlay_color():
+            c = _show_color_dialog(self._overlay_color, self, alpha=True)
+            if c is not None:
+                self._overlay_color = c
+                _refresh_overlay_btn()
+
+        def _reset_overlay_color():
+            self._overlay_color = QColor(0, 0, 0, 45)
+            _refresh_overlay_btn()
+
+        self._overlay_reset_btn.clicked.connect(_reset_overlay_color)
+        self._overlay_colored_cb.toggled.connect(lambda _=None: _refresh_overlay_btn())
+        self._overlay_color_btn.clicked.connect(_pick_overlay_color)
+        _refresh_overlay_btn()
+
         lay.addWidget(crg)
 
         # Selected monitor
@@ -14726,6 +14878,9 @@ class MainWindow(QMainWindow):
         self.config.data["region_capture_method"] = (
             "standard" if self._region_method_grp.checkedId() == 1 else "ffmpeg")
         self.config.data["detect_windows_on_capture"] = self._detect_windows_cb.isChecked()
+        self.config.data["region_overlay_colored"] = self._overlay_colored_cb.isChecked()
+        _oc = self._overlay_color
+        self.config.data["region_overlay_color"] = [_oc.red(), _oc.green(), _oc.blue(), _oc.alpha()]
         
         # Safely determine the active OCR engine using QButtonGroup ID
         engine_id = self._ocr_grp.checkedId()
@@ -16019,9 +16174,42 @@ def main():
     # Set taskbar icon as early as possible
     app.setWindowIcon(load_app_icon())
 
+    if IS_LINUX and _is_wayland_session():
+        threading.Thread(target=_wl_grant_screenshot_permission, daemon=True).start()
+
     config = Config()
     win = MainWindow(config)
     win.show()
+    _missing = []
+    if not PIL_AVAILABLE:
+        _missing.append("Pillow")
+    if not MSS_AVAILABLE and not (IS_LINUX and _is_wayland_session()):
+        _missing.append("mss")
+    if _missing:
+        def _warn_missing(names=tuple(_missing)):
+            print("[PyshareX] MISSING LIBRARIES: " + ", ".join(names), flush=True)
+            reasons = "\n".join(f"  {n}: {_IMPORT_ERRORS.get(n, '?')}" for n in names)
+            print(f"[PyshareX] interpreter: {sys.executable} "
+                  f"(Python {sys.version_info.major}.{sys.version_info.minor})\n{reasons}", flush=True)
+            pip = " ".join(n.lower() for n in names)
+            if IS_LINUX:
+                # `pip` says "already satisfied" when a package of ANOTHER Python version sits in
+                # /usr/lib/python3/dist-packages (its C extension then fails to import), so force
+                # a copy into this interpreter's own user site.
+                how = (f"{sys.executable} -m pip install --user --ignore-installed {pip} "
+                       f"--break-system-packages")
+            else:
+                how = f"{sys.executable} -m pip install {pip}"
+            QMessageBox.warning(
+                win, "PyshareX - missing libraries",
+                "These libraries required for taking screenshots could not be loaded: "
+                + ", ".join(names) + ".\n"
+                "Without them Capture Region, Pixelate/Blur and saving screenshots do not work.\n\n"
+                f"Interpreter: {sys.executable}\nReason:\n{reasons}\n\n"
+                f"Easiest fix - run the installer with this same interpreter:\n"
+                f"{sys.executable} install.py\n\n"
+                "Or install manually:\n" + how + "\n\nThen restart the program.")
+        QTimer.singleShot(600, _warn_missing)
     if cli_action:
         QTimer.singleShot(1500, lambda: win._ipc_handle(cli_action))
     sys.exit(app.exec())
