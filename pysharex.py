@@ -10227,6 +10227,15 @@ class CropOverlayItem(QGraphicsRectItem):
         self.setZValue(1000)  # Zawsze na samej górze
         self.setPen(QPen(Qt.GlobalColor.transparent))
         self.setBrush(Qt.GlobalColor.transparent)
+        # Wywoływane po każdej zmianie prostokąta (uchwyty, Shift-move, spinboxy),
+        # dzięki temu pasek narzędzi może na bieżąco pokazywać rozmiar zaznaczenia.
+        self.rect_changed_cb = None
+
+    def setRect(self, *args):
+        super().setRect(*args)
+        cb = getattr(self, 'rect_changed_cb', None)
+        if cb is not None:
+            cb()
 
     def paint(self, painter, option, widget=None):
         # Maska musi pokrywać też powiększony obszar (poza oryginalną sceną)
@@ -12465,6 +12474,62 @@ _EDITOR_TOOL_KEYS = {
     "Text": 'text', "Marker": 'marker',
 }
 
+_SPIN_ARROW_CACHE = {}
+
+def _ensure_arrow_pngs():
+    """Paint two tiny ▲/▼ PNGs once into the temp folder (Qt stylesheets
+    can't draw arrows by themselves, they need an image for url())."""
+    if not _SPIN_ARROW_CACHE:
+        from PySide6.QtGui import QPolygonF
+        for name, up in (("up", True), ("down", False)):
+            pm = QPixmap(10, 6)
+            pm.fill(Qt.GlobalColor.transparent)
+            pt = QPainter(pm)
+            pt.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pt.setPen(Qt.PenStyle.NoPen)
+            pt.setBrush(QColor("#cdd6f4"))
+            if up:
+                pts = [QPointF(1, 5), QPointF(5, 1), QPointF(9, 5)]
+            else:
+                pts = [QPointF(1, 1), QPointF(5, 5), QPointF(9, 1)]
+            pt.drawPolygon(QPolygonF(pts))
+            pt.end()
+            path = os.path.join(tempfile.gettempdir(), f"pysharex_spin_{name}.png")
+            pm.save(path, "PNG")
+            _SPIN_ARROW_CACHE[name] = path.replace("\\", "/")
+    return _SPIN_ARROW_CACHE["up"], _SPIN_ARROW_CACHE["down"]
+
+def _visible_combo_style():
+    """Brings back the drop-down arrow of a QComboBox (the global app
+    stylesheet strips the ::drop-down border and with it the arrow)."""
+    _up, down_png = _ensure_arrow_pngs()
+    return (
+        "QComboBox { padding-right:26px; }"
+        "QComboBox::drop-down { subcontrol-origin:padding; subcontrol-position:center right;"
+        " width:22px; border:none; border-left:1px solid #45475a; }"
+        f"QComboBox::down-arrow {{ image:url({down_png}); width:10px; height:6px; }}"
+    )
+
+def _visible_spin_style():
+    """Stylesheet that brings back the ▲/▼ buttons of a QSpinBox.
+
+    The global app stylesheet hides every QSpinBox button (width: 0), which
+    makes spinboxes look like plain text inputs."""
+    up_png, down_png = _ensure_arrow_pngs()
+    return (
+        "QSpinBox { padding:3px 24px 3px 8px; }"
+        "QSpinBox::up-button { subcontrol-origin:border; subcontrol-position:top right;"
+        " width:20px; border-left:1px solid #45475a; border-bottom:1px solid #45475a;"
+        " border-top-right-radius:6px; background:#313244; }"
+        "QSpinBox::down-button { subcontrol-origin:border; subcontrol-position:bottom right;"
+        " width:20px; border-left:1px solid #45475a;"
+        " border-bottom-right-radius:6px; background:#313244; }"
+        "QSpinBox::up-button:hover, QSpinBox::down-button:hover { background:#45475a; }"
+        "QSpinBox::up-button:pressed, QSpinBox::down-button:pressed { background:#585b70; }"
+        f"QSpinBox::up-arrow {{ image:url({up_png}); width:10px; height:6px; }}"
+        f"QSpinBox::down-arrow {{ image:url({down_png}); width:10px; height:6px; }}"
+    )
+
 class ImageEditorWindow(QMainWindow):
     def __init__(self, pixmap, save_callback, default_dir="", parent=None,
                  annotation_mode=False):
@@ -12585,6 +12650,43 @@ class ImageEditorWindow(QMainWindow):
 
         tbar.addStretch()
         
+        # Rozmiar płótna w trybie Crop: dwa spinboxy (W/H) + punkt odniesienia.
+        # Widoczne tylko przy aktywnym narzędziu Crop.
+        self.crop_size_box = QWidget()
+        _csl = QHBoxLayout(self.crop_size_box)
+        _csl.setContentsMargins(0, 0, 0, 0)
+        _csl.setSpacing(4)
+        _csl.addWidget(QLabel("W:"))
+        self.crop_w_spin = QSpinBox()
+        self.crop_w_spin.setRange(1, 30000)
+        self.crop_w_spin.setSuffix(" px")
+        self.crop_w_spin.setKeyboardTracking(False)   # wpisana wartość działa po Enter / utracie fokusu
+        self.crop_w_spin.setToolTip("Canvas width (Crop)")
+        self.crop_w_spin.setStyleSheet(_visible_spin_style())
+        _csl.addWidget(self.crop_w_spin)
+        _csl.addWidget(QLabel("H:"))
+        self.crop_h_spin = QSpinBox()
+        self.crop_h_spin.setRange(1, 30000)
+        self.crop_h_spin.setSuffix(" px")
+        self.crop_h_spin.setKeyboardTracking(False)
+        self.crop_h_spin.setToolTip("Canvas height (Crop)")
+        self.crop_h_spin.setStyleSheet(_visible_spin_style())
+        _csl.addWidget(self.crop_h_spin)
+        self.crop_anchor_combo = QComboBox()
+        for _lbl in ("Top-left corner", "Top-right corner", "Bottom-left corner",
+                     "Bottom-right corner", "Center"):
+            self.crop_anchor_combo.addItem(_lbl)
+        self.crop_anchor_combo.setCurrentIndex(0)
+        self.crop_anchor_combo.setToolTip(
+            "Anchor point on the image — the selection of the chosen W×H is placed there")
+        self.crop_anchor_combo.setStyleSheet(_visible_combo_style())
+        _csl.addWidget(self.crop_anchor_combo)
+        self.crop_w_spin.valueChanged.connect(self._crop_apply_spins)
+        self.crop_h_spin.valueChanged.connect(self._crop_apply_spins)
+        self.crop_anchor_combo.currentIndexChanged.connect(self._crop_apply_spins)
+        self._crop_spin_updating = False
+        self.crop_size_box.hide()
+
         # Dedykowany przycisk zatwierdzenia przycięcia (widoczny tylko w trybie Crop)
         self.btn_apply_crop = QPushButton("✂️ Apply Crop")
         self.btn_apply_crop.setStyleSheet("background: #e74c3c; color: white; font-weight: bold; padding: 5px 10px; font-size: 14px;")
@@ -12645,7 +12747,8 @@ class ImageEditorWindow(QMainWindow):
         self.btn_hc.hide()
         pbar.addWidget(self.btn_hc)
         
-        pbar.addWidget(QLabel("Size:"))
+        self.size_label = QLabel("Size:")
+        pbar.addWidget(self.size_label)
 
         self.spin = QSpinBox(); self.spin.setRange(1, 200); self.spin.setValue(5)
         self.spin.setToolTip("Font size for text tools / Stroke width for shape tools")
@@ -12654,6 +12757,8 @@ class ImageEditorWindow(QMainWindow):
 
         self.fill = QCheckBox("Fill Shape"); self.fill.toggled.connect(self.update_live_props)
         pbar.addWidget(self.fill)
+        pbar.addSpacing(12)
+        pbar.addWidget(self.crop_size_box)   # panel rozmiaru Crop (drugi rząd)
         pbar.addStretch()
         layout.addLayout(pbar)
 
@@ -12866,15 +12971,74 @@ class ImageEditorWindow(QMainWindow):
                 self.canvas.scene.addItem(self.canvas.crop_item)
             self.canvas.crop_item.setSelected(True)
             self.canvas.crop_item.show()
+            self.canvas.crop_item.rect_changed_cb = self._crop_sync_spins
+            self.crop_size_box.show()
+            self._crop_sync_spins()
         else:
             self.btn_apply_crop.hide()
+            self.crop_size_box.hide()
             if self.canvas.crop_item:
+                self.canvas.crop_item.rect_changed_cb = None
                 self.canvas.scene.removeItem(self.canvas.crop_item)
                 self.canvas.crop_item = None
             
             # Restore massive sceneRect for free panning
             bg_rect = QRectF(self.canvas.bg_pixmap.rect())
             self.canvas.scene.setSceneRect(bg_rect.center().x() - 50000, bg_rect.center().y() - 50000, 100000, 100000)
+
+    def _crop_sync_spins(self):
+        """Zaznaczenie Crop -> spinboxy (wywoływane przy każdej zmianie ramki)."""
+        item = getattr(self.canvas, 'crop_item', None)
+        if item is None or self._crop_spin_updating:
+            return
+        r = item.rect().normalized()
+        w = max(1, int(round(r.right())) - int(round(r.left())))
+        h = max(1, int(round(r.bottom())) - int(round(r.top())))
+        self._crop_spin_updating = True
+        try:
+            for spin, val in ((self.crop_w_spin, w), (self.crop_h_spin, h)):
+                if spin.value() != val:
+                    spin.blockSignals(True)
+                    spin.setValue(val)
+                    spin.blockSignals(False)
+        finally:
+            self._crop_spin_updating = False
+
+    def _crop_apply_spins(self, *_):
+        """Spinboxes / anchor -> Crop selection.
+
+        The anchor is a point of the IMAGE (like Photoshop's Canvas Size):
+        the W×H selection is placed so that the same point of the selection
+        sits on that point of the image (top-left corners together, centres
+        together, ...). Larger than the image = canvas gets expanded from
+        that anchor, smaller = cropped towards it."""
+        item = getattr(self.canvas, 'crop_item', None)
+        if item is None or self._crop_spin_updating:
+            return
+        bg = self.canvas.bg_item.sceneBoundingRect()
+        bl, bt = int(round(bg.left())), int(round(bg.top()))
+        br, bb = int(round(bg.right())), int(round(bg.bottom()))
+        w, h = self.crop_w_spin.value(), self.crop_h_spin.value()
+        a = self.crop_anchor_combo.currentIndex()
+        if a == 0:      # top-left
+            x, y = bl, bt
+        elif a == 1:    # top-right
+            x, y = br - w, bt
+        elif a == 2:    # bottom-left
+            x, y = bl, bb - h
+        elif a == 3:    # bottom-right
+            x, y = br - w, bb - h
+        else:           # center
+            x = int(round((bl + br) / 2.0 - w / 2.0))
+            y = int(round((bt + bb) / 2.0 - h / 2.0))
+        self._crop_spin_updating = True
+        try:
+            item.prepareGeometryChange()
+            item.setRect(QRectF(x, y, w, h))
+        finally:
+            self._crop_spin_updating = False
+        item.update()
+        self.canvas.viewport().update()
 
     def apply_crop_action(self):
         if not self.canvas.crop_item:
@@ -12896,9 +13060,11 @@ class ImageEditorWindow(QMainWindow):
 
         # ── Annotation mode: save the crop region with annotations, don't crop the canvas ──
         if self._annotation_mode:
+            self.canvas.crop_item.rect_changed_cb = None
             self.canvas.scene.removeItem(self.canvas.crop_item)
             self.canvas.crop_item = None
             self.btn_apply_crop.hide()
+            self.crop_size_box.hide()
             self._finish_annotated_capture(crop_rect)
             return
 
@@ -12952,9 +13118,11 @@ class ImageEditorWindow(QMainWindow):
                 item.setPos(item.pos().x() + dx, item.pos().y() + dy)
 
         # Remove the crop overlay
+        self.canvas.crop_item.rect_changed_cb = None
         self.canvas.scene.removeItem(self.canvas.crop_item)
         self.canvas.crop_item = None
         self.btn_apply_crop.hide()
+        self.crop_size_box.hide()
 
         # Mark as dirty and return to Select tool
         self.canvas.is_dirty = True
@@ -13003,6 +13171,10 @@ class ImageEditorWindow(QMainWindow):
             self.spin.setValue(int(value))
         self.spin.setEnabled(value is not None)
         self.spin.blockSignals(False)
+        # Size is only shown when the active tool / selected object uses it
+        _show_size = value is not None and (item is not None or self._tool_key() is not None)
+        self.spin.setVisible(_show_size)
+        self.size_label.setVisible(_show_size)
 
         # Fill: only for rectangles / ellipses (selected, or their own tool active)
         show_fill = key in ('rect', 'circle') and (
