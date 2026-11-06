@@ -1710,7 +1710,8 @@ class Config:
                      "show_in_explorer": False, "scan_qr": False, "ocr_recognize": False,
                      "open_in_editor": False}
     DEFAULT_NOTIF = {"enabled": True, "sound": True, "thumbnail": True,
-                      "show_path": True, "click_open_file": True, "click_open_folder": False}
+                      "show_path": True, "click_open_file": True, "click_open_folder": False,
+                     "btn_edit": True, "btn_copy": True}
 
     def __init__(self):
         cfg_dir = Path(QStandardPaths.writableLocation(
@@ -1861,8 +1862,48 @@ def _play_beep():
         pass
 
 
+_SVG_TOAST_EDIT = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+<path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25z" fill="#ffffff"/>
+<path d="M20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" fill="#ffffff"/>
+</svg>"""
+
+_SVG_TOAST_COPY = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+<path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1z" fill="#ffffff"/>
+<path d="M19 5H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" fill="#ffffff"/>
+</svg>"""
+
+_SVG_TOAST_CHECK = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+<path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z" fill="#ffffff"/>
+</svg>"""
+
+_TOAST_BTN_STYLE = """
+    QPushButton {
+        background-color: rgba(20, 20, 20, 190);
+        border: 1px solid rgba(255, 255, 255, 60);
+        border-radius: 20px;
+    }
+    QPushButton:hover {
+        background-color: rgba(0, 162, 237, 235);
+        border: 1px solid rgba(255, 255, 255, 140);
+    }
+    QPushButton:pressed {
+        background-color: rgba(0, 120, 190, 255);
+    }
+"""
+
+_TOAST_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
+
 class NotificationToast(QWidget):
-    def __init__(self, title, message, pixmap=None, filepath=None, on_click_open=True, on_click_folder=False):
+    """Powiadomienie w stylu ShareX: sama duża miniaturka zrzutu (bez paska i tekstu)
+    + przycisk edycji w lewym dolnym rogu (otwiera zrzut w Image Editor)."""
+
+    MAX_W = 420
+    MAX_H = 260
+
+    def __init__(self, title, message, pixmap=None, filepath=None,
+                 on_click_open=True, on_click_folder=False, on_edit=None,
+                 show_edit=True, show_copy=True):
         super().__init__(None,
                          Qt.WindowType.Tool |
                          Qt.WindowType.FramelessWindowHint |
@@ -1874,69 +1915,62 @@ class NotificationToast(QWidget):
         self._filepath = filepath
         self._on_click_open   = on_click_open
         self._on_click_folder = on_click_folder
+        self._on_edit = on_edit
 
-        self.setStyleSheet("""
-            QWidget#MainFrame {
-                background-color: #1f1f1f;
-                border: 1px solid #3a3a3a;
-            }
-            QLabel#Title {
-                color: #00a2ed;
-                font-weight: bold;
-                font-size: 14px;
-            }
-            QLabel#Message {
-                color: #bbbbbb;
-                font-size: 12px;
-            }
-            QWidget#AccentBar {
-                background-color: #00a2ed;
-            }
-        """)
+        screen = QApplication.primaryScreen()
+        dpr = screen.devicePixelRatio() if screen else 1.0
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        # Niebieski pasek
-        self.accent = QFrame()
-        self.accent.setObjectName("AccentBar")
-        self.accent.setFixedWidth(4)
-        layout.addWidget(self.accent)
-
-        # Główny kontener
-        self.frame = QFrame()
-        self.frame.setObjectName("MainFrame")
-        layout.addWidget(self.frame)
-
-        f_layout = QHBoxLayout(self.frame)
-        f_layout.setContentsMargins(5, 5, 15, 5) # Bardzo małe marginesy dla obrazka
-        f_layout.setSpacing(15)
-
-        # DUŻA MINIATURKA - teraz 125x125
-        self.img_label = QLabel()
-        tsize = 125
-        self.img_label.setFixedSize(tsize, tsize)
+        # ── Miniaturka ────────────────────────────────────────────────────
+        self.img_label = QLabel(self)
+        self.img_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         if pixmap and not pixmap.isNull():
-            # Skalowanie wypełniające całe pole (Crop)
-            scaled = pixmap.scaled(tsize, tsize, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            scaled = pixmap.scaled(
+                int(self.MAX_W * dpr), int(self.MAX_H * dpr),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            scaled.setDevicePixelRatio(dpr)
+            w = max(1, int(round(scaled.width()  / dpr)))
+            h = max(1, int(round(scaled.height() / dpr)))
             self.img_label.setPixmap(scaled)
         else:
-            self.img_label.setStyleSheet("background-color: #2a2a2a;")
-        f_layout.addWidget(self.img_label)
+            # Brak podglądu (np. nagranie bez klatki) — ciemny placeholder z nazwą pliku
+            w, h = 320, 180
+            self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.img_label.setStyleSheet(
+                "background-color:#1f1f1f; color:#bbbbbb; font-size:12px;")
+            self.img_label.setText(Path(filepath).name if filepath else title)
+            self.img_label.setWordWrap(True)
+        self.img_label.setGeometry(0, 0, w, h)
+        self.setFixedSize(w, h)
 
-        # Tekst
-        t_layout = QVBoxLayout()
-        t_layout.setSpacing(2)
-        self.l_title = QLabel(title); self.l_title.setObjectName("Title")
-        self.l_msg = QLabel(message); self.l_msg.setObjectName("Message"); self.l_msg.setWordWrap(True)
-        t_layout.addStretch()
-        t_layout.addWidget(self.l_title)
-        t_layout.addWidget(self.l_msg)
-        t_layout.addStretch()
-        f_layout.addLayout(t_layout, 1)
+        # ── Przyciski na miniaturce (lewy dolny róg): Edit, a za nim Copy ──
+        self.btn_edit = None
+        self.btn_copy = None
+        is_image = bool(filepath) and Path(filepath).suffix.lower() in _TOAST_IMAGE_EXTS
+        x = 8
 
-        self.setFixedSize(480, 145) # Szerokie i czytelne
+        if show_edit and on_edit is not None and is_image:
+            self.btn_edit = self._make_btn(_SVG_TOAST_EDIT, "Edit image", x, h)
+            self.btn_edit.clicked.connect(self._edit_clicked)
+            x += 40 + 8
+
+        if show_copy and is_image:
+            self.btn_copy = self._make_btn(_SVG_TOAST_COPY, "Copy to clipboard", x, h)
+            self.btn_copy.clicked.connect(self._copy_clicked)
+            x += 40 + 8
+
+        # Zbyt wąska miniaturka — przyciski nie mogą wystawać poza okno
+        if x - 8 + 8 > w:
+            for bt in (self.btn_edit, self.btn_copy):
+                if bt is not None:
+                    bt.setFixedSize(30, 30)
+                    bt.setIconSize(QSize(16, 16))
+                    bt.setStyleSheet(_TOAST_BTN_STYLE.replace("20px", "15px"))
+            if self.btn_edit is not None:
+                self.btn_edit.move(6, h - 30 - 6)
+            if self.btn_copy is not None:
+                self.btn_copy.move(6 + (36 if self.btn_edit is not None else 0), h - 30 - 6)
+
         sg = QApplication.primaryScreen().availableGeometry()
         self.move(sg.right() - self.width() - 20, sg.bottom() - self.height() - 20)
         self.show()
@@ -1946,10 +1980,58 @@ class NotificationToast(QWidget):
         QTimer.singleShot(5000, self._ftimer.start)
         self._ftimer.setInterval(20)
 
+    def _make_btn(self, svg, tooltip, x, h):
+        btn = QPushButton(self)
+        btn.setFixedSize(40, 40)
+        btn.setIcon(_svg_icon(svg, 22))
+        btn.setIconSize(QSize(22, 22))
+        btn.setToolTip(tooltip)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn.setStyleSheet(_TOAST_BTN_STYLE)
+        btn.move(x, h - 40 - 8)
+        btn.raise_()
+        return btn
+
+    def _copy_clicked(self):
+        """Kopiuje zrzut (cały plik, nie miniaturkę) do schowka i na chwilę pokazuje ✓."""
+        ok = False
+        try:
+            pix = QPixmap(str(self._filepath))
+            if not pix.isNull():
+                QApplication.clipboard().setPixmap(pix)
+                ok = True
+        except Exception as ex:
+            print(f"[PyshareX] copy from toast error: {ex}")
+        if ok and self.btn_copy is not None:
+            self.btn_copy.setIcon(_svg_icon(_SVG_TOAST_CHECK, 22))
+            self.btn_copy.setToolTip("Copied!")
+            self._ftimer.stop()
+            self._opacity = 1.0
+            self.setWindowOpacity(1.0)
+            QTimer.singleShot(700, self.close)
+
+    def paintEvent(self, e):
+        # cienka ramka wokół miniaturki (rysowana NA obrazku)
+        p = QPainter(self)
+        p.setPen(QPen(QColor("#3a3a3a"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(0, 0, self.width() - 1, self.height() - 1)
+        p.end()
+
     def _fade(self):
         self._opacity -= 0.05
         if self._opacity <= 0: self.close()
         else: self.setWindowOpacity(self._opacity)
+
+    def _edit_clicked(self):
+        cb, path = self._on_edit, self._filepath
+        self.close()
+        if cb and path:
+            try:
+                cb(path)
+            except Exception as ex:
+                print(f"[PyshareX] edit from toast error: {ex}")
 
     def mousePressEvent(self, e):
         if not self._filepath:
@@ -1979,49 +2061,54 @@ class NotificationToast(QWidget):
 
         self.close()
 
-def notify(config: Config, filepath: str, pixmap=None):
+def notify(config: Config, filepath: str, pixmap=None, on_edit=None):
     notif = config.get("notifications", {})
     if not notif.get("enabled", True): return
-    
+
     if notif.get("sound", True):
         threading.Thread(target=_play_beep, daemon=True).start()
 
     p = Path(filepath)
     title = "Task completed"
-    msg = f"Image saved to:\n{p.name}" # Formatted like ShareX
-    
-    if pixmap is None:
-        p = Path(filepath)
-        if PIL_AVAILABLE and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp"):
-            try:
-                img = Image.open(filepath)
-                # ... tutaj kod ładowania obrazka z pliku ...
-            except: pass
-    if PIL_AVAILABLE and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp"):
+    msg = f"Image saved to:\n{p.name}"
+
+    # Dla obrazów bierzemy miniaturkę prosto z pliku (ostra, bez pełnego pixmapa w pamięci)
+    if p.suffix.lower() in _TOAST_IMAGE_EXTS and p.exists():
         try:
-            # Ładujemy obrazek w wyższej rozdzielczości do miniatury
-            img = Image.open(filepath)
-            img.thumbnail((250, 250)) 
-            img = img.convert("RGBA")
-            data = img.tobytes("raw", "RGBA")
-            # Force deep copy to prevent Segmentation Fault when bytes are garbage collected
-            qi = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888).copy()
-            pixmap = QPixmap.fromImage(qi)
-        except: pass
+            from PySide6.QtGui import QImageReader
+            reader = QImageReader(str(p))
+            reader.setAutoTransform(True)
+            sz = reader.size()
+            if sz.isValid():
+                sz.scale(NotificationToast.MAX_W * 2, NotificationToast.MAX_H * 2,
+                         Qt.AspectRatioMode.KeepAspectRatio)
+                if sz.width() < reader.size().width():
+                    reader.setScaledSize(sz)
+            qi = reader.read()
+            if not qi.isNull():
+                pixmap = QPixmap.fromImage(qi)
+        except Exception:
+            pass
 
     click_open_file   = notif.get("click_open_file",   True)
     click_open_folder = notif.get("click_open_folder", False)
+    show_edit = notif.get("btn_edit", True)
+    show_copy = notif.get("btn_copy", True)
     QTimer.singleShot(0, lambda: _show_toast(title, msg, pixmap, filepath,
-                                             click_open_file, click_open_folder))
+                                             click_open_file, click_open_folder, on_edit,
+                                             show_edit, show_copy))
 
 _toasts = []
 def _show_toast(title, msg, pixmap, filepath,
-                on_click_open=True, on_click_folder=False):
+                on_click_open=True, on_click_folder=False, on_edit=None,
+                show_edit=True, show_copy=True):
     global _toasts
     _toasts = [t for t in _toasts if t.isVisible()]
     t = NotificationToast(title, msg, pixmap, filepath,
                           on_click_open=on_click_open,
-                          on_click_folder=on_click_folder)
+                          on_click_folder=on_click_folder,
+                          on_edit=on_edit,
+                          show_edit=show_edit, show_copy=show_copy)
     _toasts.append(t)
 
 
@@ -9303,6 +9390,447 @@ except Exception as e:
         except Exception as e:
             return f"An error occurred while decoding: {e}"
 
+# ══════════════════════════════════════════════════════════════════════════
+#  WAYLAND SCREENCAST (nagrywanie wideo / GIF)
+#  Na Waylandzie x11grab i mss nie widzą ekranu. Jedyna dozwolona droga to
+#  xdg-desktop-portal ScreenCast -> strumień PipeWire. Pomocnik (osobny
+#  proces z PyGObject) otwiera sesję portalu i uruchamia gst-launch-1.0
+#  z pipewiresrc; sesja żyje, dopóki trwa nagrywanie. Surowy plik MKV (cały
+#  monitor) jest potem przycinany do zaznaczonego obszaru i zamieniany na
+#  MP4 / GIF przez ffmpeg. Na Windows/X11 nic z tego nie jest używane.
+#  Wymagane pakiety (Debian/Ubuntu/Kubuntu/Mint):
+#    sudo apt install python3-gi gstreamer1.0-tools gstreamer1.0-pipewire \
+#         gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly ffmpeg
+# ══════════════════════════════════════════════════════════════════════════
+
+_WL_CAST_TOKEN_FILE = Path.home() / ".cache" / "pysharex" / "screencast_restore_token"
+
+_WL_CAST_HELPER = r'''
+import sys, os, json, signal, subprocess, threading, time, tempfile
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+cfg = json.loads(sys.argv[1])
+
+def emit(**kw):
+    sys.stdout.write(json.dumps(kw) + "\n")
+    sys.stdout.flush()
+
+def die(msg):
+    emit(event="error", msg=str(msg))
+    sys.exit(1)
+
+try:
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+except Exception as e:
+    die("D-Bus session bus unavailable: %s" % e)
+
+PORTAL = "org.freedesktop.portal.Desktop"
+PPATH  = "/org/freedesktop/portal/desktop"
+SC     = "org.freedesktop.portal.ScreenCast"
+sender = bus.get_unique_name()[1:].replace(".", "_")
+_n = [0]
+
+def sv(t, v):
+    return GLib.Variant(t, v)
+
+def request(method, build, timeout):
+    """Wywołuje metodę portalu i czeka na sygnał Request.Response."""
+    _n[0] += 1
+    token = "pysx%d_%d" % (os.getpid(), _n[0])
+    handle = "/org/freedesktop/portal/desktop/request/%s/%s" % (sender, token)
+    res = {}
+    loop = GLib.MainLoop()
+    def on_resp(conn, sname, path, iface, sig, params, *a):
+        code, results = params.unpack()
+        res["code"] = code
+        res["results"] = results
+        loop.quit()
+    sid = bus.signal_subscribe(PORTAL, "org.freedesktop.portal.Request", "Response",
+                               handle, None, Gio.DBusSignalFlags.NONE, on_resp)
+    timed_out = [False]
+    tid = None
+    try:
+        bus.call_sync(PORTAL, PPATH, SC, method, build(token), None,
+                      Gio.DBusCallFlags.NONE, -1, None)
+        def on_to():
+            timed_out[0] = True
+            loop.quit()
+            return False
+        tid = GLib.timeout_add_seconds(timeout, on_to)
+        loop.run()
+        if tid is not None and not timed_out[0]:
+            GLib.source_remove(tid)
+    finally:
+        bus.signal_unsubscribe(sid)
+    if "code" not in res:
+        die("Timeout waiting for the portal (%s)" % method)
+    return res["code"], res["results"]
+
+def prop(name):
+    try:
+        r = bus.call_sync(PORTAL, PPATH, "org.freedesktop.DBus.Properties", "Get",
+                          sv("(ss)", (SC, name)), GLib.VariantType("(v)"),
+                          Gio.DBusCallFlags.NONE, -1, None)
+        return r.unpack()[0]
+    except Exception:
+        return None
+
+# 1. CreateSession
+code, r = request("CreateSession", lambda t: sv("(a{sv})", ({
+    "handle_token": sv("s", t), "session_handle_token": sv("s", t + "s")},)), 30)
+if code != 0:
+    die("CreateSession refused (code %s)" % code)
+session = r.get("session_handle")
+if not session:
+    die("CreateSession returned no session handle")
+
+# 2. SelectSources (monitor, kursor w strumieniu, zapamiętanie wyboru)
+restored = False
+def build_select(t):
+    global restored
+    opts = {"handle_token": sv("s", t), "types": sv("u", 1), "multiple": sv("b", False)}
+    cm = prop("AvailableCursorModes")
+    if cm is not None:
+        if cm & 2:
+            opts["cursor_mode"] = sv("u", 2)      # kursor wmontowany w obraz
+        elif cm & 1:
+            opts["cursor_mode"] = sv("u", 1)      # bez kursora
+    ver = prop("version")
+    if ver is not None and ver >= 4:
+        opts["persist_mode"] = sv("u", 2)         # pamiętaj wybór do odwołania
+        if cfg.get("restore_token"):
+            opts["restore_token"] = sv("s", cfg["restore_token"])
+            restored = True
+    return sv("(oa{sv})", (session, opts))
+code, r = request("SelectSources", build_select, 30)
+if code != 0:
+    die("SelectSources refused (code %s)" % code)
+
+# 3. Start - tu kompozytor pokazuje okno wyboru ekranu (jeśli brak zapamiętanego wyboru)
+code, r = request("Start", lambda t: sv("(osa{sv})", (session, "", {"handle_token": sv("s", t)})), 300)
+if code == 1:
+    emit(event="cancelled")
+    sys.exit(0)
+if code != 0:
+    die("Start refused (code %s)" % code)
+streams = r.get("streams") or []
+if not streams:
+    die("The portal returned no video stream")
+node, props = streams[0]
+position = props.get("position")
+size = props.get("size")
+new_token = r.get("restore_token")
+if new_token:
+    try:
+        os.makedirs(os.path.dirname(cfg["token_file"]), exist_ok=True)
+        with open(cfg["token_file"], "w") as f:
+            f.write(new_token)
+    except Exception:
+        pass
+
+# 4. OpenPipeWireRemote -> deskryptor pliku
+try:
+    res, fdl = bus.call_with_unix_fd_list_sync(
+        PORTAL, PPATH, SC, "OpenPipeWireRemote",
+        sv("(oa{sv})", (session, {})), GLib.VariantType("(h)"),
+        Gio.DBusCallFlags.NONE, -1, None, None)
+    fd = fdl.get(res.unpack()[0])
+except Exception as e:
+    die("OpenPipeWireRemote failed: %s" % e)
+
+# 5. GStreamer
+tokens = [t.replace("{FD}", str(fd)).replace("{NODE}", str(node)) for t in cfg["pipeline"]]
+cmd = ["gst-launch-1.0", "-e", "-q"] + tokens
+errf = tempfile.TemporaryFile()
+try:
+    gst = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=errf, pass_fds=(fd,))
+except Exception as e:
+    die("Cannot start gst-launch-1.0: %s" % e)
+
+def err_tail():
+    try:
+        errf.seek(0)
+        return errf.read().decode(errors="replace").strip()[-600:]
+    except Exception:
+        return ""
+
+def close_session():
+    try:
+        bus.call_sync(PORTAL, session, "org.freedesktop.portal.Session", "Close",
+                      None, None, Gio.DBusCallFlags.NONE, -1, None)
+    except Exception:
+        pass
+
+time.sleep(1.0)
+if gst.poll() is not None:
+    tail = err_tail()
+    close_session()
+    die("GStreamer exited immediately:\n%s" % tail)
+
+emit(event="started", node=node, position=position, size=size, restored=restored)
+
+stop = threading.Event()
+def reader():
+    try:
+        for line in sys.stdin:
+            if line.strip() == "stop":
+                break
+    except Exception:
+        pass
+    stop.set()
+threading.Thread(target=reader, daemon=True).start()
+
+while not stop.is_set() and gst.poll() is None:
+    time.sleep(0.1)
+
+if gst.poll() is None:
+    gst.send_signal(signal.SIGINT)          # -e: EOS -> poprawnie zamknięty MKV
+    try:
+        gst.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        gst.kill()
+        gst.wait()
+rc = gst.returncode
+tail = err_tail()
+close_session()
+emit(event="done", rc=rc, err=tail)
+'''
+
+
+def _wl_cast_check_deps(rec_fps):
+    """Sprawdza zależności nagrywania na Waylandzie. Zwraca słownik z danymi
+    (interpreter z `gi`, tokeny pipeline) albo tekst błędu (str)."""
+    py = _wl_find_gi_python()
+    if not py:
+        return ("Wayland recording needs PyGObject:\n"
+                "  sudo apt install python3-gi gir1.2-glib-2.0")
+    if not _shutil.which("ffmpeg"):
+        return ("ffmpeg is not installed.\n  sudo apt install ffmpeg")
+    if not _shutil.which("gst-launch-1.0") or not _shutil.which("gst-inspect-1.0"):
+        return ("GStreamer is not installed. Wayland recording needs:\n"
+                "  sudo apt install gstreamer1.0-tools gstreamer1.0-pipewire "
+                "gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly")
+
+    def has(el):
+        try:
+            return subprocess.run(["gst-inspect-1.0", el], capture_output=True,
+                                  timeout=15).returncode == 0
+        except Exception:
+            return False
+
+    if not has("pipewiresrc"):
+        return ("The GStreamer PipeWire plugin is missing:\n"
+                "  sudo apt install gstreamer1.0-pipewire")
+    if not has("matroskamux"):
+        return ("The GStreamer 'matroskamux' element is missing:\n"
+                "  sudo apt install gstreamer1.0-plugins-good")
+
+    enc = None
+    for name, toks in (
+            ("x264enc", ["x264enc", "speed-preset=ultrafast", "tune=zerolatency",
+                         "bitrate=40000", "key-int-max=60"]),
+            ("vp8enc",  ["vp8enc", "deadline=1", "cpu-used=8", "threads=4",
+                         "target-bitrate=40000000", "keyframe-max-dist=60"]),
+            ("jpegenc", ["jpegenc", "quality=92"])):
+        if has(name):
+            enc = toks
+            break
+    if enc is None:
+        return ("No GStreamer video encoder found (x264enc / vp8enc / jpegenc):\n"
+                "  sudo apt install gstreamer1.0-plugins-ugly gstreamer1.0-plugins-good")
+
+    keepalive = False
+    try:
+        r = subprocess.run(["gst-inspect-1.0", "pipewiresrc"], capture_output=True,
+                           text=True, timeout=15)
+        keepalive = "keepalive-time" in (r.stdout or "")
+    except Exception:
+        pass
+    return {"py": py, "enc": enc, "keepalive": keepalive, "fps": int(rec_fps)}
+
+
+def _wl_cast_region_fractions(region):
+    """Region (współrzędne Qt/X jak w _WaylandMSS) -> ułamki monitora, na którym leży.
+    Zwraca (geoms, idx, (fx, fy, fw, fh)). Ułamki nie zależą od skalowania ani
+    od tego, czy współrzędne są logiczne czy fizyczne."""
+    geoms = _wl_screen_geoms() or [(0, 0, 1920, 1080)]
+    if region:
+        x, y, w, h = region
+    else:
+        x, y, w, h = geoms[0]
+    cx, cy = x + w / 2.0, y + h / 2.0
+    idx = 0
+    for i, g in enumerate(geoms):
+        if g[0] <= cx < g[0] + g[2] and g[1] <= cy < g[1] + g[3]:
+            idx = i
+            break
+    gx, gy, gw, gh = geoms[idx]
+    gw = max(1, gw); gh = max(1, gh)
+    fx = min(1.0, max(0.0, (x - gx) / gw))
+    fy = min(1.0, max(0.0, (y - gy) / gh))
+    fw = min(1.0 - fx, max(0.0, w / gw))
+    fh = min(1.0 - fy, max(0.0, h / gh))
+    return geoms, idx, (fx, fy, fw, fh)
+
+
+def _wl_cast_record(raw_path, deps, stop_event, check=None, on_started=None, use_token=True):
+    """Nagrywa monitor przez portal ScreenCast do surowego MKV (raw_path), aż do
+    stop_event. Zwraca {"status": "ok"|"declined"|"cancelled"|"mismatch", ...};
+    przy błędzie rzuca RuntimeError(tekst)."""
+    import queue
+
+    token = None
+    if use_token:
+        try:
+            token = _WL_CAST_TOKEN_FILE.read_text().strip() or None
+        except Exception:
+            token = None
+
+    fps = deps["fps"]
+    pipeline = (["pipewiresrc", "fd={FD}", "path={NODE}", "do-timestamp=true"]
+                + (["keepalive-time=1000"] if deps["keepalive"] else [])
+                + ["!", "queue", "!", "videoconvert", "!", "videorate", "!",
+                   f"video/x-raw,framerate={fps}/1", "!"]
+                + deps["enc"]
+                + ["!", "matroskamux", "!", "filesink", f"location={raw_path}"])
+    cfg = {"pipeline": pipeline, "restore_token": token,
+           "token_file": str(_WL_CAST_TOKEN_FILE)}
+
+    errf = tempfile.TemporaryFile()
+    try:
+        proc = subprocess.Popen([deps["py"], "-c", _WL_CAST_HELPER, _json.dumps(cfg)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=errf, text=True, bufsize=1)
+    except Exception as e:
+        errf.close()
+        raise RuntimeError(f"Cannot start the screencast helper: {e}")
+
+    lines = queue.Queue()
+
+    def _reader():
+        try:
+            for ln in proc.stdout:
+                lines.put(ln)
+        except Exception:
+            pass
+        lines.put(None)
+    threading.Thread(target=_reader, daemon=True).start()
+
+    def _helper_err():
+        try:
+            errf.seek(0)
+            return errf.read().decode(errors="replace").strip()[-500:]
+        except Exception:
+            return ""
+
+    def _parse(ln):
+        try:
+            return _json.loads(ln)
+        except Exception:
+            return {}
+
+    def _ask_stop(wait):
+        try:
+            proc.stdin.write("stop\n")
+            proc.stdin.flush()
+        except Exception:
+            pass
+        done = None
+        t_end = time.monotonic() + wait
+        while time.monotonic() < t_end:
+            try:
+                ln = lines.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if ln is None:
+                break
+            ev = _parse(ln)
+            if ev.get("event") == "done":
+                done = ev
+                break
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+        return done
+
+    try:
+        # ── Czekamy, aż użytkownik zatwierdzi udostępnianie ekranu ───────────
+        info = None
+        deadline = time.monotonic() + 300
+        while info is None:
+            if stop_event.is_set():
+                proc.kill()
+                return {"status": "cancelled"}
+            try:
+                ln = lines.get(timeout=0.2)
+            except queue.Empty:
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    raise RuntimeError("Timed out waiting for the screen-sharing permission.")
+                continue
+            if ln is None:
+                raise RuntimeError("The screencast helper stopped unexpectedly.\n" + _helper_err())
+            ev = _parse(ln)
+            kind = ev.get("event")
+            if kind == "started":
+                info = ev
+            elif kind == "cancelled":
+                return {"status": "declined"}
+            elif kind == "error":
+                raise RuntimeError(ev.get("msg", "Unknown screencast error"))
+
+        _wl_log(f"screencast ruszył: node={info.get('node')} pos={info.get('position')} "
+                f"size={info.get('size')} restored={info.get('restored')}")
+
+        if check:
+            msg = check(info)
+            if msg:
+                _ask_stop(10)
+                return {"status": "mismatch", "info": info, "msg": msg}
+        if on_started:
+            on_started(info)
+
+        # ── Nagrywanie trwa do stop_event (albo do końca strumienia) ─────────
+        done_ev = None
+        ended = False
+        while not stop_event.is_set():
+            try:
+                ln = lines.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if ln is None:
+                ended = True
+                break
+            ev = _parse(ln)
+            if ev.get("event") in ("done", "error"):
+                done_ev = ev
+                ended = True
+                break
+        if not ended:
+            done_ev = _ask_stop(40)
+        else:
+            try: proc.wait(timeout=5)
+            except Exception: pass
+
+        if not (os.path.exists(raw_path) and os.path.getsize(raw_path) > 1024):
+            tail = (done_ev or {}).get("err") or (done_ev or {}).get("msg") or _helper_err()
+            raise RuntimeError("GStreamer produced no video.\n" + str(tail))
+        return {"status": "ok", "info": info}
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        try: errf.close()
+        except Exception: pass
+
+
 # ─────────────────────────────────────────────
 #  RECORDING THREAD
 # ─────────────────────────────────────────────
@@ -9326,6 +9854,7 @@ class RecordingThread(QThread):
         self.snapshot_mode = snapshot_mode   # True = grab exactly 1 frame → PNG
         self._stop         = threading.Event()
         self._proc         = None
+        self.thumb_image   = None           # QImage pierwszej klatki (Wayland)
 
     def stop(self):
         # IMPORTANT: only set the flag here. This is called directly (not via
@@ -9360,17 +9889,161 @@ class RecordingThread(QThread):
     def run(self):
         try:
             if _is_wayland_session() and not self.snapshot_mode:
-                self.error.emit(
-                    "Nagrywanie wideo/GIF nie działa jeszcze na Waylandzie "
-                    "(x11grab i grabowanie klatka-po-klatce nie widzą ekranu; "
-                    "potrzebny jest portal ScreenCast + PipeWire). "
-                    "Zaloguj się do sesji X11, żeby nagrywać.")
+                self._wayland_run()
                 return
             if self.gif_mode:      self._gif()
             elif self.snapshot_mode: self._snapshot()
             else:                  self._video()
         except Exception as e:
             self.error.emit(f"Unexpected error: {e}")
+
+    # ── Wayland: portal ScreenCast + PipeWire (GStreamer) -> ffmpeg ──────────
+    def _wayland_run(self):
+        rec_fps = max(10, int(self.gif_fps)) if self.gif_mode else int(self.fps)
+        deps = _wl_cast_check_deps(rec_fps)
+        if isinstance(deps, str):
+            self.error.emit(deps)
+            return
+
+        raw = self.output_path + ".raw.mkv"
+        geoms, idx, frac = _wl_cast_region_fractions(self.region)
+        gx, gy, gw, gh = geoms[idx]
+
+        def check(info):
+            """Czy strumień z portalu to ten sam monitor, na którym zaznaczono obszar?"""
+            if len(geoms) < 2:
+                return None
+            wrong = ("The selected area is on a different monitor than the one shared in "
+                     "the system dialog. Pick the matching monitor in the dialog and try again.")
+            size = info.get("size"); pos = info.get("position")
+            if size and size[0] and size[1]:
+                if abs(size[0] / float(size[1]) - gw / float(gh)) > 0.02:
+                    return wrong
+            if pos:
+                p = (pos[0], pos[1])
+                for i, g in enumerate(geoms):
+                    if i != idx and (g[0], g[1]) == p and (gx, gy) != p:
+                        return wrong
+            return None
+
+        def on_started(info):
+            if self.region:
+                x, y, w, h = self.region
+            else:
+                x, y, w, h = gx, gy, gw, gh
+            self.region_ready.emit(int(x), int(y), int(w), int(h))
+
+        if self.audio:
+            _wl_log("audio is not recorded on Wayland yet - video only")
+
+        try:
+            res = _wl_cast_record(raw, deps, self._stop, check=check,
+                                  on_started=on_started, use_token=True)
+            if res["status"] == "mismatch" and res["info"].get("restored"):
+                # Zapamiętany wybór wskazywał inny monitor - zapomnij go i pokaż okno wyboru
+                try: _WL_CAST_TOKEN_FILE.unlink()
+                except Exception: pass
+                try: Path(raw).unlink()
+                except Exception: pass
+                res = _wl_cast_record(raw, deps, self._stop, check=check,
+                                      on_started=on_started, use_token=False)
+        except RuntimeError as e:
+            self._wl_cleanup(raw)
+            self.error.emit(str(e))
+            return
+
+        st = res["status"]
+        if st == "declined":
+            self._wl_cleanup(raw)
+            self.error.emit("Screen sharing was cancelled in the system dialog.")
+            return
+        if st == "cancelled":
+            self._wl_cleanup(raw)
+            self.error.emit("Recording cancelled before it started.")
+            return
+        if st == "mismatch":
+            self._wl_cleanup(raw)
+            self.error.emit(res.get("msg", "Wrong monitor selected."))
+            return
+
+        self._wl_convert(raw, frac, rec_fps)
+
+    @staticmethod
+    def _wl_cleanup(raw):
+        try:
+            if os.path.exists(raw):
+                os.unlink(raw)
+        except Exception:
+            pass
+
+    def _wl_convert(self, raw, frac, rec_fps):
+        """Przycina surowy MKV do zaznaczonego obszaru i zapisuje MP4 / GIF."""
+        fx, fy, fw, fh = frac
+        full = fw > 0.999 and fh > 0.999 and fx < 0.001 and fy < 0.001
+        if full:
+            crop = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        else:
+            crop = (f"crop=w='trunc(iw*{fw:.6f}/2)*2':h='trunc(ih*{fh:.6f}/2)*2':"
+                    f"x='min(trunc(iw*{fx:.6f}),iw-ow)':y='min(trunc(ih*{fy:.6f}),ih-oh)'")
+
+        if self.gif_mode:
+            gfps = max(1, int(self.gif_fps))
+            vf = (f"fps={gfps},{crop},scale='min(1280,iw)':-2:flags=lanczos,"
+                  f"split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
+                  f"[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle")
+            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", raw,
+                   "-vf", vf, "-loop", "0", self.output_path]
+        else:
+            vf = f"{crop},fps={int(self.fps)}"
+            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", raw,
+                   "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                   "-pix_fmt", "yuv420p", "-movflags", "+faststart", self.output_path]
+        print(f"[PyshareX] {' '.join(cmd)}")
+
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        except FileNotFoundError:
+            self.error.emit("ffmpeg is not installed.\n  sudo apt install ffmpeg")
+            return
+        except Exception as e:
+            self.error.emit(f"ffmpeg conversion failed: {e}")
+            return
+
+        out = Path(self.output_path)
+        if r.returncode == 0 and out.exists() and out.stat().st_size > 512:
+            self._wl_cleanup(raw)
+            self._wl_make_thumb(self.output_path)
+            self.finished.emit(self.output_path)
+            return
+
+        tail = "\n".join((r.stderr or "").strip().splitlines()[-10:])
+        if not self.gif_mode:
+            # Zapasowo zostawiamy surowy MKV (odtwarzalny w VLC/mpv), jak na X11
+            fallback = self.output_path.replace(".mp4", ".mkv")
+            try:
+                os.replace(raw, fallback)
+                _wl_log(f"ffmpeg conversion failed, kept raw recording: {fallback}\n{tail}")
+                self.finished.emit(fallback)
+                return
+            except Exception:
+                pass
+        self._wl_cleanup(raw)
+        self.error.emit(f"ffmpeg conversion error:\n{tail}")
+
+    def _wl_make_thumb(self, path):
+        """Pierwsza klatka nagrania -> QImage dla powiadomienia (na Waylandzie nie robimy
+        zrzutu przez portal przy starcie)."""
+        try:
+            png = path + ".thumb.png"
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+                            "-frames:v", "1", png], capture_output=True, timeout=60)
+            qi = QImage(png)
+            if not qi.isNull():
+                self.thumb_image = qi
+            try: os.unlink(png)
+            except Exception: pass
+        except Exception as e:
+            _wl_log(f"thumbnail: {e}")
 
     def _resolve_region(self):
         if self.region:
@@ -14564,6 +15237,8 @@ class MainWindow(QMainWindow):
                 ("show_path",         "📂 Show file path",                   True),
                 ("click_open_file",   "🖱  Click → open file",               True),
                 ("click_open_folder", "📁 Click → open containing folder",   False),
+                ("btn_edit",         "✏️ Show \"Edit image\" button on the thumbnail",  True),
+                ("btn_copy",         "📋 Show \"Copy to clipboard\" button on the thumbnail", True),
         ]:
             cb = QCheckBox(lbl2); cb.setChecked(notif.get(k, default))
             self._nc[k] = cb; nl.addWidget(cb)
@@ -15212,7 +15887,7 @@ class MainWindow(QMainWindow):
 
     def _on_notify(self, path, pixmap=None):
         self._add_hist(path)
-        notify(self.config, path, pixmap=pixmap)
+        notify(self.config, path, pixmap=pixmap, on_edit=self._open_file_in_editor)
         
         after = self.config.get("after_capture", {})
 
@@ -15285,6 +15960,22 @@ class MainWindow(QMainWindow):
                 # Otwieramy okno edytora
                 self.editor = ImageEditorWindow(pixmap, self.save_edited_image, str(_month_folder(self.config.get("save_folder", ""))), self)
                 self.editor.show()
+
+    def _open_file_in_editor(self, path):
+        """Otwiera istniejący zrzut ekranu w Image Editor (przycisk w powiadomieniu)."""
+        try:
+            pix = QPixmap(str(path))
+            if pix.isNull():
+                return
+            screenshot_dir = str(_month_folder(self.config.get(
+                "save_folder",
+                str(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)))))
+            self.editor_win = ImageEditorWindow(pix, self.save_edited_image, screenshot_dir, self)
+            self.editor_win.show()
+            self.editor_win.raise_()
+            self.editor_win.activateWindow()
+        except Exception as ex:
+            print(f"[PyshareX] open in editor error: {ex}")
 
     def _done(self, path, label="Screenshot"):
         if path:
@@ -15473,6 +16164,8 @@ class MainWindow(QMainWindow):
         self._bar = RecordingBar()
         # Robimy "zdjęcie" obszaru pod miniaturkę, zanim ruszy nagrywanie
         try:
+            if _is_wayland_session():
+                raise RuntimeError("Wayland: thumbnail comes from the recorded video")
             with mss.MSS() as sct:
                 # x, y, w, h to obszar fizyczny
                 mon = {"top": y, "left": x, "width": w, "height": h}
@@ -15512,6 +16205,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_rec_btn"):
             self._rec_btn.setText("Record"); self._rec_btn.setProperty("rec", "0")
             self._rec_btn.setStyle(self._rec_btn.style())
+        _wl_img = getattr(self.rec_th, "thumb_image", None)
+        self.last_rec_pixmap = QPixmap.fromImage(_wl_img) if (_wl_img is not None and not _wl_img.isNull()) else (None if _is_wayland_session() else self.last_rec_pixmap)
         self.rec_th = None
         if self._border: self._border.stop(); self._border = None
         if self._bar:    self._bar.stop_display(); self._bar = None
@@ -15583,6 +16278,8 @@ class MainWindow(QMainWindow):
         self._gif_bar.stop_clicked.connect(self._stop_gif)
         self._gif_bar.abort_clicked.connect(self._abort_gif)
         try:
+            if _is_wayland_session():
+                raise RuntimeError("Wayland: thumbnail comes from the recorded video")
             with mss.MSS() as sct:
                 mon = {"top": y, "left": x, "width": w, "height": h}
                 sct_img = sct.grab(mon)
@@ -15616,6 +16313,8 @@ class MainWindow(QMainWindow):
 
     def _on_gif_done(self, path):
         self._stop_gif_border()
+        _wl_img = getattr(self.gif_th, "thumb_image", None)
+        self.last_rec_pixmap = QPixmap.fromImage(_wl_img) if (_wl_img is not None and not _wl_img.isNull()) else (None if _is_wayland_session() else self.last_rec_pixmap)
         self.gif_th = None
         if getattr(self, "_gif_aborted", False):
             self._gif_aborted = False
