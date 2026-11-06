@@ -33,7 +33,9 @@ sudo apt install libxcb-cursor0
 sudo apt install libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-util1
 ```
 
-
+```
+sudo apt install python3-gi gstreamer1.0-tools gstreamer1.0-pipewire gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly ffmpeg
+```
 
 
 ## For Windows:
