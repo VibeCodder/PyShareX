@@ -80,8 +80,8 @@ sudo apt install tesseract-ocr tesseract-ocr-pol
 ----
 ### PyShareX allows you for:
 - capture screen region
-- capture active monitor screenshot
-- capture selected monitor screenshot
+- capture active monitor
+- capture selected monitor
 - caputure full screen (from all monitors)
 - scrolling capture
 - screen region video recording
