@@ -14,7 +14,10 @@ What it does:
   2. picks the pip flags that fit the system (venv / PEP 668 "externally managed" / user account),
   3. CHECKS that every package can really be imported - if not (e.g. a package installed by apt
      for a DIFFERENT Python version), it is reinstalled into this interpreter,
-  4. installs system tools: ffmpeg and (Linux/Wayland) a screenshot tool.
+  4. installs system tools: ffmpeg and, on Linux, PyGObject + GStreamer (video/GIF recording on
+     Wayland goes through the screen-sharing portal and PipeWire), a screenshot tool and (Debian/
+     Ubuntu/Mint) the libxcb-* libraries that Qt's "xcb" platform plugin needs. On Linux it also
+     makes sure python-xlib (X11 window detection) is installed, even if requirements.txt lacks it.
 
 The OCR packages are optional: if they cannot be installed for your Python version, everything
 else is still installed and the program simply runs without OCR.
@@ -160,17 +163,38 @@ def check_module(module: str, optional: bool):
 PACKAGE_MANAGERS = {
     "apt-get": (["apt-get", "install", "-y"],
                 {"ffmpeg": "ffmpeg", "gi": ["python3-gi", "gir1.2-glib-2.0"], "spectacle": "spectacle",
-                 "gnome-screenshot": "gnome-screenshot", "grim": "grim"}),
+                 "gnome-screenshot": "gnome-screenshot", "grim": "grim",
+                 "gst-tools": "gstreamer1.0-tools", "gst-pipewire": "gstreamer1.0-pipewire",
+                 "gst-good": "gstreamer1.0-plugins-good", "gst-ugly": "gstreamer1.0-plugins-ugly"}),
     "dnf": (["dnf", "install", "-y"],
             {"ffmpeg": "ffmpeg-free", "gi": "python3-gobject", "spectacle": "spectacle",
-             "gnome-screenshot": "gnome-screenshot", "grim": "grim"}),
+             "gnome-screenshot": "gnome-screenshot", "grim": "grim",
+             "gst-tools": "gstreamer1", "gst-pipewire": "pipewire-gstreamer",
+             "gst-good": "gstreamer1-plugins-good", "gst-ugly": "gstreamer1-plugins-ugly"}),
     "pacman": (["pacman", "-S", "--needed", "--noconfirm"],
                {"ffmpeg": "ffmpeg", "gi": "python-gobject", "spectacle": "spectacle",
-                "gnome-screenshot": "gnome-screenshot", "grim": "grim"}),
+                "gnome-screenshot": "gnome-screenshot", "grim": "grim",
+                "gst-tools": "gstreamer", "gst-pipewire": "gst-plugin-pipewire",
+                "gst-good": "gst-plugins-good", "gst-ugly": "gst-plugins-ugly"}),
     "zypper": (["zypper", "install", "-y"],
                {"ffmpeg": "ffmpeg", "gi": "python3-gobject", "spectacle": "spectacle",
-                "gnome-screenshot": "gnome-screenshot", "grim": "grim"}),
+                "gnome-screenshot": "gnome-screenshot", "grim": "grim",
+                "gst-tools": "gstreamer", "gst-pipewire": "gstreamer-plugin-pipewire",
+                "gst-good": "gstreamer-plugins-good", "gst-ugly": "gstreamer-plugins-ugly"}),
 }
+
+
+# Qt's "xcb" platform plugin (the program forces it on Linux, also under Wayland via XWayland) needs these
+# libraries; without them the program stops with "Could not load the Qt platform plugin xcb".
+# (libxcb-cursor0 is required by Qt >= 6.5, i.e. by current PySide6.)
+APT_XCB_LIBS = [
+    "libxcb-xinerama0", "libxcb-icccm4", "libxcb-image0", "libxcb-keysyms1", "libxcb-randr0",
+    "libxcb-render-util0", "libxcb-shape0", "libxcb-util1", "libxcb-cursor0",
+]
+
+
+def apt_package_installed(pkg: str) -> bool:
+    return run(["dpkg", "-s", pkg], quiet=True).returncode == 0
 
 
 def system_python_has_gi() -> bool:
@@ -181,13 +205,37 @@ def system_python_has_gi() -> bool:
     return False
 
 
+def gst_element_missing(element: str) -> bool:
+    """True if GStreamer cannot find `element` (or GStreamer itself is not installed)."""
+    if not shutil.which("gst-inspect-1.0"):
+        return True
+    return run(["gst-inspect-1.0", element], quiet=True).returncode != 0
+
+
+def missing_gst_packages() -> list:
+    """Keys of the GStreamer packages needed for Wayland video/GIF recording that are missing.
+    Recording goes: screen-sharing portal -> PipeWire -> GStreamer (pipewiresrc + encoder) -> ffmpeg."""
+    if not (shutil.which("gst-launch-1.0") and shutil.which("gst-inspect-1.0")):
+        return ["gst-tools", "gst-pipewire", "gst-good", "gst-ugly"]
+    missing = []
+    if gst_element_missing("pipewiresrc"):
+        missing.append("gst-pipewire")
+    if gst_element_missing("matroskamux"):
+        missing.append("gst-good")
+    if gst_element_missing("x264enc"):
+        missing.append("gst-ugly")
+    return missing
+
+
 def install_system_linux():
     pm_name = next((n for n in PACKAGE_MANAGERS if shutil.which(n)), None)
     if pm_name is None and shutil.which("apt"):
         pm_name = "apt-get"
     if pm_name is None:
-        say("Package manager not recognised - please install manually: ffmpeg"
-            " (and on Wayland: python3-gi + spectacle / gnome-screenshot / grim).")
+        say("Package manager not recognised - please install manually: ffmpeg, PyGObject (python3-gi),"
+            " GStreamer (tools + pipewire + plugins-good + plugins-ugly), the libxcb-* libraries for Qt"
+            " (Debian/Ubuntu: " + " ".join(APT_XCB_LIBS) + ")"
+            " (and on Wayland a screenshot tool: spectacle / gnome-screenshot / grim).")
         return
     base_cmd, names = PACKAGE_MANAGERS[pm_name]
 
@@ -207,13 +255,21 @@ def install_system_linux():
             wanted.append("gnome-screenshot")
         elif any(d in desktop for d in ("sway", "hypr", "wlroots", "river")) and not shutil.which("grim"):
             wanted.append("grim")
-        if not system_python_has_gi():
-            wanted.append("gi")
+
+    # Video / GIF recording (needed on Wayland; harmless on X11, and the same install works when you
+    # switch session): PyGObject talks to the screen-sharing portal, GStreamer records the PipeWire stream.
+    if not system_python_has_gi() and "gi" not in wanted:
+        wanted.append("gi")
+    for key in missing_gst_packages():
+        if key not in wanted:
+            wanted.append(key)
 
     pkgs = []
     for w in wanted:
         v = names[w]
         pkgs += v if isinstance(v, list) else [v]
+    if pm_name == "apt-get":
+        pkgs += [p for p in APT_XCB_LIBS if p not in pkgs and not apt_package_installed(p)]
     if not pkgs:
         say("System tools: everything is already installed.")
         return
@@ -223,9 +279,19 @@ def install_system_linux():
         say("No sudo available - install manually as administrator: " + " ".join(base_cmd + pkgs))
         return
     rc = run(sudo + base_cmd + pkgs).returncode
+    if rc != 0 and len(pkgs) > 1:
+        # One unavailable package (e.g. gstreamer1-plugins-ugly needs RPM Fusion on Fedora) makes the
+        # package manager install NOTHING - so retry one by one to keep everything that can be installed.
+        say("\nThe combined system install failed - retrying package by package...")
+        bad = [p for p in pkgs if run(sudo + base_cmd + [p]).returncode != 0]
+        rc = 1 if bad else 0
+        pkgs = bad
     if rc != 0:
         say("  ! installing the system packages failed (the rest of the installation continues).")
         say("    Manually: " + " ".join(base_cmd + pkgs))
+        if any(p in ("gstreamer1.0-plugins-ugly", "gstreamer1-plugins-ugly", "gst-plugins-ugly",
+                     "gstreamer-plugins-ugly") for p in pkgs):
+            say("    (plugins-ugly only provides the faster x264 encoder - recording still works without it.)")
 
 
 def install_system():
@@ -277,6 +343,22 @@ def install_packages(reqs, flags) -> list:
     return failed
 
 
+def ensure_xlib(reqs, flags):
+    """python-xlib is a pip package (not an apt one) that the program uses on X11 to detect windows
+    (capture active window / pick a window). requirements.txt normally lists it; if it does not,
+    install it here so that it does not depend on that file. Optional: the program runs without it."""
+    if SYSTEM != "Linux" or any(r["name"] == "python-xlib" for r in reqs):
+        return
+    say("\n== python-xlib (X11 window detection) ==")
+    if check_module("Xlib", False)[0]:
+        say("  OK   python-xlib")
+        return
+    run([PY, "-m", "pip", "install", *flags, "python-xlib"])
+    ok, err = check_module("Xlib", False)
+    say("  OK   python-xlib" if ok else
+        f"  !!   python-xlib could not be installed ({err}) - window detection on X11 will be unavailable")
+
+
 def main() -> int:
     say(f"Python {sys.version.split()[0]}  ({PY})")
     say(f"System: {SYSTEM}  |  venv: {'yes' if IN_VENV else 'no'}")
@@ -296,6 +378,7 @@ def main() -> int:
 
     say("\n== Python packages (requirements.txt) ==")
     failed = install_packages(reqs, flags)
+    ensure_xlib(reqs, flags)
     failed_core = [r for r in failed if not r["optional"]]
     failed_opt = [r for r in failed if r["optional"]]
 

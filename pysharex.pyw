@@ -9398,6 +9398,8 @@ except Exception as e:
 #  z pipewiresrc; sesja żyje, dopóki trwa nagrywanie. Surowy plik MKV (cały
 #  monitor) jest potem przycinany do zaznaczonego obszaru i zamieniany na
 #  MP4 / GIF przez ffmpeg. Na Windows/X11 nic z tego nie jest używane.
+#  Obszar obejmujący kilka monitorów: nagrywane są wszystkie potrzebne strumienie,
+#  a ffmpeg skleja ich części w jeden obraz.
 #  Wymagane pakiety (Debian/Ubuntu/Kubuntu/Mint):
 #    sudo apt install python3-gi gstreamer1.0-tools gstreamer1.0-pipewire \
 #         gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly ffmpeg
@@ -9431,9 +9433,19 @@ PPATH  = "/org/freedesktop/portal/desktop"
 SC     = "org.freedesktop.portal.ScreenCast"
 sender = bus.get_unique_name()[1:].replace(".", "_")
 _n = [0]
+session = None
 
 def sv(t, v):
     return GLib.Variant(t, v)
+
+def close_session():
+    if not session:
+        return
+    try:
+        bus.call_sync(PORTAL, session, "org.freedesktop.portal.Session", "Close",
+                      None, None, Gio.DBusCallFlags.NONE, -1, None)
+    except Exception:
+        pass
 
 def request(method, build, timeout):
     """Wywołuje metodę portalu i czeka na sygnał Request.Response."""
@@ -9486,11 +9498,11 @@ session = r.get("session_handle")
 if not session:
     die("CreateSession returned no session handle")
 
-# 2. SelectSources (monitor, kursor w strumieniu, zapamiętanie wyboru)
+# 2. SelectSources: monitory (wiele naraz), kursor w strumieniu, zapamiętanie wyboru
 restored = False
 def build_select(t):
     global restored
-    opts = {"handle_token": sv("s", t), "types": sv("u", 1), "multiple": sv("b", False)}
+    opts = {"handle_token": sv("s", t), "types": sv("u", 1), "multiple": sv("b", True)}
     cm = prop("AvailableCursorModes")
     if cm is not None:
         if cm & 2:
@@ -9508,7 +9520,7 @@ code, r = request("SelectSources", build_select, 30)
 if code != 0:
     die("SelectSources refused (code %s)" % code)
 
-# 3. Start - tu kompozytor pokazuje okno wyboru ekranu (jeśli brak zapamiętanego wyboru)
+# 3. Start - kompozytor pokazuje okno wyboru ekranów (jeśli brak zapamiętanego wyboru)
 code, r = request("Start", lambda t: sv("(osa{sv})", (session, "", {"handle_token": sv("s", t)})), 300)
 if code == 1:
     emit(event="cancelled")
@@ -9518,9 +9530,9 @@ if code != 0:
 streams = r.get("streams") or []
 if not streams:
     die("The portal returned no video stream")
-node, props = streams[0]
-position = props.get("position")
-size = props.get("size")
+info = []
+for node, props in streams:
+    info.append({"node": node, "position": props.get("position"), "size": props.get("size")})
 new_token = r.get("restore_token")
 if new_token:
     try:
@@ -9530,7 +9542,17 @@ if new_token:
     except Exception:
         pass
 
-# 4. OpenPipeWireRemote -> deskryptor pliku
+# 4. Aplikacja wybiera, które strumienie są potrzebne ("go 0 1" albo "abort")
+emit(event="streams", streams=info, restored=restored)
+line = sys.stdin.readline()
+idxs = []
+if line.startswith("go"):
+    idxs = [int(x) for x in line.split()[1:] if x.isdigit() and int(x) < len(info)]
+if not idxs:
+    close_session()
+    sys.exit(0)
+
+# 5. OpenPipeWireRemote -> deskryptor pliku (wspólny dla wszystkich strumieni)
 try:
     res, fdl = bus.call_with_unix_fd_list_sync(
         PORTAL, PPATH, SC, "OpenPipeWireRemote",
@@ -9538,65 +9560,72 @@ try:
         Gio.DBusCallFlags.NONE, -1, None, None)
     fd = fdl.get(res.unpack()[0])
 except Exception as e:
+    close_session()
     die("OpenPipeWireRemote failed: %s" % e)
 
-# 5. GStreamer
-tokens = [t.replace("{FD}", str(fd)).replace("{NODE}", str(node)) for t in cfg["pipeline"]]
-cmd = ["gst-launch-1.0", "-e", "-q"] + tokens
-errf = tempfile.TemporaryFile()
-try:
-    gst = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=errf, pass_fds=(fd,))
-except Exception as e:
-    die("Cannot start gst-launch-1.0: %s" % e)
+# 6. GStreamer: jeden proces na strumień
+procs = []   # (index, Popen, errfile, outfile)
+for i in idxs:
+    out = "%s.s%d.mkv" % (cfg["out_base"], i)
+    tokens = [t.replace("{FD}", str(fd)).replace("{NODE}", str(info[i]["node"]))
+               .replace("{OUT}", out) for t in cfg["pipeline"]]
+    errf = tempfile.TemporaryFile()
+    try:
+        p = subprocess.Popen(["gst-launch-1.0", "-e", "-q"] + tokens,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=errf, pass_fds=(fd,))
+    except Exception as e:
+        for _, pp, _, _ in procs:
+            pp.kill()
+        close_session()
+        die("Cannot start gst-launch-1.0: %s" % e)
+    procs.append((i, p, errf, out))
 
-def err_tail():
+def err_tail(errf):
     try:
         errf.seek(0)
-        return errf.read().decode(errors="replace").strip()[-600:]
+        return errf.read().decode(errors="replace").strip()[-400:]
     except Exception:
         return ""
 
-def close_session():
-    try:
-        bus.call_sync(PORTAL, session, "org.freedesktop.portal.Session", "Close",
-                      None, None, Gio.DBusCallFlags.NONE, -1, None)
-    except Exception:
-        pass
-
 time.sleep(1.0)
-if gst.poll() is not None:
-    tail = err_tail()
+dead = [x for x in procs if x[1].poll() is not None]
+if dead:
+    tails = "\n".join("stream %d: %s" % (x[0], err_tail(x[2])) for x in dead)
+    for _, pp, _, _ in procs:
+        if pp.poll() is None:
+            pp.kill()
     close_session()
-    die("GStreamer exited immediately:\n%s" % tail)
+    die("GStreamer exited immediately:\n%s" % tails)
 
-emit(event="started", node=node, position=position, size=size, restored=restored)
+emit(event="started", files={str(x[0]): x[3] for x in procs}, restored=restored)
 
 stop = threading.Event()
 def reader():
     try:
-        for line in sys.stdin:
-            if line.strip() == "stop":
+        for ln in sys.stdin:
+            if ln.strip() == "stop":
                 break
     except Exception:
         pass
     stop.set()
 threading.Thread(target=reader, daemon=True).start()
 
-while not stop.is_set() and gst.poll() is None:
+while not stop.is_set() and any(x[1].poll() is None for x in procs):
     time.sleep(0.1)
 
-if gst.poll() is None:
-    gst.send_signal(signal.SIGINT)          # -e: EOS -> poprawnie zamknięty MKV
+for _, pp, _, _ in procs:
+    if pp.poll() is None:
+        pp.send_signal(signal.SIGINT)       # -e: EOS -> poprawnie zamknięty MKV
+for _, pp, _, _ in procs:
     try:
-        gst.wait(timeout=20)
+        pp.wait(timeout=20)
     except subprocess.TimeoutExpired:
-        gst.kill()
-        gst.wait()
-rc = gst.returncode
-tail = err_tail()
+        pp.kill()
+        pp.wait()
+tails = "\n".join(err_tail(x[2]) for x in procs).strip()[-600:]
 close_session()
-emit(event="done", rc=rc, err=tail)
+emit(event="done", rc=[x[1].returncode for x in procs], err=tails)
 '''
 
 
@@ -9652,33 +9681,80 @@ def _wl_cast_check_deps(rec_fps):
     return {"py": py, "enc": enc, "keepalive": keepalive, "fps": int(rec_fps)}
 
 
-def _wl_cast_region_fractions(region):
-    """Region (współrzędne Qt/X jak w _WaylandMSS) -> ułamki monitora, na którym leży.
-    Zwraca (geoms, idx, (fx, fy, fw, fh)). Ułamki nie zależą od skalowania ani
-    od tego, czy współrzędne są logiczne czy fizyczne."""
-    geoms = _wl_screen_geoms() or [(0, 0, 1920, 1080)]
+def _wl_cast_region_parts(region, geoms):
+    """Rozkłada region (współrzędne Qt/X jak w _WaylandMSS) na części leżące na
+    poszczególnych monitorach. Każda część: monitor, ułamki monitora do wycięcia
+    (fx, fy, fw, fh) oraz miejsce w obszarze wynikowym (dx, dy, dw, dh) w tych samych
+    jednostkach co region. Ułamki nie zależą od skalowania."""
     if region:
         x, y, w, h = region
     else:
         x, y, w, h = geoms[0]
-    cx, cy = x + w / 2.0, y + h / 2.0
-    idx = 0
-    for i, g in enumerate(geoms):
-        if g[0] <= cx < g[0] + g[2] and g[1] <= cy < g[1] + g[3]:
-            idx = i
-            break
-    gx, gy, gw, gh = geoms[idx]
-    gw = max(1, gw); gh = max(1, gh)
-    fx = min(1.0, max(0.0, (x - gx) / gw))
-    fy = min(1.0, max(0.0, (y - gy) / gh))
-    fw = min(1.0 - fx, max(0.0, w / gw))
-    fh = min(1.0 - fy, max(0.0, h / gh))
-    return geoms, idx, (fx, fy, fw, fh)
+    parts = []
+    for i, (gx, gy, gw, gh) in enumerate(geoms):
+        gw = max(1, gw); gh = max(1, gh)
+        x0, x1 = max(x, gx), min(x + w, gx + gw)
+        y0, y1 = max(y, gy), min(y + h, gy + gh)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+        parts.append({"screen": i,
+                      "frac": ((x0 - gx) / gw, (y0 - gy) / gh, (x1 - x0) / gw, (y1 - y0) / gh),
+                      "dest": (x0 - x, y0 - y, x1 - x0, y1 - y0)})
+    if not parts:   # region poza wszystkimi monitorami - bierzemy monitor ze środkiem regionu
+        cx, cy = x + w / 2.0, y + h / 2.0
+        idx = 0
+        for i, g in enumerate(geoms):
+            if g[0] <= cx < g[0] + g[2] and g[1] <= cy < g[1] + g[3]:
+                idx = i
+                break
+        parts.append({"screen": idx, "frac": (0.0, 0.0, 1.0, 1.0),
+                      "dest": (0, 0, w, h)})
+    return parts, (x, y, w, h)
 
 
-def _wl_cast_record(raw_path, deps, stop_event, check=None, on_started=None, use_token=True):
-    """Nagrywa monitor przez portal ScreenCast do surowego MKV (raw_path), aż do
-    stop_event. Zwraca {"status": "ok"|"declined"|"cancelled"|"mismatch", ...};
+def _wl_cast_match_streams(streams, geoms):
+    """Dopasowuje strumienie portalu do monitorów Qt. Zwraca {indeks_monitora: indeks_strumienia}."""
+    res, used = {}, set()
+    # 1) dokładna zgodność pozycji i rozmiaru
+    for si, g in enumerate(geoms):
+        for ti, s in enumerate(streams):
+            if ti in used:
+                continue
+            pos, size = s.get("position"), s.get("size")
+            if pos and size and tuple(pos) == (g[0], g[1]) and tuple(size) == (g[2], g[3]):
+                res[si] = ti
+                used.add(ti)
+                break
+    if len(res) == len(geoms):
+        return res
+    # 2) tyle samo strumieni co monitorów -> parujemy po kolejności pozycji (x, y)
+    if len(streams) == len(geoms) and all(s.get("position") for s in streams):
+        s_order = sorted(range(len(streams)), key=lambda t: tuple(streams[t]["position"]))
+        g_order = sorted(range(len(geoms)), key=lambda i: (geoms[i][0], geoms[i][1]))
+        return {gi_: si_ for gi_, si_ in zip(g_order, s_order)}
+    # 3) reszta: najbliższa proporcja obrazu
+    for si, g in enumerate(geoms):
+        if si in res:
+            continue
+        best, best_d = None, 0.03
+        for ti, s in enumerate(streams):
+            size = s.get("size")
+            if ti in used or not size or not size[0] or not size[1]:
+                continue
+            d = abs(size[0] / float(size[1]) - g[2] / float(max(1, g[3])))
+            if d < best_d:
+                best, best_d = ti, d
+        if best is not None:
+            res[si] = best
+            used.add(best)
+    return res
+
+
+def _wl_cast_record(raw_base, deps, stop_event, select=None, on_started=None, use_token=True):
+    """Nagrywa wybrane monitory przez portal ScreenCast do surowych plików MKV
+    (<raw_base>.s<N>.mkv), aż do stop_event.
+    select(streams) -> lista indeksów strumieni do nagrania albo tekst błędu.
+    Zwraca {"status": "ok"|"declined"|"cancelled"|"mismatch", ...};
     przy błędzie rzuca RuntimeError(tekst)."""
     import queue
 
@@ -9695,8 +9771,8 @@ def _wl_cast_record(raw_path, deps, stop_event, check=None, on_started=None, use
                 + ["!", "queue", "!", "videoconvert", "!", "videorate", "!",
                    f"video/x-raw,framerate={fps}/1", "!"]
                 + deps["enc"]
-                + ["!", "matroskamux", "!", "filesink", f"location={raw_path}"])
-    cfg = {"pipeline": pipeline, "restore_token": token,
+                + ["!", "matroskamux", "!", "filesink", "location={OUT}"])
+    cfg = {"pipeline": pipeline, "restore_token": token, "out_base": raw_base,
            "token_file": str(_WL_CAST_TOKEN_FILE)}
 
     errf = tempfile.TemporaryFile()
@@ -9732,12 +9808,15 @@ def _wl_cast_record(raw_path, deps, stop_event, check=None, on_started=None, use
         except Exception:
             return {}
 
-    def _ask_stop(wait):
+    def _send(text):
         try:
-            proc.stdin.write("stop\n")
+            proc.stdin.write(text)
             proc.stdin.flush()
         except Exception:
             pass
+
+    def _ask_stop(wait):
+        _send("stop\n")
         done = None
         t_end = time.monotonic() + wait
         while time.monotonic() < t_end:
@@ -9759,10 +9838,10 @@ def _wl_cast_record(raw_path, deps, stop_event, check=None, on_started=None, use
         return done
 
     try:
-        # ── Czekamy, aż użytkownik zatwierdzi udostępnianie ekranu ───────────
-        info = None
+        # ── Czekamy na zatwierdzenie udostępniania i listę strumieni ──────────
+        started = None
         deadline = time.monotonic() + 300
-        while info is None:
+        while started is None:
             if stop_event.is_set():
                 proc.kill()
                 return {"status": "cancelled"}
@@ -9777,25 +9856,30 @@ def _wl_cast_record(raw_path, deps, stop_event, check=None, on_started=None, use
                 raise RuntimeError("The screencast helper stopped unexpectedly.\n" + _helper_err())
             ev = _parse(ln)
             kind = ev.get("event")
-            if kind == "started":
-                info = ev
+            if kind == "streams":
+                streams = ev.get("streams") or []
+                _wl_log(f"portal przekazał {len(streams)} strumień(ie): "
+                        + ", ".join(f"{s.get('position')} {s.get('size')}" for s in streams))
+                choice = select(streams) if select else list(range(len(streams)))
+                if isinstance(choice, str):
+                    _send("abort\n")
+                    try: proc.wait(timeout=5)
+                    except Exception: pass
+                    return {"status": "mismatch", "msg": choice, "restored": ev.get("restored")}
+                _send("go " + " ".join(str(int(i)) for i in choice) + "\n")
+            elif kind == "started":
+                started = ev
             elif kind == "cancelled":
                 return {"status": "declined"}
             elif kind == "error":
                 raise RuntimeError(ev.get("msg", "Unknown screencast error"))
 
-        _wl_log(f"screencast ruszył: node={info.get('node')} pos={info.get('position')} "
-                f"size={info.get('size')} restored={info.get('restored')}")
-
-        if check:
-            msg = check(info)
-            if msg:
-                _ask_stop(10)
-                return {"status": "mismatch", "info": info, "msg": msg}
+        files = {int(k): v for k, v in (started.get("files") or {}).items()}
+        _wl_log(f"screencast ruszył: pliki={files}")
         if on_started:
-            on_started(info)
+            on_started()
 
-        # ── Nagrywanie trwa do stop_event (albo do końca strumienia) ─────────
+        # ── Nagrywanie trwa do stop_event (albo do końca strumieni) ──────────
         done_ev = None
         ended = False
         while not stop_event.is_set():
@@ -9812,15 +9896,17 @@ def _wl_cast_record(raw_path, deps, stop_event, check=None, on_started=None, use
                 ended = True
                 break
         if not ended:
-            done_ev = _ask_stop(40)
+            done_ev = _ask_stop(60)
         else:
             try: proc.wait(timeout=5)
             except Exception: pass
 
-        if not (os.path.exists(raw_path) and os.path.getsize(raw_path) > 1024):
+        bad = [p for p in files.values()
+               if not (os.path.exists(p) and os.path.getsize(p) > 1024)]
+        if bad:
             tail = (done_ev or {}).get("err") or (done_ev or {}).get("msg") or _helper_err()
             raise RuntimeError("GStreamer produced no video.\n" + str(tail))
-        return {"status": "ok", "info": info}
+        return {"status": "ok", "files": files}
     finally:
         try:
             if proc.poll() is None:
@@ -9905,68 +9991,66 @@ class RecordingThread(QThread):
             self.error.emit(deps)
             return
 
-        raw = self.output_path + ".raw.mkv"
-        geoms, idx, frac = _wl_cast_region_fractions(self.region)
-        gx, gy, gw, gh = geoms[idx]
+        raw_base = self.output_path + ".raw"
+        geoms = _wl_screen_geoms() or [(0, 0, 1920, 1080)]
+        parts, region = _wl_cast_region_parts(self.region, geoms)
+        _wl_log(f"obszar {region} -> części: {[(p['screen'], p['dest']) for p in parts]}")
+        state = {}
 
-        def check(info):
-            """Czy strumień z portalu to ten sam monitor, na którym zaznaczono obszar?"""
-            if len(geoms) < 2:
-                return None
-            wrong = ("The selected area is on a different monitor than the one shared in "
-                     "the system dialog. Pick the matching monitor in the dialog and try again.")
-            size = info.get("size"); pos = info.get("position")
-            if size and size[0] and size[1]:
-                if abs(size[0] / float(size[1]) - gw / float(gh)) > 0.02:
-                    return wrong
-            if pos:
-                p = (pos[0], pos[1])
-                for i, g in enumerate(geoms):
-                    if i != idx and (g[0], g[1]) == p and (gx, gy) != p:
-                        return wrong
-            return None
+        def select(streams):
+            """Wybiera strumienie potrzebne dla zaznaczonego obszaru (nawet kilku monitorów)."""
+            mapping = _wl_cast_match_streams(streams, geoms)
+            missing = [p["screen"] for p in parts if mapping.get(p["screen"]) is None]
+            if missing:
+                state["missing"] = True
+                return ("The recorded area needs a monitor that was not shared in the system "
+                        "dialog. In that dialog select ALL monitors you want to record "
+                        "(or select all of them) and try again.")
+            for p in parts:
+                p["stream"] = mapping[p["screen"]]
+            return sorted({p["stream"] for p in parts})
 
-        def on_started(info):
-            if self.region:
-                x, y, w, h = self.region
-            else:
-                x, y, w, h = gx, gy, gw, gh
+        def on_started():
+            x, y, w, h = region
             self.region_ready.emit(int(x), int(y), int(w), int(h))
 
         if self.audio:
             _wl_log("audio is not recorded on Wayland yet - video only")
 
+        def cleanup_raw():
+            for pth in Path(raw_base).parent.glob(Path(raw_base).name + ".s*.mkv"):
+                self._wl_cleanup(str(pth))
+
         try:
-            res = _wl_cast_record(raw, deps, self._stop, check=check,
+            res = _wl_cast_record(raw_base, deps, self._stop, select=select,
                                   on_started=on_started, use_token=True)
-            if res["status"] == "mismatch" and res["info"].get("restored"):
-                # Zapamiętany wybór wskazywał inny monitor - zapomnij go i pokaż okno wyboru
+            if res["status"] == "mismatch" and res.get("restored"):
+                # Zapamiętany wybór nie obejmował potrzebnych monitorów - zapomnij go
+                # i pokaż okno wyboru jeszcze raz.
                 try: _WL_CAST_TOKEN_FILE.unlink()
                 except Exception: pass
-                try: Path(raw).unlink()
-                except Exception: pass
-                res = _wl_cast_record(raw, deps, self._stop, check=check,
+                res = _wl_cast_record(raw_base, deps, self._stop, select=select,
                                       on_started=on_started, use_token=False)
         except RuntimeError as e:
-            self._wl_cleanup(raw)
+            cleanup_raw()
             self.error.emit(str(e))
             return
 
         st = res["status"]
         if st == "declined":
-            self._wl_cleanup(raw)
+            cleanup_raw()
             self.error.emit("Screen sharing was cancelled in the system dialog.")
             return
         if st == "cancelled":
-            self._wl_cleanup(raw)
+            cleanup_raw()
             self.error.emit("Recording cancelled before it started.")
             return
         if st == "mismatch":
-            self._wl_cleanup(raw)
+            cleanup_raw()
             self.error.emit(res.get("msg", "Wrong monitor selected."))
             return
 
-        self._wl_convert(raw, frac, rec_fps)
+        self._wl_convert(res["files"], parts, region, geoms, rec_fps)
 
     @staticmethod
     def _wl_cleanup(raw):
@@ -9976,59 +10060,134 @@ class RecordingThread(QThread):
         except Exception:
             pass
 
-    def _wl_convert(self, raw, frac, rec_fps):
-        """Przycina surowy MKV do zaznaczonego obszaru i zapisuje MP4 / GIF."""
-        fx, fy, fw, fh = frac
-        full = fw > 0.999 and fh > 0.999 and fx < 0.001 and fy < 0.001
-        if full:
-            crop = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    @staticmethod
+    def _wl_probe_size(path):
+        """Rozmiar klatki pliku w pikselach (ffprobe)."""
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                                path], capture_output=True, text=True, timeout=30)
+            w, h = r.stdout.strip().split(",")[:2]
+            return int(w), int(h)
+        except Exception:
+            return None
+
+    def _wl_convert(self, files, parts, region, geoms, rec_fps):
+        """Przycina surowe MKV do zaznaczonego obszaru (także ze sklejeniem kilku
+        monitorów) i zapisuje MP4 / GIF."""
+        raws = list(files.values())
+        cmd_in = []
+        vf_args = []
+
+        if len(parts) == 1:
+            # Jeden monitor: przycięcie wyrażeniami względem rozmiaru wejścia (bez ffprobe)
+            fx, fy, fw, fh = parts[0]["frac"]
+            full = fw > 0.999 and fh > 0.999 and fx < 0.001 and fy < 0.001
+            if full:
+                crop = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+            else:
+                crop = (f"crop=w='trunc(iw*{fw:.6f}/2)*2':h='trunc(ih*{fh:.6f}/2)*2':"
+                        f"x='min(trunc(iw*{fx:.6f}),iw-ow)':y='min(trunc(ih*{fy:.6f}),ih-oh)'")
+            cmd_in = ["-i", files[parts[0]["stream"]]]
+            if self.gif_mode:
+                gfps = max(1, int(self.gif_fps))
+                vf_args = ["-vf",
+                           f"fps={gfps},{crop},scale='min(1280,iw)':-2:flags=lanczos,"
+                           f"split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
+                           f"[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"]
+            else:
+                vf_args = ["-vf", f"{crop},fps={int(self.fps)}"]
         else:
-            crop = (f"crop=w='trunc(iw*{fw:.6f}/2)*2':h='trunc(ih*{fh:.6f}/2)*2':"
-                    f"x='min(trunc(iw*{fx:.6f}),iw-ow)':y='min(trunc(ih*{fy:.6f}),ih-oh)'")
+            # Kilka monitorów: znamy rozmiary w pikselach (ffprobe), skalujemy części do
+            # wspólnej skali (najostrzejszy monitor) i kładziemy na jednym płótnie.
+            sizes = {}
+            for p in parts:
+                sz = self._wl_probe_size(files[p["stream"]])
+                if not sz:
+                    self._wl_cleanup_all(raws)
+                    self.error.emit("ffprobe failed (it comes with the ffmpeg package) - "
+                                    "cannot combine several monitors.")
+                    return
+                sizes[p["stream"]] = sz
+            scale = 0.0
+            for p in parts:
+                gw = max(1, geoms[p["screen"]][2])
+                scale = max(scale, sizes[p["stream"]][0] / float(gw))
+            even = lambda v: max(2, int(round(v / 2.0)) * 2)
+            _, _, rw, rh = region
+            W, H = even(rw * scale), even(rh * scale)
+            F = int(self.gif_fps) if self.gif_mode else int(self.fps)
+
+            chains, labels = [], []
+            for k, p in enumerate(parts):
+                pw, ph = sizes[p["stream"]]
+                fx, fy, fw, fh = p["frac"]
+                cx, cy = int(round(fx * pw)), int(round(fy * ph))
+                cw = max(2, min(int(round(fw * pw)), pw - cx) // 2 * 2)
+                ch = max(2, min(int(round(fh * ph)), ph - cy) // 2 * 2)
+                dx, dy, dw, dh = p["dest"]
+                chains.append(f"[{k}:v]fps={F},crop={cw}:{ch}:{cx}:{cy},"
+                              f"scale={even(dw * scale)}:{even(dh * scale)}:flags=lanczos[p{k}]")
+                labels.append((k, int(round(dx * scale)), int(round(dy * scale))))
+                cmd_in += ["-i", files[p["stream"]]]
+            chains.append(f"color=c=black:s={W}x{H}:r={F}[bg]")
+            prev = "bg"
+            for k, ox, oy in labels:
+                nxt = f"o{k}"
+                chains.append(f"[{prev}][p{k}]overlay={ox}:{oy}:eof_action=endall[{nxt}]")
+                prev = nxt
+            if self.gif_mode:
+                chains.append(f"[{prev}]scale='min(1280,iw)':-2:flags=lanczos,split[s0][s1];"
+                              f"[s0]palettegen=stats_mode=diff[pg];"
+                              f"[s1][pg]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle[out]")
+            else:
+                chains.append(f"[{prev}]format=yuv420p[out]")
+            vf_args = ["-filter_complex", ";".join(chains), "-map", "[out]"]
 
         if self.gif_mode:
-            gfps = max(1, int(self.gif_fps))
-            vf = (f"fps={gfps},{crop},scale='min(1280,iw)':-2:flags=lanczos,"
-                  f"split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
-                  f"[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle")
-            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", raw,
-                   "-vf", vf, "-loop", "0", self.output_path]
+            cmd = ["ffmpeg", "-y", "-loglevel", "error"] + cmd_in + vf_args + \
+                  ["-loop", "0", self.output_path]
         else:
-            vf = f"{crop},fps={int(self.fps)}"
-            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", raw,
-                   "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            cmd = ["ffmpeg", "-y", "-loglevel", "error"] + cmd_in + vf_args + \
+                  ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", self.output_path]
         print(f"[PyshareX] {' '.join(cmd)}")
 
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         except FileNotFoundError:
+            self._wl_cleanup_all(raws)
             self.error.emit("ffmpeg is not installed.\n  sudo apt install ffmpeg")
             return
         except Exception as e:
+            self._wl_cleanup_all(raws)
             self.error.emit(f"ffmpeg conversion failed: {e}")
             return
 
         out = Path(self.output_path)
         if r.returncode == 0 and out.exists() and out.stat().st_size > 512:
-            self._wl_cleanup(raw)
+            self._wl_cleanup_all(raws)
             self._wl_make_thumb(self.output_path)
             self.finished.emit(self.output_path)
             return
 
         tail = "\n".join((r.stderr or "").strip().splitlines()[-10:])
-        if not self.gif_mode:
+        if not self.gif_mode and len(raws) == 1:
             # Zapasowo zostawiamy surowy MKV (odtwarzalny w VLC/mpv), jak na X11
             fallback = self.output_path.replace(".mp4", ".mkv")
             try:
-                os.replace(raw, fallback)
+                os.replace(raws[0], fallback)
                 _wl_log(f"ffmpeg conversion failed, kept raw recording: {fallback}\n{tail}")
                 self.finished.emit(fallback)
                 return
             except Exception:
                 pass
-        self._wl_cleanup(raw)
+        self._wl_cleanup_all(raws)
         self.error.emit(f"ffmpeg conversion error:\n{tail}")
+
+    def _wl_cleanup_all(self, paths):
+        for pth in paths:
+            self._wl_cleanup(pth)
 
     def _wl_make_thumb(self, path):
         """Pierwsza klatka nagrania -> QImage dla powiadomienia (na Waylandzie nie robimy
